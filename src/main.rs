@@ -64,6 +64,15 @@ struct Cli {
     #[arg(long, env = "RUSTY_MEMORY", default_value = "learn")]
     memory: String,
 
+    /// Context window in tokens; otherwise asked of the endpoint, then the saved
+    /// table, else 128000 is assumed
+    #[arg(long, env = "RUSTY_CONTEXT_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
+    context_tokens: Option<u64>,
+
+    /// Compaction: aggressive, standard, passive or smart (overrides saved settings)
+    #[arg(long, env = "RUSTY_COMPACTION")]
+    compaction: Option<String>,
+
     /// Permission mode: read-only, ask, auto or yolo
     #[arg(short, long, env = "RUSTY_PERMISSIONS", default_value = "auto")]
     permissions: String,
@@ -275,6 +284,28 @@ fn run() -> Result<i32> {
             }
         }
     }
+    agent.meter = match cli.context_tokens {
+        Some(n) => context::Meter::new(n as usize, "flag"),
+        None => match client.context_window(&agent.model) {
+            Some(n) => context::Meter::new(n, "endpoint"),
+            None => match settings.context_windows.get(&agent.model) {
+                Some(&n) => context::Meter::new(n, "table"),
+                None => {
+                    println!(
+                        "{}",
+                        ui::dim(&format!(
+                            "◇ context window assumed {} tokens; pass --context-tokens to set it",
+                            context::ASSUMED_WINDOW
+                        ))
+                    );
+                    context::Meter::default()
+                }
+            },
+        },
+    };
+    let compaction = cli.compaction.clone().unwrap_or_else(|| settings.compaction.clone());
+    agent.compaction = context::Compaction::parse(&compaction)
+        .ok_or_else(|| anyhow!("unknown compaction `{compaction}` ({})", context::Compaction::NAMES))?;
     agent.shell_only = match cli.toolset.as_str() {
         "full" => false,
         "shell" => true,
@@ -374,12 +405,15 @@ fn capabilities() -> serde_json::Value {
         values.iter().copied().filter(|v| ok(v)).collect()
     };
     let memory: Vec<&str> = rusty::advisor::Level::NAMES.split(", ").collect();
+    let compaction: Vec<&str> = context::Compaction::NAMES.split(", ").collect();
     let mut modes = vec!["auto"];
     modes.extend(accepted(&["careful", "standard", "vibe"], &|v| ExecutionMode::parse(v).is_some()));
     serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "contract": CONTRACT,
         "memory": accepted(&memory, &|v| rusty::advisor::Level::parse(v).is_some()),
+        "compaction": accepted(&compaction, &|v| context::Compaction::parse(v).is_some()),
+        "context": {"tokens_flag": true, "window_sources": ["flag", "endpoint", "table", "assumed", "overflow"]},
         "mode": modes,
         "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
@@ -389,7 +423,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal"],
+        "stats": ["model_budget", "claims", "safety", "goal", "context"],
     })
 }
 
@@ -412,6 +446,8 @@ fn print_stats(agent: &Agent, started: Instant) {
             "claims": agent.completion,
             "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
+            "compaction": agent.compaction.name(),
+            "context": agent.context_record(),
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
@@ -589,6 +625,23 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 println!("  {m}");
             }
         }
+        "/compact" if rest == "settings" || rest.starts_with("settings ") => match rest["settings".len()..].trim() {
+            "" => {
+                println!("  compaction · {}", agent.compaction.describe());
+                println!("  {}", ui::dim(&format!("/compact settings <mode> · {}", context::Compaction::NAMES)));
+            }
+            name => match context::Compaction::parse(name) {
+                Some(mode) => {
+                    agent.compaction = mode;
+                    settings.compaction = mode.name().into();
+                    settings.save();
+                    println!("  compaction · {} (saved)", mode.describe());
+                }
+                None => {
+                    println!("  {}", ui::err(&format!("unknown compaction `{name}` ({})", context::Compaction::NAMES)))
+                }
+            },
+        },
         "/compact" => agent.compact(Some(rest).filter(|r| !r.is_empty()))?,
         "/context" => println!("{}", agent.context_report()),
         "/tokens" | "/usage" | "/cost" => print_tokens(agent),
@@ -917,7 +970,7 @@ fn print_settings(agent: &Agent) {
         ("swarm spread", format!("{:.1}", a.spread)),
         ("tips", if agent.tips { "on".into() } else { "off".into() }),
         ("target", if agent.infra.target.is_empty() { "-".into() } else { agent.infra.target.summary() }),
-        ("context window", context::window().to_string()),
+        ("context window", format!("{} ({})", agent.meter.window, agent.meter.window_source)),
     ];
     for (k, v) in rows {
         println!("  {} {}", ui::dim(&format!("{k:<15}")), v);
@@ -1099,6 +1152,7 @@ fn print_help(cwd: &Path) {
                 ("/remember <text>", "save one (prefix preference:, gotcha:, decision:)"),
                 ("/context", "where the window is going"),
                 ("/compact [focus]", "summarise now; say what matters most to keep it in detail"),
+                ("/compact settings [mode]", "when to compact: aggressive · standard · passive · smart"),
                 ("/tokens", "spend by model and by tool"),
                 ("/clear", "fresh conversation, memories kept"),
             ],

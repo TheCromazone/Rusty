@@ -198,6 +198,11 @@ pub struct Agent {
     pub delegation_override: bool,
     /// `--toolset shell`: the lead gets bash and the control tools only.
     pub shell_only: bool,
+    /// When history is compacted; `smart` adds the `compact` tool.
+    pub compaction: context::Compaction,
+    /// A compaction the model asked for, with its reason and focus; it runs
+    /// before the next step, so a tool call is never split from its result.
+    pending_compaction: Option<(String, Option<String>)>,
     pending_goal: Option<Value>,
     /// Careful mode still owes one checker review for this turn or goal.
     checker_owed: bool,
@@ -227,6 +232,8 @@ pub struct Agent {
     tips_shown: HashSet<&'static str>,
     pub totals: Totals,
     pub last_prompt_tokens: u64,
+    /// The context window and how full it is, from reported usage.
+    pub meter: context::Meter,
     /// The last turn ended on a repetition or talk-only stall.
     last_turn_stalled: bool,
     project_notes: String,
@@ -281,6 +288,8 @@ impl Agent {
             model_override: None,
             delegation_override: false,
             shell_only: false,
+            compaction: context::Compaction::default(),
+            pending_compaction: None,
             pending_goal: None,
             checker_owed: false,
             cwd,
@@ -304,6 +313,7 @@ impl Agent {
             tips_shown: HashSet::new(),
             totals: Totals::default(),
             last_prompt_tokens: 0,
+            meter: context::Meter::default(),
             last_turn_stalled: false,
             project_notes,
             snapshot: String::new(),
@@ -432,6 +442,7 @@ impl Agent {
         self.goal = None;
         self.verification_records.clear();
         self.last_prompt_tokens = 0;
+        self.meter.forget_last();
     }
 
     // ---------------------------------------------------------------- prompt
@@ -477,6 +488,15 @@ impl Agent {
         );
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
+        if self.smart_compaction() {
+            s.push_str(&format!(
+                "\nContext: call compact when the next step is substantially different work from what you just \
+                 did (a different task, or a different codebase), or when the task ahead looks long, provided the \
+                 context is more than {}% full. The note at the end of each request says how full it is. Don't \
+                 compact in the middle of one piece of work.\n",
+                context::SMART_INVITE
+            ));
+        }
         match self.agents.mode {
             AgentsMode::Off => {}
             AgentsMode::Sub => s.push_str(
@@ -593,6 +613,19 @@ impl Agent {
         ));
         defs.push(t("recall", "Search long-term memory.", json!({"query": {"type": "string"}}), &["query"]));
         defs.push(t("forget", "Delete a memory that is wrong or stale.", json!({"id": {"type": "string"}}), &["id"]));
+        if self.smart_compaction() {
+            defs.push(t(
+                "compact",
+                "Summarise the conversation so far and continue from the summary. Call it when the next step is \
+                 substantially different work from what you just did, or the task ahead is long. The user's \
+                 messages, the plan and a working set of files and commands are kept word for word.",
+                json!({
+                    "reason": {"type": "string", "description": "Why now, in a few words, e.g. 'the next task is unrelated'"},
+                    "focus": {"type": "string", "description": "What the summary must keep in detail (optional)"}
+                }),
+                &["reason"],
+            ));
+        }
         defs.push(t(
             "plan",
             "Replace the task plan. Use it for any work with more than two steps.",
@@ -691,6 +724,8 @@ impl Agent {
         // Commands that only print text: announcements no one reads.
         let mut talk_only = 0;
         let mut empty_replies = 0;
+        // An overflow error corrects the window and is retried once per turn.
+        let mut overflow_retried = false;
         // A repetition or talk-only stall: an open goal retries in a fresh turn.
         let mut stalled = false;
         self.last_turn_stalled = false;
@@ -716,13 +751,30 @@ impl Agent {
             messages.push(json!({"role": "system", "content": system}));
             messages.extend(self.history.iter().cloned());
             // Last, so the cached prefix stays the same; never stored in history.
-            if let Some(status) = self.client.budget.status().filter(|_| !self.is_worker) {
-                messages.push(json!({"role": "user", "content": format!("{}{status}", context::NOTE)}));
+            let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
+            if self.smart_compaction() {
+                notes.push(format!("Context in use: {}% of the usable window.", self.context_used()));
+            }
+            if !notes.is_empty() {
+                messages.push(json!({"role": "user", "content": format!("{}{}", context::NOTE, notes.join("\n"))}));
             }
 
             let started = Instant::now();
-            let mut reply = match self.ask(&mut d, messages, self.tool_defs()) {
+            let tools = self.tool_defs();
+            let sent = context::estimate(&messages) + tools.to_string().len() / 4;
+            let mut reply = match self.ask(&mut d, messages, tools) {
                 Ok(r) => r,
+                Err(e) if !overflow_retried && self.meter.overflow(&format!("{e:#}")) => {
+                    overflow_retried = true;
+                    d.line(&ui::dim(&format!(
+                        "  the context window is {} tokens, from the provider's error; compacting and retrying",
+                        self.meter.window
+                    )));
+                    if let Err(c) = self.compact_with(&mut d, None, false) {
+                        d.line(&ui::err(&format!("  compaction failed: {c:#}")));
+                    }
+                    continue;
+                }
                 Err(e) => {
                     // Drop a dangling user message so a retry starts clean.
                     if step == 0 {
@@ -735,6 +787,11 @@ impl Agent {
             if let Some(u) = reply.usage {
                 self.totals.add_request(&self.model, u.prompt, u.completion);
                 self.last_prompt_tokens = u.prompt;
+            }
+            self.meter.observe(reply.usage.as_ref(), sent, self.history.len());
+            if reply.window_full {
+                let used = reply.usage.map_or(0, |u| (u.prompt + u.completion) as usize);
+                self.meter.reached(used);
             }
             self.trace(&reply, started.elapsed());
 
@@ -964,7 +1021,7 @@ impl Agent {
             let facts = tips::Facts {
                 stats: &d.stats,
                 prompt_last: self.last_prompt_tokens,
-                window: context::window(),
+                window: self.meter.window,
                 completion: self.totals.completion - before.completion,
                 session_total: self.totals.prompt + self.totals.completion,
                 delegation_off: self.agents.mode == AgentsMode::Off,
@@ -1071,6 +1128,7 @@ impl Agent {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
                 Ok("plan updated".into())
             }
+            "compact" => Ok(self.request_compaction(&args, d)),
             "task" => Ok(self.run_workers(vec![job(&args)], d, "worker")),
             "swarm" => {
                 let jobs: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten().map(job).collect();
@@ -1395,6 +1453,7 @@ impl Agent {
             let (client, cwd, deny, backend) =
                 (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), self.backend.clone());
             let (cfg, lead_model, execution_mode) = (cfg.clone(), self.model.clone(), self.execution_mode);
+            let lead_window = (self.meter.window, self.meter.window_source);
             std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
@@ -1409,6 +1468,9 @@ impl Agent {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let mut w = Agent::new(client.clone(), model.clone(), cwd.clone(), Policy::new(Mode::ReadOnly));
                 w.is_worker = true;
+                if model == lead_model {
+                    w.meter = context::Meter::new(lead_window.0, lead_window.1);
+                }
                 w.request_role = role;
                 w.backend = backend.clone();
                 w.execution_mode = execution_mode;
@@ -1772,30 +1834,86 @@ impl Agent {
 
     // --------------------------------------------------------------- context
 
-    fn system_tokens(&self) -> usize {
-        1_800
-            + self.project_notes.len() / 4
-            + context::MEMORY_CHARS / 4
-            + (self.execution_mode.max_tokens() as usize).saturating_sub(context::REPLY_RESERVE)
+    /// What every request sends besides history: the system prompt and the
+    /// tool schemas, estimated.
+    fn fixed_estimate(&self) -> usize {
+        let advice = if self.advisor.is_some() { context::MEMORY_CHARS } else { 0 };
+        (self.system_prompt().len() + self.tool_defs().to_string().len() + advice) / 4
     }
 
     pub fn context_pct(&self) -> usize {
-        (self.last_prompt_tokens as usize * 100) / context::window().max(1)
+        (self.last_prompt_tokens as usize * 100) / self.meter.window
     }
 
     fn manage_context(&mut self, d: &mut Display) {
-        let budget = context::history_budget(self.system_tokens());
-        if context::estimate(&self.history) > budget * 6 / 10 {
+        if let Some((reason, focus)) = self.pending_compaction.take() {
+            if let Err(e) = self.compact_with(d, focus.as_deref(), true) {
+                d.line(&ui::err(&format!("  compaction ({reason}) failed: {e:#}")));
+            }
+        }
+        let (fixed, capacity) = (self.fixed_estimate(), self.meter.capacity());
+        if self.meter.fill(&self.history, fixed) > capacity * self.compaction.trim_at() / 100 {
             let saved = context::elide_old_tool_outputs(&mut self.history);
             if saved > 0 {
+                self.meter.forget_last();
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if context::estimate(&self.history) > budget * 8 / 10 {
+        if self.meter.fill(&self.history, fixed) > capacity * self.compaction.summarize_at() / 100 {
             if let Err(e) = self.compact_with(d, None, false) {
                 d.line(&ui::err(&format!("  compaction failed: {e:#}")));
             }
         }
+    }
+
+    /// The window, where it came from, the calibration, and how many
+    /// requests carried provider usage, for `--stats` and the trajectory.
+    pub fn context_record(&self) -> Value {
+        let m = &self.meter;
+        let provider = m.requests.iter().filter(|r| r.source == "provider").count();
+        json!({
+            "window": m.window,
+            "window_source": m.window_source,
+            "calibration": m.calibration(),
+            "provider_usage": provider,
+            "estimated_usage": m.requests.len() - provider,
+            "cache_read": m.requests.iter().map(|r| r.cache_read).sum::<u64>(),
+            "cache_write": m.requests.iter().map(|r| r.cache_write).sum::<u64>(),
+        })
+    }
+
+    /// Whether the model may compact on its own: smart mode, for the lead,
+    /// with the full tool set.
+    fn smart_compaction(&self) -> bool {
+        self.compaction == context::Compaction::Smart && !self.is_worker && !self.shell_only
+    }
+
+    /// The context's share of what a request may fill, in percent.
+    fn context_used(&self) -> usize {
+        context::percent(self.meter.fill(&self.history, self.fixed_estimate()), self.meter.capacity())
+    }
+
+    /// The `compact` tool: refused below the floor, otherwise scheduled for
+    /// the start of the next step and announced to the user.
+    fn request_compaction(&mut self, args: &Value, d: &mut Display) -> String {
+        if !self.smart_compaction() {
+            return "error: compaction is automatic in this mode".into();
+        }
+        let used = self.context_used();
+        if used < context::SMART_FLOOR {
+            return format!(
+                "error: context is only {used}% full; compaction is refused below {}%. Continue without it.",
+                context::SMART_FLOOR
+            );
+        }
+        let reason = args["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty());
+        let reason = ui::truncate(reason.unwrap_or("the next step is different work"), 120).to_string();
+        let focus = args["focus"].as_str().map(str::trim).filter(|f| !f.is_empty()).map(String::from);
+        d.line(&ui::dim(&format!(
+            "  Rusty is auto-compacting because {reason}. Use /compact settings to turn it off."
+        )));
+        self.pending_compaction = Some((reason, focus));
+        format!("compaction scheduled at {used}% of the usable window; it runs before your next step")
     }
 
     /// `/compact [focus]`: summarise now, steered by what the user wants kept.
@@ -1824,6 +1942,7 @@ impl Agent {
             // The bulk is in recent messages, so summarising older ones won't help.
             let saved = context::elide_tool_outputs(&mut self.history, 1);
             if saved > 0 {
+                self.meter.forget_last();
                 d.line(&ui::dim(&format!("  ✂ context is mostly recent tool output; trimmed ~{saved} tokens")));
             }
             return Ok(());
@@ -1866,6 +1985,7 @@ impl Agent {
         block.push_str(&format!("{}\n{carried}", context::USER_MESSAGES_HEADER));
         self.archived.append(&mut self.history);
         self.history = vec![json!({"role": "user", "content": block})];
+        self.meter.forget_last();
         // Keep user/assistant alternation when the kept tail starts with a user turn.
         if tail.first().is_some_and(|m| m["role"] == "user") {
             self.history.push(json!({"role": "assistant", "content": "Got it. I'll continue from this summary."}));
@@ -1891,6 +2011,9 @@ impl Agent {
             "version": env!("CARGO_PKG_VERSION"),
             "model": self.model,
             "memory_mode": self.memory_level.name(),
+            "compaction": self.compaction.name(),
+            "context": self.context_record(),
+            "usage": self.meter.requests,
             "memory": self.advisor.as_ref().map(|h| &h.metrics),
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),
@@ -1929,17 +2052,21 @@ impl Agent {
     }
 
     pub fn context_report(&self) -> String {
-        let system = self.system_prompt();
-        let sys = system.len() / 4;
+        let fixed = self.fixed_estimate();
         let hist = context::estimate(&self.history);
-        let win = context::window();
+        let win = self.meter.window;
         let tools_n = self.history.iter().filter(|m| m["role"] == "tool").count();
-        let used = (sys + hist) * 100 / win.max(1);
+        let used = context::percent(self.meter.fill(&self.history, fixed), self.meter.capacity());
         let bar_w = 30;
         let filled = (used * bar_w / 100).min(bar_w);
         let bar = format!("{}{}", ui::primary(&"█".repeat(filled)), ui::dim(&"░".repeat(bar_w - filled)));
+        let calibration = match self.meter.calibration() {
+            Some(r) => format!("{r:.2} measured/estimated tokens"),
+            None => "none yet (estimates only)".into(),
+        };
         format!(
-            "  {bar} ~{used}%\n  window        {win}\n  system+memory ~{sys}\n  history       ~{hist} ({} messages, {tools_n} tool results)\n  reply reserve {}\n  last request  {} prompt tokens (reported by the API)",
+            "  {bar} ~{used}% of what a request may fill\n  window        {win} ({})\n  system+tools  ~{fixed}\n  history       ~{hist} ({} messages, {tools_n} tool results)\n  reply reserve {}\n  calibration   {calibration}\n  last request  {} prompt tokens (reported by the API)",
+            self.meter.window_source,
             self.history.len(),
             context::REPLY_RESERVE,
             self.last_prompt_tokens,

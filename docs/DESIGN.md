@@ -69,9 +69,24 @@ answering the question.
 
 The window is split into allowances: system and project instructions,
 memory (3k chars), pinned plan and goal, a 16k reply reserve, and history.
-When history passes 60% of its share, old tool output shrinks. Past 80%, older
-turns are summarised. Measured token counts from the API are shown after every
-turn, so you always know where you stand.
+How full the context is comes from the provider's own count: the prompt
+tokens it reports for a request are the context at that request, and what was
+added since is estimated, scaled by a running ratio of reported to estimated
+tokens. No tokenizer ships and no model name is consulted. The window comes
+from `--context-tokens`, else the endpoint's model list (`context_length`,
+`max_model_len`), else `context_windows` in saved settings, else 128k is
+assumed and the user told; an overflow error that names the real window
+corrects it, and the request is compacted and retried once.
+
+When the context passes 60% of the usable window (the window less the reply
+reserve), old tool output shrinks. Past 80%, older turns are summarised. `/compact settings` (or `--compaction`) moves that pair:
+`aggressive` trims at 40% and summarises at 60%, `standard` (the default) at
+60% and 80%, `passive` at 75% and 95%. `smart` keeps the standard pair as a
+backstop and adds a `compact` tool. The model is asked to use it when the next
+step is substantially different work, or a long task, once history is more than
+25% full; below 20% it is refused. Each time, the user sees one line: "Rusty is
+auto-compacting because …". Measured token counts from the API are shown after
+every turn, so you always know where you stand.
 
 Delegation is also a token decision. A subagent spends its own context on
 exploration and hands back a page. A swarm does the same in parallel, with a

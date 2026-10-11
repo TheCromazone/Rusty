@@ -9,7 +9,8 @@
 //! When history outgrows its share, rusty gives tokens back in order of how
 //! cheap they are to get back: first it shrinks old tool outputs (the model
 //! can re-run a read), and only then does it summarise older turns. Your own
-//! messages, the plan and the goal are never dropped.
+//! messages, the plan and the goal are never dropped. [`Compaction`] sets how
+//! full history gets before each step happens.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -20,6 +21,78 @@ pub const REPLY_RESERVE: usize = 16_000;
 const KEEP_RECENT_TOOL_RESULTS: usize = 8;
 const ELIDE_OVER_CHARS: usize = 1_500;
 const ELIDED_MARK: &str = "[elided to save context";
+
+/// When compaction happens, as a share of the usable window: the window
+/// less the reply reserve, filled by the system prompt, tool schemas and
+/// history, as [`Meter`] measures it. Each fixed mode names the
+/// share at which older turns are summarised; old tool output is trimmed 20
+/// points earlier, which keeps `standard` at rusty's original 60% and 80%.
+/// `smart` also lets the model compact at a change of task, with `standard`'s
+/// thresholds as the backstop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compaction {
+    Aggressive,
+    #[default]
+    Standard,
+    Passive,
+    Smart,
+}
+
+impl Compaction {
+    pub const NAMES: &'static str = "aggressive, standard, passive, smart";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "aggressive" => Some(Self::Aggressive),
+            "standard" => Some(Self::Standard),
+            "passive" => Some(Self::Passive),
+            "smart" => Some(Self::Smart),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Aggressive => "aggressive",
+            Self::Standard => "standard",
+            Self::Passive => "passive",
+            Self::Smart => "smart",
+        }
+    }
+
+    /// Percent of the usable window past which older turns are summarised.
+    pub fn summarize_at(self) -> usize {
+        match self {
+            Self::Aggressive => 60,
+            Self::Standard | Self::Smart => 80,
+            Self::Passive => 95,
+        }
+    }
+
+    /// Percent past which old tool output is trimmed: 20 points earlier.
+    pub fn trim_at(self) -> usize {
+        self.summarize_at() - 20
+    }
+
+    /// One line for `/compact settings`.
+    pub fn describe(self) -> String {
+        let fixed = format!("trims old tool output past {}%, summarises past {}%", self.trim_at(), self.summarize_at());
+        match self {
+            Self::Smart => format!("smart: the model may compact when the work changes; otherwise {fixed}"),
+            m => format!("{}: {fixed}", m.name()),
+        }
+    }
+}
+
+/// Smart mode's own compaction is refused below this share of the budget.
+pub const SMART_FLOOR: usize = 20;
+/// The share above which the prompt invites the model to compact.
+pub const SMART_INVITE: usize = 25;
+
+/// `used` as a whole percent of `budget`.
+pub fn percent(used: usize, budget: usize) -> usize {
+    used * 100 / budget.max(1)
+}
 
 /// Rough token count: about 4 characters per token for code and English.
 pub fn estimate(messages: &[Value]) -> usize {
@@ -39,13 +112,186 @@ pub fn estimate_one(m: &Value) -> usize {
     chars / 4
 }
 
-pub fn window() -> usize {
-    std::env::var("RUSTY_CONTEXT_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(128_000)
+/// The window assumed when nothing says otherwise.
+pub const ASSUMED_WINDOW: usize = 128_000;
+
+/// How full the context is, read from the provider's own token counts.
+///
+/// The prompt tokens a provider reports for a request are the context at
+/// that request: system prompt, tool schemas and history. Between requests,
+/// what was appended since is estimated and scaled by a calibration ratio
+/// (measured over estimated tokens, an average updated on every reported
+/// request), so no tokenizer ships and no model name is consulted. Without
+/// any report the whole context is estimated.
+#[derive(Clone, Debug)]
+pub struct Meter {
+    pub window: usize,
+    /// Where `window` came from: flag, endpoint, table, assumed or overflow.
+    pub window_source: &'static str,
+    ratio: f64,
+    calibrated: bool,
+    /// The last reported prompt and the history length it covered.
+    last: Option<(usize, usize)>,
+    /// The largest prompt a request has been accepted with.
+    largest_accepted: usize,
+    pub requests: Vec<RequestUsage>,
 }
 
-/// Token budget for conversation history.
-pub fn history_budget(system_tokens: usize) -> usize {
-    window().saturating_sub(REPLY_RESERVE + system_tokens)
+/// One request's token counts, as the provider reported them or estimated.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RequestUsage {
+    pub prompt: u64,
+    pub completion: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// `provider` when the response carried usage, `estimated` otherwise.
+    pub source: &'static str,
+}
+
+/// Calibration: weight of the newest measurement, and the ratio's bounds.
+const CALIBRATION_WEIGHT: f64 = 0.3;
+const CALIBRATION_BOUNDS: (f64, f64) = (0.5, 2.0);
+
+impl Default for Meter {
+    fn default() -> Self {
+        Self::new(ASSUMED_WINDOW, "assumed")
+    }
+}
+
+impl Meter {
+    pub fn new(window: usize, window_source: &'static str) -> Self {
+        Self {
+            window: window.max(1),
+            window_source,
+            ratio: 1.0,
+            calibrated: false,
+            last: None,
+            largest_accepted: 0,
+            requests: Vec::new(),
+        }
+    }
+
+    /// The calibration ratio, or None before the first reported request.
+    pub fn calibration(&self) -> Option<f64> {
+        self.calibrated.then_some(self.ratio)
+    }
+
+    /// Records a finished request: `sent` is the estimate of everything it
+    /// sent (system prompt and tool schemas included) and `history_len` how
+    /// much history it covered.
+    pub fn observe(&mut self, usage: Option<&crate::llm::Usage>, sent: usize, history_len: usize) {
+        match usage {
+            Some(u) => {
+                let prompt = u.prompt as usize;
+                if sent > 0 && prompt > 0 {
+                    let measured = prompt as f64 / sent as f64;
+                    // The first report sets the ratio; later ones are averaged in.
+                    let next = if self.calibrated {
+                        (1.0 - CALIBRATION_WEIGHT) * self.ratio + CALIBRATION_WEIGHT * measured
+                    } else {
+                        measured
+                    };
+                    self.ratio = next.clamp(CALIBRATION_BOUNDS.0, CALIBRATION_BOUNDS.1);
+                    self.calibrated = true;
+                }
+                self.last = Some((prompt, history_len));
+                self.largest_accepted = self.largest_accepted.max(prompt);
+                self.requests.push(RequestUsage {
+                    prompt: u.prompt,
+                    completion: u.completion,
+                    cache_read: u.cache_read,
+                    cache_write: u.cache_write,
+                    source: "provider",
+                });
+            }
+            None => {
+                // The last report still describes its prefix of history; only
+                // what came after it is estimated.
+                self.requests.push(RequestUsage {
+                    prompt: self.scaled(sent) as u64,
+                    completion: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    source: "estimated",
+                });
+            }
+        }
+    }
+
+    /// History was rewritten (trimmed or compacted), so the last report no
+    /// longer describes it.
+    pub fn forget_last(&mut self) {
+        self.last = None;
+    }
+
+    fn scaled(&self, estimate: usize) -> usize {
+        (estimate as f64 * self.ratio).round() as usize
+    }
+
+    /// Tokens in context now: the last report plus what history gained since,
+    /// or, without a usable report, `fixed` (system prompt and tool schemas)
+    /// plus all of history, estimated.
+    pub fn fill(&self, history: &[Value], fixed: usize) -> usize {
+        match self.last {
+            Some((prompt, len)) if len <= history.len() => prompt + self.scaled(estimate(&history[len..])),
+            _ => self.scaled(fixed + estimate(history)),
+        }
+    }
+
+    /// What a request may fill: the window less the reply reserve.
+    pub fn capacity(&self) -> usize {
+        self.window.saturating_sub(REPLY_RESERVE).max(1)
+    }
+
+    /// A reply stopped because it reached the window: the window is at least
+    /// that request's prompt plus its output, and at least the largest prompt
+    /// accepted plus the reply reserve. Never raises it.
+    pub fn reached(&mut self, prompt_and_output: usize) -> bool {
+        let window = prompt_and_output.max(self.largest_accepted + REPLY_RESERVE);
+        if window == 0 || window >= self.window {
+            return false;
+        }
+        self.window = window;
+        self.window_source = "overflow";
+        self.last = None;
+        true
+    }
+
+    /// Corrects the window from a provider's overflow error. Returns whether
+    /// it changed. An OpenAI-style message names the limit; one that doesn't
+    /// lowers the window to the largest prompt the endpoint accepted.
+    pub fn overflow(&mut self, error: &str) -> bool {
+        let lower = error.to_lowercase();
+        let named = number_after(&lower, "maximum context length is ")
+            .or_else(|| number_after(&lower, "tokens > ").filter(|_| lower.contains("maximum")));
+        let window = match named {
+            Some(n) => n,
+            None if lower.contains("model_context_window_exceeded")
+                || lower.contains("context_length_exceeded")
+                || lower.contains("prompt is too long") =>
+            {
+                if self.largest_accepted == 0 {
+                    return false;
+                }
+                self.largest_accepted + REPLY_RESERVE
+            }
+            None => return false,
+        };
+        if window == 0 || window >= self.window {
+            return false;
+        }
+        self.window = window;
+        self.window_source = "overflow";
+        self.last = None;
+        true
+    }
+}
+
+/// The integer right after `marker` in `text`, if any.
+fn number_after(text: &str, marker: &str) -> Option<usize> {
+    let rest = &text[text.find(marker)? + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == ',').filter(|c| *c != ',').collect();
+    digits.parse().ok()
 }
 
 /// Shrinks old, large tool results in place. Returns tokens saved.
@@ -266,6 +512,90 @@ pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(prompt: u64) -> crate::llm::Usage {
+        crate::llm::Usage { prompt, completion: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn the_meter_trusts_reported_prompts_and_calibrates_the_rest() {
+        let history: Vec<Value> =
+            (0..4).map(|i| json!({"role": "user", "content": "x".repeat(400 * (i + 1))})).collect();
+        let mut m = Meter::new(100_000, "flag");
+        assert_eq!(m.calibration(), None);
+        // Before any report the whole context is estimated, ratio 1.
+        assert_eq!(m.fill(&history, 1_000), 1_000 + estimate(&history));
+        // The first report sets the ratio: 1,600 reported against 1,000 estimated.
+        m.observe(Some(&usage(1_600)), 1_000, 2);
+        assert!((m.calibration().unwrap() - 1.6).abs() < 1e-9);
+        // Later ones move it 30% of the way: 1.6 → 1.6 * 0.7 + 1.0 * 0.3 = 1.42, then back.
+        m.observe(Some(&usage(1_000)), 1_000, 2);
+        assert!((m.calibration().unwrap() - 1.42).abs() < 1e-9);
+        m.observe(Some(&usage(3_000)), 1_000, 2);
+        assert!((m.calibration().unwrap() - (1.42 * 0.7 + 3.0 * 0.3)).abs() < 1e-9);
+        let ratio = m.calibration().unwrap();
+        // The report stands for the first two messages; the rest is estimated and scaled.
+        assert_eq!(m.fill(&history, 1_000), 3_000 + (estimate(&history[2..]) as f64 * ratio).round() as usize);
+        // A response without usage keeps that anchor.
+        m.observe(None, 5_000, 3);
+        assert_eq!(m.fill(&history, 1_000), 3_000 + (estimate(&history[2..]) as f64 * ratio).round() as usize);
+        assert_eq!(m.requests.last().map(|r| r.source), Some("estimated"));
+        // Extreme ratios are clamped.
+        for _ in 0..20 {
+            m.observe(Some(&usage(1_000_000)), 1_000, 2);
+        }
+        assert_eq!(m.calibration(), Some(2.0));
+        // A rewritten history drops the report; a request without usage is counted as estimated.
+        m.forget_last();
+        assert_eq!(m.fill(&history, 0), (estimate(&history) as f64 * 2.0).round() as usize);
+        assert_eq!(m.capacity(), 100_000 - REPLY_RESERVE);
+    }
+
+    #[test]
+    fn an_overflow_error_corrects_the_window() {
+        let mut m = Meter::new(128_000, "assumed");
+        assert!(!m.overflow("HTTP 500: upstream timed out"), "unrelated errors change nothing");
+        assert!(!m.overflow("prompt is too long"), "no number and nothing accepted yet");
+        assert!(
+            m.overflow("HTTP 400: This model's maximum context length is 32,768 tokens. However, you requested 40000")
+        );
+        assert_eq!((m.window, m.window_source), (32_768, "overflow"));
+        assert!(!m.overflow("maximum context length is 64000 tokens"), "never raised by an error");
+        let mut a = Meter::new(1_000_000, "assumed");
+        assert!(a.overflow("prompt is too long: 210000 tokens > 200000 maximum"));
+        assert_eq!(a.window, 200_000);
+        let mut b = Meter::new(1_000_000, "assumed");
+        b.observe(Some(&usage(150_000)), 100_000, 1);
+        assert!(b.overflow("model_context_window_exceeded"));
+        assert_eq!(b.window, 150_000 + REPLY_RESERVE, "the largest accepted prompt, plus the reply reserve");
+        // A reply that stopped at the window: prompt plus output, when that is the larger bound.
+        let mut c = Meter::new(1_000_000, "assumed");
+        c.observe(Some(&usage(150_000)), 100_000, 1);
+        assert!(c.reached(150_000 + 30_000));
+        assert_eq!(c.window, 180_000);
+        assert!(!c.reached(200_000), "never raised");
+    }
+
+    #[test]
+    fn compaction_modes_scale_the_trim_and_summary_pair() {
+        use Compaction::*;
+        assert_eq!(Compaction::default(), Standard);
+        assert_eq!((Aggressive.trim_at(), Aggressive.summarize_at()), (40, 60));
+        assert_eq!((Standard.trim_at(), Standard.summarize_at()), (60, 80));
+        assert_eq!((Passive.trim_at(), Passive.summarize_at()), (75, 95));
+        assert_eq!((Smart.trim_at(), Smart.summarize_at()), (60, 80), "standard is smart's backstop");
+        for name in Compaction::NAMES.split(", ") {
+            assert_eq!(Compaction::parse(name).map(Compaction::name), Some(name));
+        }
+        assert_eq!(Compaction::parse("eager"), None);
+        // Standard fires exactly where rusty always did: budget * 6/10 and * 8/10.
+        for budget in [0, 7, 1_000, 96_123, 111_999] {
+            assert_eq!(budget * Standard.trim_at() / 100, budget * 6 / 10);
+            assert_eq!(budget * Standard.summarize_at() / 100, budget * 8 / 10);
+        }
+        assert!(SMART_FLOOR < SMART_INVITE && SMART_INVITE < Aggressive.trim_at());
+        assert_eq!((percent(25, 100), percent(19, 100), percent(5, 0)), (25, 19, 500));
+    }
 
     #[test]
     fn elides_only_old_large_outputs() {

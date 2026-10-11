@@ -223,6 +223,10 @@ pub struct Settings {
     /// None means rusty picks per request.
     pub execution_mode: Option<crate::execution::ExecutionMode>,
     pub delegation_override: bool,
+    /// When history is compacted (see `context::Compaction`).
+    pub compaction: String,
+    /// Context windows by model id, for endpoints that don't publish one.
+    pub context_windows: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for Settings {
@@ -236,6 +240,8 @@ impl Default for Settings {
             agents: AgentsConfig::default(),
             execution_mode: None,
             delegation_override: false,
+            compaction: "standard".into(),
+            context_windows: Default::default(),
         }
     }
 }
