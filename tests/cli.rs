@@ -2766,7 +2766,8 @@ fn trajectory_keeps_commands_that_compaction_summarised_away() {
         .cmd()
         .env("RUSTY_BASE_URL", url)
         .env("RUSTY_GOAL_MAX_TURNS", "1")
-        .env("RUSTY_CONTEXT_TOKENS", "22000")
+        // Small enough that the first output fills most of what a request may use.
+        .env("RUSTY_CONTEXT_TOKENS", "14000")
         .args(["--agents", "off", "--memory", "off", "--yolo", "--goal", "print some output", "--trajectory"])
         .arg(&path)
         .stdin(Stdio::null())
@@ -3561,4 +3562,65 @@ fn cache_reads_are_kept_apart_from_the_prompt_total() {
     );
     assert_eq!(trace["context"]["cache_read"], 4096);
     assert!(trace["context"]["calibration"].as_f64().unwrap() > 1.0, "5000 reported against a smaller estimate");
+}
+
+#[test]
+fn the_window_picks_the_mode_and_history_cap_unless_chosen() {
+    let run = |s: &Sandbox, window: &str, extra: &[&str]| {
+        let (url, server) = scripted_endpoint(vec![text_reply("done")]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_CONTEXT_TOKENS", window)
+            .args(["--yolo", "--memory", "off", "--stats"])
+            .args(extra)
+            .arg("go")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        server.join().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        stderr.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).unwrap()
+    };
+    let s = Sandbox::new("window-defaults");
+    let small = run(&s, "32000", &[]);
+    assert_eq!(small["compaction"], "aggressive");
+    assert_eq!(small["context"]["reply_reserve"], 4000);
+    let huge = run(&s, "1000000", &[]);
+    assert_eq!(
+        (huge["compaction"].as_str(), huge["context"]["history_cap"].as_u64()),
+        (Some("standard"), Some(128000))
+    );
+    // A chosen mode or cap wins.
+    let chosen = run(&s, "1000000", &["--compaction", "passive"]);
+    assert_eq!((chosen["compaction"].as_str(), chosen["context"]["history_cap"].as_u64()), (Some("passive"), None));
+    let capped = run(&s, "128000", &["--history-cap-tokens", "50000"]);
+    assert_eq!(capped["context"]["history_cap"], 50000);
+}
+
+#[test]
+fn a_history_cap_compacts_well_inside_a_large_window() {
+    // 30k reported tokens is 16% of a 200k window, but past a 20k cap.
+    let s = Sandbox::new("history-cap");
+    let (url, server) = scripted_endpoint(vec![
+        reported(bash_reply("echo first-step"), 30_000),
+        reported(bash_reply("echo second-step"), 30_500),
+        text_reply("1. Task: go. 2. Ran echo."),
+        text_reply("done"),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "200000")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "20000", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4, "a compaction request ran: {}", String::from_utf8_lossy(&out.stdout));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["trigger"], "level", "{stats}");
 }

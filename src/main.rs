@@ -69,6 +69,11 @@ struct Cli {
     #[arg(long, env = "RUSTY_CONTEXT_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
     context_tokens: Option<u64>,
 
+    /// Compaction never waits past this many context tokens, whatever the
+    /// window (overrides saved settings)
+    #[arg(long, env = "RUSTY_HISTORY_CAP_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
+    history_cap_tokens: Option<u64>,
+
     /// Compaction: aggressive, standard, passive or smart (overrides saved settings)
     #[arg(long, env = "RUSTY_COMPACTION")]
     compaction: Option<String>,
@@ -303,9 +308,19 @@ fn run() -> Result<i32> {
             },
         },
     };
-    let compaction = cli.compaction.clone().unwrap_or_else(|| settings.compaction.clone());
-    agent.compaction = context::Compaction::parse(&compaction)
-        .ok_or_else(|| anyhow!("unknown compaction `{compaction}` ({})", context::Compaction::NAMES))?;
+    // Unchosen, compaction follows the window: aggressive below 48k, and a
+    // 128k cap on history above 200k.
+    let chosen_compaction = cli.compaction.clone().or_else(|| settings.compaction.clone());
+    agent.compaction = match &chosen_compaction {
+        Some(c) => context::Compaction::parse(c)
+            .ok_or_else(|| anyhow!("unknown compaction `{c}` ({})", context::Compaction::NAMES))?,
+        None => context::Compaction::for_window(agent.meter.window),
+    };
+    agent.history_cap = cli
+        .history_cap_tokens
+        .map(|n| n as usize)
+        .or(settings.history_cap_tokens)
+        .or_else(|| context::default_history_cap(agent.meter.window).filter(|_| chosen_compaction.is_none()));
     agent.shell_only = match cli.toolset.as_str() {
         "full" => false,
         "shell" => true,
@@ -413,7 +428,11 @@ fn capabilities() -> serde_json::Value {
         "contract": CONTRACT,
         "memory": accepted(&memory, &|v| rusty::advisor::Level::parse(v).is_some()),
         "compaction": accepted(&compaction, &|v| context::Compaction::parse(v).is_some()),
-        "context": {"tokens_flag": true, "window_sources": ["flag", "endpoint", "table", "assumed", "overflow"]},
+        "context": {
+            "tokens_flag": true,
+            "history_cap_flag": true,
+            "window_sources": ["flag", "endpoint", "table", "assumed", "overflow"]
+        },
         "mode": modes,
         "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
@@ -634,7 +653,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             name => match context::Compaction::parse(name) {
                 Some(mode) => {
                     agent.compaction = mode;
-                    settings.compaction = mode.name().into();
+                    settings.compaction = Some(mode.name().into());
                     settings.save();
                     println!("  compaction · {} (saved)", mode.describe());
                 }

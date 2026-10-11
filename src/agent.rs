@@ -222,6 +222,11 @@ pub struct Agent {
     pub shell_only: bool,
     /// When history is compacted; `smart` adds the `compact` tool.
     pub compaction: context::Compaction,
+    /// Compaction thresholds never sit above this many context tokens, so a
+    /// large window isn't filled just because it can be.
+    pub history_cap: Option<usize>,
+    /// This step's estimate of the system prompt and tool schemas.
+    fixed_now: Option<usize>,
     /// A compaction the model asked for, with its reason and focus; it runs
     /// before the next step, so a tool call is never split from its result.
     pending_compaction: Option<(String, Option<String>)>,
@@ -315,6 +320,8 @@ impl Agent {
             delegation_override: false,
             shell_only: false,
             compaction: context::Compaction::default(),
+            history_cap: None,
+            fixed_now: None,
             pending_compaction: None,
             pending_goal: None,
             checker_owed: false,
@@ -434,7 +441,7 @@ impl Agent {
             g.checker_used = true;
         }
         d.line(&format!("  {} {}", ui::accent("◇ careful"), ui::dim("a read-only checker is reviewing the result")));
-        let constraints = context::user_messages(&self.history, 8_000);
+        let constraints = context::user_messages(&self.history, self.carry_chars());
         let working = context::working_set(&self.history);
         let recent: Vec<Value> = self.history.iter().rev().take(12).rev().cloned().collect();
         let recent = serde_json::to_string(&recent).unwrap_or_default();
@@ -773,6 +780,9 @@ impl Agent {
                     self.history.push(json!({"role": "user", "content": text}));
                 }
             }
+            self.meter.set_reply(self.execution_mode.max_tokens() as usize);
+            self.fixed_now = None;
+            self.fixed_now = Some(self.fixed_estimate());
             self.manage_context(&mut d);
             let mut system = self.system_prompt();
             if let Some(h) = &mut self.advisor {
@@ -1868,9 +1878,31 @@ impl Agent {
 
     /// What every request sends besides history: the system prompt and the
     /// tool schemas, estimated.
+    /// Built once per step and reused there.
     fn fixed_estimate(&self) -> usize {
+        if let Some(n) = self.fixed_now {
+            return n;
+        }
         let advice = if self.advisor.is_some() { context::MEMORY_CHARS } else { 0 };
         (self.system_prompt().len() + self.tool_defs().to_string().len() + advice) / 4
+    }
+
+    /// Context tokens past which old tool output is trimmed, and past which
+    /// older turns are summarised: the mode's shares of the usable window,
+    /// lowered to the history cap, if one is set, in the same proportion.
+    fn thresholds(&self) -> (usize, usize) {
+        let capacity = self.meter.capacity();
+        let (trim, summarize) = (self.compaction.trim_at(), self.compaction.summarize_at());
+        let at = |pct: usize| capacity * pct / 100;
+        match self.history_cap {
+            Some(cap) => (at(trim).min(cap * trim / summarize), at(summarize).min(cap)),
+            None => (at(trim), at(summarize)),
+        }
+    }
+
+    /// Characters of the user's messages a compaction carries now.
+    fn carry_chars(&self) -> usize {
+        context::carry_chars(self.meter.capacity().saturating_sub(self.fixed_estimate()))
     }
 
     pub fn context_pct(&self) -> usize {
@@ -1883,15 +1915,16 @@ impl Agent {
                 d.line(&ui::err(&format!("  compaction ({reason}) failed: {e:#}")));
             }
         }
-        let (fixed, capacity) = (self.fixed_estimate(), self.meter.capacity());
-        if self.meter.fill(&self.history, fixed) > capacity * self.compaction.trim_at() / 100 {
-            let saved = context::elide_old_tool_outputs(&mut self.history);
+        let fixed = self.fixed_estimate();
+        let (trim, summarize) = self.thresholds();
+        if self.meter.fill(&self.history, fixed) > trim {
+            let saved = context::elide_old_tool_outputs(&mut self.history, self.meter.window);
             if saved > 0 {
                 self.meter.forget_last();
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if self.meter.fill(&self.history, fixed) > capacity * self.compaction.summarize_at() / 100 {
+        if self.meter.fill(&self.history, fixed) > summarize {
             if let Err(e) = self.compact_with(d, None, false, "level") {
                 d.line(&ui::err(&format!("  compaction failed: {e:#}")));
             }
@@ -1906,6 +1939,8 @@ impl Agent {
         json!({
             "window": m.window,
             "window_source": m.window_source,
+            "reply_reserve": m.reserve,
+            "history_cap": self.history_cap,
             "calibration": m.calibration(),
             "provider_usage": provider,
             "estimated_usage": m.requests.len() - provider,
@@ -1958,10 +1993,14 @@ impl Agent {
             return "error: compaction is automatic in this mode".into();
         }
         let used = self.context_used();
-        if used < context::SMART_FLOOR {
+        let filled = self.meter.fill(&self.history, self.fixed_estimate());
+        let floor = (self.meter.capacity() * context::SMART_FLOOR / 100).max(context::SMART_FLOOR_TOKENS);
+        if filled < floor {
             return format!(
-                "error: context is only {used}% full; compaction is refused below {}%. Continue without it.",
-                context::SMART_FLOOR
+                "error: context is only {used}% full; compaction is refused below {}% (and below {} tokens). \
+                 Continue without it.",
+                context::SMART_FLOOR,
+                context::SMART_FLOOR_TOKENS
             );
         }
         if let Some(why) = self.compaction_refused() {
@@ -2014,14 +2053,14 @@ impl Agent {
         }
         if !manual && trigger != "smart" && context::estimate(&self.history[..split]) * 4 < before {
             // The bulk is in recent messages, so summarising older ones won't help.
-            let saved = context::elide_tool_outputs(&mut self.history, 1);
+            let saved = context::elide_tool_outputs(&mut self.history, 1, context::elision_head(self.meter.window));
             if saved > 0 {
                 self.meter.forget_last();
                 d.line(&ui::dim(&format!("  ✂ context is mostly recent tool output; trimmed ~{saved} tokens")));
             }
             return Ok(());
         }
-        let carried = context::user_messages(&self.history[..split], 8_000);
+        let carried = context::user_messages(&self.history[..split], self.carry_chars());
         let working_set = context::working_set(&self.history[..split]);
         let mut messages =
             vec![json!({"role": "system", "content": "You write precise hand-off summaries of coding sessions."})];
