@@ -456,34 +456,58 @@ pub fn manual_split(history: &[Value]) -> Option<usize> {
     (history.len() >= 2).then_some(history.len())
 }
 
-/// The user's messages from a span of history, verbatim, newest kept when
-/// they exceed `max_chars`. Compaction carries these over untouched.
+/// The user's messages from a span of history, verbatim where they fit in
+/// `max_chars`. Compaction carries these over. The first message and the
+/// newest always survive whole. When the total is too long, older entries
+/// are cut to their first line, oldest first; then the middle entries since
+/// the last compaction are dropped, oldest first; then, if a long session's
+/// carried block still doesn't fit, its middle entries go too, oldest first.
 pub fn user_messages(history: &[Value], max_chars: usize) -> String {
-    let mut picked: Vec<&str> = Vec::new();
-    let mut used = 0;
-    for m in history.iter().rev().filter(|m| m["role"] == "user") {
+    let mut entries: Vec<String> = Vec::new();
+    // Entries before this index came from an earlier compaction.
+    let mut carried = 0;
+    for m in history.iter().filter(|m| m["role"] == "user") {
         let Some(text) = m["content"].as_str() else { continue };
         if text.starts_with("[Summary of the conversation so far]") {
             // Already-carried messages live inside the previous summary block.
             if let Some((_, kept)) = text.split_once(USER_MESSAGES_HEADER) {
-                picked.push(kept.trim());
+                entries.extend(kept.trim().split(CARRY_SEPARATOR).filter(|e| !e.is_empty()).map(String::from));
+                carried = entries.len();
             }
-            break;
+            continue;
         }
         if text.starts_with(NOTE) {
             // rusty's own nudges and reviews are not things the user said.
             continue;
         }
-        let text = crate::ui::truncate(text, 2_000);
-        if used + text.len() > max_chars {
+        // A separator inside a message would split it when carried again.
+        entries.push(crate::ui::truncate(text, 2_000).replace(CARRY_SEPARATOR, "\n- - -\n"));
+    }
+    let total = |e: &[String]| e.iter().map(|x| x.len() + CARRY_SEPARATOR.len()).sum::<usize>();
+    let last = entries.len().saturating_sub(1);
+    // Cut older entries to a first line, oldest first; the first and newest stay whole.
+    for i in 1..last {
+        if total(&entries) <= max_chars {
             break;
         }
-        used += text.len();
-        picked.push(text);
+        let line = entries[i].lines().next().unwrap_or("");
+        let short = crate::ui::truncate(line, 200);
+        if short.len() < entries[i].len() {
+            entries[i] = format!("{short} …");
+        }
     }
-    picked.reverse();
-    picked.join("\n---\n")
+    // Then drop middle entries: those since the last compaction first, then
+    // carried ones; the first and the newest stay.
+    while total(&entries) > max_chars && entries.len() > 2 {
+        let newest = entries.len() - 1;
+        let i = if carried.max(1) < newest { carried.max(1) } else { 1 };
+        entries.remove(i);
+        carried = carried.saturating_sub(usize::from(i < carried));
+    }
+    entries.join(CARRY_SEPARATOR)
 }
+
+const CARRY_SEPARATOR: &str = "\n---\n";
 
 pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
 
@@ -652,6 +676,47 @@ mod tests {
         ];
         let again = user_messages(&second, 8000);
         assert!(again.contains("fix the parser") && again.contains("also add tests"));
+    }
+
+    #[test]
+    fn carried_messages_survive_when_new_ones_overflow_the_cap() {
+        let summary = |carried: &str| json!({"role": "user", "content": format!("[Summary of the conversation so far]\nstuff\n\n{USER_MESSAGES_HEADER}\n{carried}")});
+        let first = vec![
+            json!({"role": "user", "content": "fix the parser\nit drops the last field"}),
+            json!({"role": "user", "content": "and keep the CLI flags stable"}),
+        ];
+        let carried = user_messages(&first, 8_000);
+        // Since then, more than the cap of new messages.
+        let mut history = vec![summary(&carried)];
+        for i in 0..6 {
+            history.push(json!({"role": "user", "content": format!("step {i}: {}\nmore detail", "x".repeat(1_900))}));
+        }
+        history.push(json!({"role": "user", "content": "now ship it"}));
+        let again = user_messages(&history, 8_000);
+        assert!(again.starts_with("fix the parser\nit drops the last field"), "the first message stays whole: {again}");
+        assert!(again.contains("and keep the CLI flags stable"), "the carried block survives");
+        assert!(again.ends_with("now ship it"), "the newest stays");
+        assert!(again.len() <= 8_000, "{}", again.len());
+        assert!(
+            again.contains("step 0:") && again.contains(" …"),
+            "older entries are cut to a first line before any is dropped"
+        );
+        // A third compaction still carries the first message.
+        let third = user_messages(&[summary(&again), json!({"role": "user", "content": "one more"})], 8_000);
+        assert!(third.starts_with("fix the parser") && third.ends_with("one more"));
+
+        // A long session: a carried block of forty long entries plus one new message
+        // comes back under the cap, first message whole, carried entries dropped oldest first.
+        let many: Vec<String> = (0..40).map(|i| format!("request {i}: {}", "y".repeat(400))).collect();
+        let block = format!("fix the parser{CARRY_SEPARATOR}{}", many.join(CARRY_SEPARATOR));
+        let long = user_messages(&[summary(&block), json!({"role": "user", "content": "and finish"})], 8_000);
+        assert!(long.len() <= 8_000, "{}", long.len());
+        assert!(long.starts_with("fix the parser") && long.ends_with("and finish"), "{long}");
+        assert!(!long.contains("request 0:") && long.contains("request 39:"), "oldest carried entries go first");
+
+        // A message containing the separator stays one entry.
+        let hr = user_messages(&[json!({"role": "user", "content": "above\n---\nbelow"})], 8_000);
+        assert_eq!(hr.split(CARRY_SEPARATOR).count(), 1, "{hr}");
     }
 
     #[test]

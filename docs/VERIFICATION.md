@@ -166,6 +166,14 @@ the same on any model. It changes where `standard` fires: thresholds now
 count the system prompt and tool schemas, measured from the provider's
 reported usage, where the pin estimated history alone.
 
+What a compaction carries of the user's own messages changed after the pin
+too, as a fix found by reading the code, not a task failure. The pin carries
+the newest 8,000 characters and drops the block an earlier compaction
+carried whenever the messages since then pass that cap, the first request
+included. Now the first and newest messages always survive whole; over the
+cap, older entries are cut to their first line, then middle entries are
+dropped oldest first, newer ones before carried ones.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
