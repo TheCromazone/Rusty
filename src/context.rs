@@ -119,7 +119,7 @@ impl Compaction {
 
 /// Smart mode's own compaction is refused below this share of the budget.
 pub const SMART_FLOOR: usize = 20;
-/// The history cap used when no mode or cap is chosen: 128k tokens for a
+/// The history cap used when none is chosen: 128k tokens for a
 /// window over 200k, so a huge window isn't filled just because it can be.
 pub fn default_history_cap(window: usize) -> Option<usize> {
     (window > 200_000).then_some(REFERENCE_WINDOW)

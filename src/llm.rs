@@ -194,13 +194,12 @@ impl Client {
         messages: Vec<Value>,
         tools: Value,
         temperature: f32,
-        execution_mode: ExecutionMode,
-        role: &'static str,
+        inference: (ExecutionMode, &'static str, Option<u32>),
     ) -> Receiver<Event> {
         let (tx, rx) = channel();
         let me = self.clone();
         std::thread::spawn(move || {
-            let result = me.chat(&model, &messages, &tools, temperature, (execution_mode, role), &mut |d| {
+            let result = me.chat(&model, &messages, &tools, temperature, inference, &mut |d| {
                 let ev = match d {
                     Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
                     Delta::Content(s) => Event::Content(s.to_string()),
@@ -214,21 +213,23 @@ impl Client {
 
     /// Streams one chat completion, calling `on` for every text/reasoning
     /// delta; `on` returns false to stop early. An empty `tools` array means a
-    /// plain completion.
+    /// plain completion. `inference` is the mode, the request's role, and the
+    /// most output it may ask for (see [`clamp_output`]).
     pub fn chat(
         &self,
         model: &str,
         messages: &[Value],
         tools: &Value,
         temperature: f32,
-        inference: (ExecutionMode, &str),
+        inference: (ExecutionMode, &str, Option<u32>),
         on: &mut dyn FnMut(Delta) -> bool,
     ) -> Result<Reply> {
-        let (execution_mode, role) = inference;
+        let (execution_mode, role, output_cap) = inference;
         let ep = self.endpoint_for(model)?;
         if ep.provider == Provider::Anthropic {
             let first_party = ep.base_url == crate::config::ANTHROPIC_BASE_URL;
-            let (body, beta) = anthropic::request(model, messages, tools, execution_mode, first_party);
+            let (mut body, beta) = anthropic::request(model, messages, tools, execution_mode, first_party);
+            clamp_output(&mut body, output_cap);
             let url = format!("{}/v1/messages", ep.base_url);
             return self.stream_with_retry(on, |on| {
                 let sent = self.send(ep, &url, Some(&body), beta.as_deref(), role)?;
@@ -250,6 +251,7 @@ impl Client {
         } else {
             execution_mode.apply_inference(&mut body, &ep.base_url, model);
         }
+        clamp_output(&mut body, output_cap);
         if tools.as_array().is_some_and(|t| !t.is_empty()) {
             body["tools"] = tools.clone();
             body["tool_choice"] = json!("auto");
@@ -462,6 +464,21 @@ impl Client {
         waited?;
         self.budget.remaining()?;
         Ok(())
+    }
+}
+
+/// Lowers the request's output cap to `cap`, the room the window leaves
+/// beside the prompt, so prompt and reply together never ask for more than
+/// the window. A reasoning budget keeps to three quarters of the new cap.
+fn clamp_output(body: &mut Value, cap: Option<u32>) {
+    let Some(cap) = cap.map(u64::from) else { return };
+    for key in ["max_tokens", "max_completion_tokens"] {
+        if body[key].as_u64().is_some_and(|n| n > cap) {
+            body[key] = json!(cap);
+        }
+    }
+    if body["reasoning_budget"].as_u64().is_some_and(|n| n > cap * 3 / 4) {
+        body["reasoning_budget"] = json!(cap * 3 / 4);
     }
 }
 
@@ -693,6 +710,21 @@ mod tests {
         assert!(backoff(1, Some(90)).as_secs() >= 90);
         assert!(backoff(1, Some(10_000)).as_secs() <= MAX_WAIT_SECS + MAX_WAIT_SECS / 4);
         assert_eq!(backoff(3, Some(0)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_output_cap_never_exceeds_the_room_left() {
+        let mut body = json!({"max_tokens": 32768, "reasoning_budget": 24576});
+        clamp_output(&mut body, Some(32768));
+        assert_eq!((body["max_tokens"].as_u64(), body["reasoning_budget"].as_u64()), (Some(32768), Some(24576)));
+        clamp_output(&mut body, Some(8000));
+        assert_eq!((body["max_tokens"].as_u64(), body["reasoning_budget"].as_u64()), (Some(8000), Some(6000)));
+        let mut body = json!({"max_completion_tokens": 16384});
+        clamp_output(&mut body, Some(4000));
+        assert_eq!(body["max_completion_tokens"], 4000);
+        assert!(body.get("max_tokens").is_none(), "no cap is added where none was sent");
+        clamp_output(&mut body, None);
+        assert_eq!(body["max_completion_tokens"], 4000);
     }
 
     #[test]
