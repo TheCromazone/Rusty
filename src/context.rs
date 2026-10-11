@@ -133,6 +133,33 @@ pub const SMART_INVITE: usize = 25;
 pub const SMART_TAIL: usize = 2;
 /// Tool calls that must pass after any compaction before the model's next.
 pub const SMART_SPACING: usize = 10;
+/// How the working set lists files that were edited and are back as they started.
+pub const TOUCHED_UNCHANGED: &str = "- touched, now unchanged: ";
+
+/// Moves the `changed` files that `unchanged` says are back as they started
+/// to their own line, so a summary doesn't report an edit that was undone.
+pub fn collapse_reverts(working_set: &str, unchanged: impl Fn(&str) -> bool) -> String {
+    let mut out = String::new();
+    for line in working_set.lines() {
+        match line.strip_prefix("- changed: ") {
+            Some(files) => {
+                let (back, kept): (Vec<&str>, Vec<&str>) = files.split(", ").partition(|f| unchanged(f));
+                if !kept.is_empty() {
+                    out.push_str(&format!("- changed: {}\n", kept.join(", ")));
+                }
+                if !back.is_empty() {
+                    out.push_str(&format!("{TOUCHED_UNCHANGED}{}\n", back.join(", ")));
+                }
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// How the working set marks an error no later command has cleared.
 pub const UNRESOLVED_ERROR: &str = "- last unresolved error:";
 
@@ -449,9 +476,13 @@ pub fn working_set(history: &[Value]) -> String {
         // Earlier compactions: keep the files they recorded as changed.
         if let Some(text) = m["content"].as_str() {
             if let Some((_, ws)) = text.split_once(WORKING_SET_HEADER) {
-                if let Some(line) = ws.lines().find_map(|l| l.strip_prefix("- changed: ")) {
-                    for f in line.split(", ") {
-                        push(&mut edited, f.to_string());
+                // Files an earlier compaction found back as they started were
+                // still touched; they are checked again each time.
+                for prefix in ["- changed: ", TOUCHED_UNCHANGED] {
+                    if let Some(line) = ws.lines().find_map(|l| l.strip_prefix(prefix)) {
+                        for f in line.split(", ") {
+                            push(&mut edited, f.to_string());
+                        }
                     }
                 }
             }
@@ -845,6 +876,21 @@ mod tests {
         // A message containing the separator stays one entry.
         let hr = user_messages(&[json!({"role": "user", "content": "above\n---\nbelow"})], 8_000);
         assert_eq!(hr.split(CARRY_SEPARATOR).count(), 1, "{hr}");
+    }
+
+    #[test]
+    fn reverted_files_are_told_apart_from_changed_ones() {
+        let ws = "- changed: src/a.rs, src/b.rs, new.txt\n- read recently: src/a.rs\n";
+        let out = collapse_reverts(ws, |f| f != "src/b.rs");
+        assert_eq!(
+            out,
+            "- changed: src/b.rs\n- touched, now unchanged: src/a.rs, new.txt\n- read recently: src/a.rs\n"
+        );
+        assert_eq!(collapse_reverts(ws, |_| false), ws, "nothing reverted, nothing moved");
+        // A later compaction re-reads both lines, so a file edited again moves back.
+        let summary = format!("[Summary of the conversation so far]\nx\n\n{WORKING_SET_HEADER}\n{out}");
+        let again = working_set(&[json!({"role": "user", "content": summary})]);
+        assert!(again.contains("src/a.rs") && again.contains("new.txt") && again.starts_with("- changed: "), "{again}");
     }
 
     #[test]

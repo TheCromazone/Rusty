@@ -3629,6 +3629,57 @@ fn a_history_cap_compacts_well_inside_a_large_window() {
 }
 
 #[test]
+fn a_compaction_reports_an_undone_edit_as_unchanged() {
+    let s = Sandbox::new("revert-collapse");
+    std::fs::write(s.project.join("a.txt"), "one\n").unwrap();
+    std::fs::write(s.project.join("b.txt"), "keep\n").unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&s.project)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "start"]);
+    let edit = |path: &str, from: &str, to: &str| {
+        reported(
+            tool_reply("edit_file", serde_json::json!({"path": path, "old_string": from, "new_string": to})),
+            50_000,
+        )
+    };
+    let read = |path: &str| reported(tool_reply("read_file", serde_json::json!({"path": path})), 50_000);
+    // The edits fall before the two steps a smart compaction keeps, so they are summarised.
+    let (out, requests) = smart_run(
+        &s,
+        vec![
+            read("a.txt"),
+            edit("a.txt", "one", "two"),
+            read("b.txt"),
+            edit("b.txt", "keep", "changed"),
+            edit("a.txt", "two", "one"),
+            reported(bash_reply("echo x"), 55_000),
+            reported(bash_reply("echo y"), 58_000),
+            reported(tool_reply("compact", serde_json::json!({"reason": "the edits are done"})), 60_000),
+            text_reply("1. Task: go."),
+            text_reply("done"),
+        ],
+    );
+    let after = requests.last().unwrap()["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]"), "a compaction ran: {after}");
+    assert!(after.contains("- changed: b.txt"), "{after}");
+    assert!(after.contains("- touched, now unchanged: a.txt"), "{after}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["reverted"], 1, "{stats}");
+}
+
+#[test]
 fn a_request_asks_for_no_more_output_than_the_window_leaves() {
     // At a 32k window, standard's 16k reply fits beside a small prompt but
     // not beside 20k reported tokens.

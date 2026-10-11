@@ -99,7 +99,10 @@ converging on a long finish, once the context is more than 25% full. The
 harness refuses it below 20%, while the last error is unresolved, while
 another call in the same step or a background command is pending, and within
 ten tool calls of the previous compaction. An accepted one keeps the model's
-last two steps verbatim and summarises what came before. Each time, the user
+last two steps verbatim and summarises what came before. A compaction
+also compares each changed tracked file with its blob at startup, and one
+whose edits were undone is listed as touched, now unchanged rather than
+changed. Each time, the user
 sees one line: "Rusty is auto-compacting because …". Measured token counts from the API are shown after
 every turn, so you always know where you stand.
 

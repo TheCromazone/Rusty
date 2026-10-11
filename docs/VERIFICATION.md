@@ -198,6 +198,14 @@ budget where the pin carried 8,000 characters. Harness runs on these builds
 should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
 or accept the 128k default.
 
+A compaction then started telling undone edits apart, again by the
+owner-approved design: at startup rusty records each tracked file's blob
+(`git ls-files -s`, with uncommitted files hashed as they stand), and at
+compaction a "changed" path whose current blob equals that one moves to
+"touched, now unchanged". It is deterministic and costs one `git
+hash-object` per compaction. Untracked files and projects outside git are
+left as they were.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
@@ -621,9 +629,11 @@ no key, so a harness can refuse an unsupported setting before any model call.
     compaction with its `trigger` (`level`, `smart`, `manual` or
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
     them, `calls_since_last`, `boundary`, the index in the trajectory's
-    `messages` of the summary that replaced history, and `resumes_at`, the
-    index of the first message after the compaction. The messages between
-    them are the summary and those kept verbatim, which ran before it. A
+    `messages` of the summary that replaced history, `resumes_at`, the
+    index of the first message after the compaction, and `reverted`, how
+    many files it found with their edits undone. The messages from
+    `boundary` up to `resumes_at` are the summary and those kept verbatim,
+    which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.
   - `memory` (null when off).
