@@ -120,6 +120,11 @@ memory tasks test different things:
   reading the harness's records: session 1's transcript or Rusty's own
   session history in the run's home. The eval scores such a run `leak` and
   doesn't count it.
+- `evals/multi/memory-use-agent` and `memory-use-user` measure use alone.
+  Before a single session, the same seed is saved straight into memory, by
+  the agent or by the user. Rusty offers it at every level, so a miss with
+  memory on means the model ignored a lesson it was shown. `--memory off`
+  is the baseline, and fails by construction.
 - `evals/multi/memory-handoff` grades whether a lesson was saved, so
   `--memory off` fails it by construction. Its second session can find the
   test command in the Makefile, so a pass shows the mechanism works, not
@@ -150,10 +155,8 @@ separated two failures:
   ran out of time.
 
 Since this model didn't use an offered lesson, fixing delivery alone would
-not change its result. The next step is to measure use directly, by seeding
-the lesson (from the user and from the agent) into a fresh session 2 and
-checking whether it runs the suite with the seed, before changing how
-anchors or advice work. Elsewhere in the matrix, memory neither clearly
+not change its result. The `memory-use` tasks measure use directly, and
+come before any change to how anchors or advice work. Elsewhere in the matrix, memory neither clearly
 helped nor hurt: `stale-anchor` and `compact-focus` passed at every level,
 and `poisoned-lesson` and `compaction-rule` missed with memory off and at
 most levels, with no consistent direction in three repeats.
