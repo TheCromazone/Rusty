@@ -210,7 +210,13 @@ left as they were.
 settings) then let a separate model write compaction summaries, again by the
 owner-approved design. Unset, the session's model writes them as before. A
 summariser that errors or returns an empty summary hands that compaction to
-the session's model once, and one no endpoint serves is refused at startup.
+the session's model once. At startup a summariser no endpoint serves is
+refused, and so is one whose window (from its endpoint or the saved table)
+is smaller than the largest summary request, the summarise threshold plus
+the reply reserve; an unknown window is reported and left to the fallback.
+The summariser's reported usage feeds neither the context meter nor its
+calibration, so a different tokenizer cannot skew the session's fill, and
+its tokens are totalled under its own model.
 Each compaction records the model that wrote its summary, so a comparison
 can tell a summariser's effect from a fallback. It is a separate
 configuration: pin it, or leave it unset, and don't pool runs across it.
