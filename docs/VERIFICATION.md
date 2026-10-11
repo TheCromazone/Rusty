@@ -153,6 +153,13 @@ came from:
 `--memory off` for benchmark runs (4c5af14) is a cohort rule, not a fix for
 a failure.
 
+After the reporting pin, compaction modes (`--compaction`, `/compact
+settings`) were added at the owner's request, motivated by Fan et al., "An
+Empirical Study of Harness Design for Coding Agents" (arXiv:2609.20804), not
+by task failures. They are not in the reporting configuration. The default,
+`standard`, compacts where Rusty always did, and any other mode is a separate
+experiment.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
@@ -511,6 +518,10 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
 - **Memory and delegation.** `--memory off` starts no memory daemon and reads
   no lessons. `--agents off` runs one agent. Any other value is a different
   experiment.
+- **Compaction.** Builds after the reporting pin accept `--compaction`
+  (`aggressive`, `standard`, `passive` or `smart`; listed by
+  `--capabilities`). It falls back to the saved setting, so a run on such a
+  build should pin it, normally to `--compaction standard`.
 - **`--verify`** is optional. Without it, the goal closes on the model's word
   and exit status 2 can't happen.
 - **MCP.** Servers come from `.mcp.json` in the project, or from
@@ -558,6 +569,7 @@ no key, so a harness can refuse an unsupported setting before any model call.
   - `claims`: what happened to the model's completion claims (see above);
   - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;
+  - `compaction` (builds after the reporting pin);
   - `memory` (null when off).
 - **`--trajectory`** writes the conversation and the same `model_budget`,
   `claims` and `safety`, at the top level.

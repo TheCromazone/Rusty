@@ -9,7 +9,8 @@
 //! When history outgrows its share, rusty gives tokens back in order of how
 //! cheap they are to get back: first it shrinks old tool outputs (the model
 //! can re-run a read), and only then does it summarise older turns. Your own
-//! messages, the plan and the goal are never dropped.
+//! messages, the plan and the goal are never dropped. [`Compaction`] sets how
+//! full history gets before each step happens.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -20,6 +21,77 @@ pub const REPLY_RESERVE: usize = 16_000;
 const KEEP_RECENT_TOOL_RESULTS: usize = 8;
 const ELIDE_OVER_CHARS: usize = 1_500;
 const ELIDED_MARK: &str = "[elided to save context";
+
+/// When compaction happens, as a share of the history budget (the window
+/// less the reply reserve and the system prompt). Each fixed mode names the
+/// share at which older turns are summarised; old tool output is trimmed 20
+/// points earlier, which keeps `standard` at rusty's original 60% and 80%.
+/// `smart` also lets the model compact at a change of task, with `standard`'s
+/// thresholds as the backstop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Compaction {
+    Aggressive,
+    #[default]
+    Standard,
+    Passive,
+    Smart,
+}
+
+impl Compaction {
+    pub const NAMES: &'static str = "aggressive, standard, passive, smart";
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "aggressive" => Some(Self::Aggressive),
+            "standard" => Some(Self::Standard),
+            "passive" => Some(Self::Passive),
+            "smart" => Some(Self::Smart),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Aggressive => "aggressive",
+            Self::Standard => "standard",
+            Self::Passive => "passive",
+            Self::Smart => "smart",
+        }
+    }
+
+    /// Percent of the history budget past which older turns are summarised.
+    pub fn summarize_at(self) -> usize {
+        match self {
+            Self::Aggressive => 60,
+            Self::Standard | Self::Smart => 80,
+            Self::Passive => 95,
+        }
+    }
+
+    /// Percent past which old tool output is trimmed: 20 points earlier.
+    pub fn trim_at(self) -> usize {
+        self.summarize_at() - 20
+    }
+
+    /// One line for `/compact settings`.
+    pub fn describe(self) -> String {
+        let fixed = format!("trims old tool output past {}%, summarises past {}%", self.trim_at(), self.summarize_at());
+        match self {
+            Self::Smart => format!("smart: the model may compact when the work changes; otherwise {fixed}"),
+            m => format!("{}: {fixed}", m.name()),
+        }
+    }
+}
+
+/// Smart mode's own compaction is refused below this share of the budget.
+pub const SMART_FLOOR: usize = 20;
+/// The share above which the prompt invites the model to compact.
+pub const SMART_INVITE: usize = 25;
+
+/// `used` as a whole percent of `budget`.
+pub fn percent(used: usize, budget: usize) -> usize {
+    used * 100 / budget.max(1)
+}
 
 /// Rough token count: about 4 characters per token for code and English.
 pub fn estimate(messages: &[Value]) -> usize {
@@ -266,6 +338,27 @@ pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_modes_scale_the_trim_and_summary_pair() {
+        use Compaction::*;
+        assert_eq!(Compaction::default(), Standard);
+        assert_eq!((Aggressive.trim_at(), Aggressive.summarize_at()), (40, 60));
+        assert_eq!((Standard.trim_at(), Standard.summarize_at()), (60, 80));
+        assert_eq!((Passive.trim_at(), Passive.summarize_at()), (75, 95));
+        assert_eq!((Smart.trim_at(), Smart.summarize_at()), (60, 80), "standard is smart's backstop");
+        for name in Compaction::NAMES.split(", ") {
+            assert_eq!(Compaction::parse(name).map(Compaction::name), Some(name));
+        }
+        assert_eq!(Compaction::parse("eager"), None);
+        // Standard fires exactly where rusty always did: budget * 6/10 and * 8/10.
+        for budget in [0, 7, 1_000, 96_123, 111_999] {
+            assert_eq!(budget * Standard.trim_at() / 100, budget * 6 / 10);
+            assert_eq!(budget * Standard.summarize_at() / 100, budget * 8 / 10);
+        }
+        assert!(SMART_FLOOR < SMART_INVITE && SMART_INVITE < Aggressive.trim_at());
+        assert_eq!((percent(25, 100), percent(19, 100), percent(5, 0)), (25, 19, 500));
+    }
 
     #[test]
     fn elides_only_old_large_outputs() {
