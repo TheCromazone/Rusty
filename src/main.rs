@@ -271,6 +271,7 @@ fn run() -> Result<i32> {
     agent.set_backend(backend)?;
     if agent.backend.name() == "local" {
         agent.snapshot = snapshot::take(&cwd);
+        agent.start_blobs = snapshot::blobs(&cwd);
         agent.mcp = mcp::Mcp::load(&cwd)?;
         if !agent.mcp.is_empty() {
             println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));

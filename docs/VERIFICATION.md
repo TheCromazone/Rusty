@@ -193,6 +193,14 @@ pin carried 8,000 characters. Harness runs on these builds should pin
 `--compaction` and, for windows over 200k, `--history-cap-tokens` or accept
 the 128k default.
 
+A compaction then started telling undone edits apart, again by the
+owner-approved design: at startup rusty records each tracked file's blob
+(`git ls-files -s`, with uncommitted files hashed as they stand), and at
+compaction a "changed" path whose current blob equals that one moves to
+"touched, now unchanged". It is deterministic and costs one `git
+hash-object` per compaction. Untracked files and projects outside git are
+left as they were.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here

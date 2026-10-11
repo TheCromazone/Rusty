@@ -1,6 +1,7 @@
 //! A fixed picture of the workspace for the system prompt: what is here and
 //! what can run, gathered once at startup without a model call. It saves the
 //! first few exploratory calls, which matters most for smaller models.
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
@@ -97,6 +98,64 @@ fn on_path(names: &[&str]) -> Vec<String> {
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Git blob ids of the tracked files as they are now, by path relative to
+/// `cwd`: the index's ids, with files already modified hashed as they stand.
+/// None outside a git work tree.
+pub fn blobs(cwd: &Path) -> Option<HashMap<String, String>> {
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(cwd).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let mut map = HashMap::new();
+    for entry in git(&["ls-files", "-s", "-z"])?.split('\0') {
+        if let Some((meta, path)) = entry.split_once('\t') {
+            if let Some(blob) = meta.split_whitespace().nth(1) {
+                map.insert(path.to_string(), blob.to_string());
+            }
+        }
+    }
+    let dirty: Vec<String> = git(&["diff", "--name-only", "--relative", "-z"])?
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect();
+    for (path, blob) in hash_now(cwd, &dirty) {
+        match blob {
+            Some(b) => map.insert(path, b),
+            None => map.remove(&path),
+        };
+    }
+    Some(map)
+}
+
+/// Each path's git blob id as the file stands now, or None if it is gone.
+/// Empty when git can't hash them.
+pub fn hash_now(cwd: &Path, paths: &[String]) -> Vec<(String, Option<String>)> {
+    let present: Vec<&String> = paths.iter().filter(|p| cwd.join(p).is_file()).collect();
+    let mut ids = Vec::new();
+    if !present.is_empty() {
+        let out = Command::new("git")
+            .arg("hash-object")
+            .arg("--")
+            .args(present.iter().map(|p| p.as_str()))
+            .current_dir(cwd)
+            .output();
+        match out.ok().filter(|o| o.status.success()) {
+            Some(o) => ids = String::from_utf8_lossy(&o.stdout).lines().map(String::from).collect(),
+            // Unknown, not gone: say nothing about any of them.
+            None => return Vec::new(),
+        }
+    }
+    let mut ids = ids.into_iter();
+    paths
+        .iter()
+        .map(|p| {
+            let id = if cwd.join(p).is_file() { ids.next() } else { None };
+            (p.clone(), id)
+        })
+        .collect()
 }
 
 #[cfg(test)]

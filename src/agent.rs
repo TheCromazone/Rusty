@@ -270,6 +270,9 @@ pub struct Agent {
     project_notes: String,
     /// The workspace at startup (local lead only), see snapshot.rs.
     pub snapshot: String,
+    /// Tracked files' git blob ids at startup (local lead in a git work tree),
+    /// so a compaction can tell an undone edit from a change.
+    pub start_blobs: Option<std::collections::HashMap<String, String>>,
     pub session_path: Option<PathBuf>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
@@ -352,6 +355,7 @@ impl Agent {
             last_turn_stalled: false,
             project_notes,
             snapshot: String::new(),
+            start_blobs: None,
             session_path: None,
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
@@ -1900,6 +1904,26 @@ impl Agent {
         }
     }
 
+    /// The working set with files back as they were at startup moved out of
+    /// `changed`. Without a start record (not a git work tree), unchanged.
+    fn collapse_reverts(&self, working_set: &str) -> String {
+        let Some(start) = &self.start_blobs else { return working_set.to_string() };
+        let changed: Vec<String> = working_set
+            .lines()
+            .find_map(|l| l.strip_prefix("- changed: "))
+            .map(|l| l.split(", ").map(|f| f.trim_start_matches("./").to_string()).collect())
+            .unwrap_or_default();
+        if changed.is_empty() {
+            return working_set.to_string();
+        }
+        let now: std::collections::HashMap<String, Option<String>> =
+            crate::snapshot::hash_now(&self.cwd, &changed).into_iter().collect();
+        context::collapse_reverts(working_set, |f| {
+            let f = f.trim_start_matches("./");
+            now.get(f).is_some_and(|blob| blob.as_ref() == start.get(f))
+        })
+    }
+
     /// Characters of the user's messages a compaction carries now.
     fn carry_chars(&self) -> usize {
         context::carry_chars(self.meter.capacity().saturating_sub(self.fixed_estimate()))
@@ -2061,7 +2085,7 @@ impl Agent {
             return Ok(());
         }
         let carried = context::user_messages(&self.history[..split], self.carry_chars());
-        let working_set = context::working_set(&self.history[..split]);
+        let working_set = self.collapse_reverts(&context::working_set(&self.history[..split]));
         let mut messages =
             vec![json!({"role": "system", "content": "You write precise hand-off summaries of coding sessions."})];
         messages.extend(self.history[..split].iter().cloned());
