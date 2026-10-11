@@ -3,7 +3,7 @@
 //! - system prompt + project instructions: fixed, kept small
 //! - memory: at most `MEMORY_CHARS`
 //! - plan and goal: pinned, never compacted
-//! - reply reserve: `REPLY_RESERVE` tokens kept free for the answer
+//! - reply reserve: the mode's reply size, at most an eighth of the window
 //! - history: everything else
 //!
 //! When history outgrows its share, rusty gives tokens back in order of how
@@ -16,10 +16,33 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 pub const MEMORY_CHARS: usize = 3_000;
+/// The reply reserve before a mode sets it, and the floor under it.
 pub const REPLY_RESERVE: usize = 16_000;
-/// Tool results among the newest N stay intact.
-const KEEP_RECENT_TOOL_RESULTS: usize = 8;
+const MIN_REPLY_RESERVE: usize = 4_000;
 const ELIDE_OVER_CHARS: usize = 1_500;
+/// The window the fixed sizes below were tuned for.
+const REFERENCE_WINDOW: usize = 128_000;
+
+/// `at_reference` scaled by `window` against a 128k window, kept within [lo, hi].
+fn scaled(window: usize, at_reference: usize, lo: usize, hi: usize) -> usize {
+    (at_reference * window / REFERENCE_WINDOW).clamp(lo, hi)
+}
+
+/// Tool results among the newest this many stay whole: 8 at 128k, 4 to 16.
+pub fn kept_tool_results(window: usize) -> usize {
+    scaled(window, 8, 4, 16)
+}
+
+/// Characters an elided tool result keeps: 400 at 128k, 200 to 800.
+pub fn elision_head(window: usize) -> usize {
+    scaled(window, 400, 200, 800)
+}
+
+/// Characters of the user's own messages a compaction carries: a tenth of
+/// the history budget (`history_tokens`), 2,000 to 16,000 tokens' worth.
+pub fn carry_chars(history_tokens: usize) -> usize {
+    (history_tokens / 10).clamp(2_000, 16_000) * 4
+}
 const ELIDED_MARK: &str = "[elided to save context";
 
 /// When compaction happens, as a share of the usable window: the window
@@ -60,6 +83,16 @@ impl Compaction {
         }
     }
 
+    /// The mode used when none is chosen: aggressive for a window under 48k,
+    /// where every token counts, standard otherwise.
+    pub fn for_window(window: usize) -> Self {
+        if window < 48_000 {
+            Self::Aggressive
+        } else {
+            Self::Standard
+        }
+    }
+
     /// Percent of the usable window past which older turns are summarised.
     pub fn summarize_at(self) -> usize {
         match self {
@@ -86,6 +119,14 @@ impl Compaction {
 
 /// Smart mode's own compaction is refused below this share of the budget.
 pub const SMART_FLOOR: usize = 20;
+/// The history cap used when none is chosen: 128k tokens for a
+/// window over 200k, so a huge window isn't filled just because it can be.
+pub fn default_history_cap(window: usize) -> Option<usize> {
+    (window > 200_000).then_some(REFERENCE_WINDOW)
+}
+
+/// Nor below this many tokens, however large the window.
+pub const SMART_FLOOR_TOKENS: usize = 4_000;
 /// The share above which the prompt invites the model to compact.
 pub const SMART_INVITE: usize = 25;
 /// Steps a smart compaction keeps verbatim.
@@ -140,6 +181,8 @@ pub struct Meter {
     last: Option<(usize, usize)>,
     /// The largest prompt a request has been accepted with.
     largest_accepted: usize,
+    /// Tokens kept free for the reply (see [`Meter::set_reply`]).
+    pub reserve: usize,
     pub requests: Vec<RequestUsage>,
 }
 
@@ -173,8 +216,15 @@ impl Meter {
             calibrated: false,
             last: None,
             largest_accepted: 0,
+            reserve: REPLY_RESERVE.min(window.max(1) / 8).max(MIN_REPLY_RESERVE),
             requests: Vec::new(),
         }
+    }
+
+    /// The reply reserve: the mode's reply size, at most an eighth of the
+    /// window, at least 4,000 tokens.
+    pub fn set_reply(&mut self, reply_tokens: usize) {
+        self.reserve = reply_tokens.min(self.window / 8).max(MIN_REPLY_RESERVE);
     }
 
     /// The calibration ratio, or None before the first reported request.
@@ -246,14 +296,14 @@ impl Meter {
 
     /// What a request may fill: the window less the reply reserve.
     pub fn capacity(&self) -> usize {
-        self.window.saturating_sub(REPLY_RESERVE).max(1)
+        self.window.saturating_sub(self.reserve).max(1)
     }
 
     /// A reply stopped because it reached the window: the window is at least
     /// that request's prompt plus its output, and at least the largest prompt
     /// accepted plus the reply reserve. Never raises it.
     pub fn reached(&mut self, prompt_and_output: usize) -> bool {
-        let window = prompt_and_output.max(self.largest_accepted + REPLY_RESERVE);
+        let window = prompt_and_output.max(self.largest_accepted + self.reserve);
         if window == 0 || window >= self.window {
             return false;
         }
@@ -279,7 +329,7 @@ impl Meter {
                 if self.largest_accepted == 0 {
                     return false;
                 }
-                self.largest_accepted + REPLY_RESERVE
+                self.largest_accepted + self.reserve
             }
             None => return false,
         };
@@ -300,13 +350,15 @@ fn number_after(text: &str, marker: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-/// Shrinks old, large tool results in place. Returns tokens saved.
-pub fn elide_old_tool_outputs(history: &mut [Value]) -> usize {
-    elide_tool_outputs(history, KEEP_RECENT_TOOL_RESULTS)
+/// Shrinks old, large tool results in place, as many and as far as suits
+/// `window`. Returns tokens saved.
+pub fn elide_old_tool_outputs(history: &mut [Value], window: usize) -> usize {
+    elide_tool_outputs(history, kept_tool_results(window), elision_head(window))
 }
 
-/// Shrinks large tool results except the newest `keep_recent`. Returns tokens saved.
-pub fn elide_tool_outputs(history: &mut [Value], keep_recent: usize) -> usize {
+/// Shrinks large tool results except the newest `keep_recent` to their first
+/// `head` characters. Returns tokens saved.
+pub fn elide_tool_outputs(history: &mut [Value], keep_recent: usize, head: usize) -> usize {
     let tool_idx: Vec<usize> =
         history.iter().enumerate().filter(|(_, m)| m["role"] == "tool").map(|(i, _)| i).collect();
     let cutoff = tool_idx.len().saturating_sub(keep_recent);
@@ -316,7 +368,7 @@ pub fn elide_tool_outputs(history: &mut [Value], keep_recent: usize) -> usize {
         if text.len() <= ELIDE_OVER_CHARS || text.contains(ELIDED_MARK) {
             continue;
         }
-        let head = crate::ui::truncate(text, 400);
+        let head = crate::ui::truncate(text, head);
         let short =
             format!("{head}\n{ELIDED_MARK}: {} more chars; re-run the tool if you need them]", text.len() - head.len());
         saved += (text.len() - short.len()) / 4;
@@ -601,7 +653,7 @@ mod tests {
         // A rewritten history drops the report; a request without usage is counted as estimated.
         m.forget_last();
         assert_eq!(m.fill(&history, 0), (estimate(&history) as f64 * 2.0).round() as usize);
-        assert_eq!(m.capacity(), 100_000 - REPLY_RESERVE);
+        assert_eq!(m.capacity(), 100_000 - m.reserve);
     }
 
     #[test]
@@ -620,13 +672,43 @@ mod tests {
         let mut b = Meter::new(1_000_000, "assumed");
         b.observe(Some(&usage(150_000)), 100_000, 1);
         assert!(b.overflow("model_context_window_exceeded"));
-        assert_eq!(b.window, 150_000 + REPLY_RESERVE, "the largest accepted prompt, plus the reply reserve");
+        assert_eq!(b.window, 150_000 + b.reserve, "the largest accepted prompt, plus the reply reserve");
         // A reply that stopped at the window: prompt plus output, when that is the larger bound.
         let mut c = Meter::new(1_000_000, "assumed");
         c.observe(Some(&usage(150_000)), 100_000, 1);
         assert!(c.reached(150_000 + 30_000));
         assert_eq!(c.window, 180_000);
         assert!(!c.reached(200_000), "never raised");
+    }
+
+    #[test]
+    fn fixed_sizes_scale_with_the_window() {
+        // At 128k everything is what rusty always used.
+        assert_eq!((kept_tool_results(128_000), elision_head(128_000)), (8, 400));
+        assert_eq!(Meter::new(128_000, "flag").reserve, REPLY_RESERVE);
+        // Smaller and larger windows scale, within bounds.
+        assert_eq!((kept_tool_results(32_000), elision_head(32_000)), (4, 200));
+        assert_eq!((kept_tool_results(1_000_000), elision_head(1_000_000)), (16, 800));
+        assert_eq!((kept_tool_results(200_000), elision_head(200_000)), (12, 625));
+        // A tenth of the history budget, 2k to 16k tokens, as characters.
+        assert_eq!(carry_chars(100_000), 40_000);
+        assert_eq!(carry_chars(10_000), 8_000);
+        assert_eq!(carry_chars(1_000_000), 64_000);
+        // The reply reserve: the mode's reply size, at most an eighth of the window, at least 4k.
+        let mut m = Meter::new(32_000, "flag");
+        assert_eq!(m.reserve, 4_000);
+        m.set_reply(16_384);
+        assert_eq!(m.reserve, 4_000);
+        let mut big = Meter::new(1_000_000, "flag");
+        big.set_reply(32_768);
+        assert_eq!((big.reserve, big.capacity()), (32_768, 1_000_000 - 32_768));
+        big.set_reply(1_000);
+        assert_eq!(big.reserve, 4_000);
+        // Unchosen, the mode and history cap follow the window.
+        assert_eq!(Compaction::for_window(32_000), Compaction::Aggressive);
+        assert_eq!(Compaction::for_window(128_000), Compaction::Standard);
+        assert_eq!(default_history_cap(200_000), None);
+        assert_eq!(default_history_cap(1_000_000), Some(128_000));
     }
 
     #[test]
@@ -653,11 +735,11 @@ mod tests {
     #[test]
     fn elides_only_old_large_outputs() {
         let mut h: Vec<Value> = (0..12).map(|i| json!({"role": "tool", "content": "x".repeat(3000 + i)})).collect();
-        let saved = elide_old_tool_outputs(&mut h);
+        let saved = elide_old_tool_outputs(&mut h, 128_000);
         assert!(saved > 0);
         assert!(h[0]["content"].as_str().unwrap().contains(ELIDED_MARK));
         assert!(!h[11]["content"].as_str().unwrap().contains(ELIDED_MARK));
-        assert_eq!(elide_old_tool_outputs(&mut h), 0, "second pass is a no-op");
+        assert_eq!(elide_old_tool_outputs(&mut h, 128_000), 0, "second pass is a no-op");
     }
 
     #[test]

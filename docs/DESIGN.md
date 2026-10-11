@@ -68,7 +68,18 @@ answering the question.
 ## Token allocation
 
 The window is split into allowances: system and project instructions,
-memory (3k chars), pinned plan and goal, a 16k reply reserve, and history.
+memory (3k chars), pinned plan and goal, a reply reserve, and history. The
+reserve is the mode's reply size, at most an eighth of the window and at least
+4k tokens (16k at 128k). A request asks for the mode's reply size when the
+window has room for it beside the context, else for the room left, never less
+than the reserve. Other sizes scale from their 128k values with the
+window, within bounds: the newest 8 tool results stay whole (4 to 16), a
+trimmed result keeps its first 400 characters (200 to 800), and a compaction
+carries a tenth of the history budget of the user's own messages (2k to 16k
+tokens). Unchosen, the mode follows the window: `aggressive` below 48k,
+`standard` otherwise. Whatever the mode, history is capped at 128k tokens above
+a 200k window unless `--history-cap-tokens` sets the cap: each threshold then
+fires at the lower of its share and the cap.
 How full the context is comes from the provider's own count: the prompt
 tokens it reports for a request are the context at that request, and what was
 added since is estimated, scaled by a running ratio of reported to estimated

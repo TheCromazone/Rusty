@@ -181,6 +181,23 @@ pending call or background command, and fewer than ten tool calls since the
 last compaction. These follow the owner-approved compaction design, not task
 failures. Smart mode is opt-in and outside the reporting configuration.
 
+The fixed sizes then became proportional to the window, again by the
+owner-approved design: the reply reserve (the mode's reply size, at most an
+eighth of the window, at least 4k; 16k at 128k as before), the tool results
+kept whole, the head a trimmed result keeps, the user messages a compaction
+carries, and smart mode's floor (never below 4k tokens). `--history-cap-tokens`
+caps the thresholds; unchosen, the cap is 128k above a 200k window whatever
+the mode, and the mode follows the window (`aggressive` below 48k). A
+request's output cap (`max_tokens`, `max_completion_tokens`) is the mode's
+as before when the window has room for it beside the context, else the room
+left less a fiftieth of the window, never below the reserve. A request
+changes from the pin's only when its prompt and output cap came within a
+fiftieth of the window or past it. At a 128k window with
+`standard` chosen, only the carried messages change: a tenth of the history
+budget where the pin carried 8,000 characters. Harness runs on these builds
+should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
+or accept the 128k default.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
