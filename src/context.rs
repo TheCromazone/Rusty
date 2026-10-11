@@ -185,7 +185,12 @@ impl Meter {
                 let prompt = u.prompt as usize;
                 if sent > 0 && prompt > 0 {
                     let measured = prompt as f64 / sent as f64;
-                    let next = (1.0 - CALIBRATION_WEIGHT) * self.ratio + CALIBRATION_WEIGHT * measured;
+                    // The first report sets the ratio; later ones are averaged in.
+                    let next = if self.calibrated {
+                        (1.0 - CALIBRATION_WEIGHT) * self.ratio + CALIBRATION_WEIGHT * measured
+                    } else {
+                        measured
+                    };
                     self.ratio = next.clamp(CALIBRATION_BOUNDS.0, CALIBRATION_BOUNDS.1);
                     self.calibrated = true;
                 }
@@ -200,7 +205,8 @@ impl Meter {
                 });
             }
             None => {
-                self.last = None;
+                // The last report still describes its prefix of history; only
+                // what came after it is estimated.
                 self.requests.push(RequestUsage {
                     prompt: self.scaled(sent) as u64,
                     completion: 0,
@@ -235,6 +241,20 @@ impl Meter {
     /// What a request may fill: the window less the reply reserve.
     pub fn capacity(&self) -> usize {
         self.window.saturating_sub(REPLY_RESERVE).max(1)
+    }
+
+    /// A reply stopped because it reached the window: the window is at least
+    /// that request's prompt plus its output, and at least the largest prompt
+    /// accepted plus the reply reserve. Never raises it.
+    pub fn reached(&mut self, prompt_and_output: usize) -> bool {
+        let window = prompt_and_output.max(self.largest_accepted + REPLY_RESERVE);
+        if window == 0 || window >= self.window {
+            return false;
+        }
+        self.window = window;
+        self.window_source = "overflow";
+        self.last = None;
+        true
     }
 
     /// Corrects the window from a provider's overflow error. Returns whether
@@ -505,11 +525,21 @@ mod tests {
         assert_eq!(m.calibration(), None);
         // Before any report the whole context is estimated, ratio 1.
         assert_eq!(m.fill(&history, 1_000), 1_000 + estimate(&history));
-        // 3,000 reported against 1,000 estimated: the ratio moves 30% of the way, 1 → 1.6.
-        m.observe(Some(&usage(3_000)), 1_000, 2);
+        // The first report sets the ratio: 1,600 reported against 1,000 estimated.
+        m.observe(Some(&usage(1_600)), 1_000, 2);
         assert!((m.calibration().unwrap() - 1.6).abs() < 1e-9);
+        // Later ones move it 30% of the way: 1.6 → 1.6 * 0.7 + 1.0 * 0.3 = 1.42, then back.
+        m.observe(Some(&usage(1_000)), 1_000, 2);
+        assert!((m.calibration().unwrap() - 1.42).abs() < 1e-9);
+        m.observe(Some(&usage(3_000)), 1_000, 2);
+        assert!((m.calibration().unwrap() - (1.42 * 0.7 + 3.0 * 0.3)).abs() < 1e-9);
+        let ratio = m.calibration().unwrap();
         // The report stands for the first two messages; the rest is estimated and scaled.
-        assert_eq!(m.fill(&history, 1_000), 3_000 + (estimate(&history[2..]) as f64 * 1.6).round() as usize);
+        assert_eq!(m.fill(&history, 1_000), 3_000 + (estimate(&history[2..]) as f64 * ratio).round() as usize);
+        // A response without usage keeps that anchor.
+        m.observe(None, 5_000, 3);
+        assert_eq!(m.fill(&history, 1_000), 3_000 + (estimate(&history[2..]) as f64 * ratio).round() as usize);
+        assert_eq!(m.requests.last().map(|r| r.source), Some("estimated"));
         // Extreme ratios are clamped.
         for _ in 0..20 {
             m.observe(Some(&usage(1_000_000)), 1_000, 2);
@@ -518,8 +548,6 @@ mod tests {
         // A rewritten history drops the report; a request without usage is counted as estimated.
         m.forget_last();
         assert_eq!(m.fill(&history, 0), (estimate(&history) as f64 * 2.0).round() as usize);
-        m.observe(None, 500, 4);
-        assert_eq!(m.requests.last().map(|r| r.source), Some("estimated"));
         assert_eq!(m.capacity(), 100_000 - REPLY_RESERVE);
     }
 
@@ -540,6 +568,12 @@ mod tests {
         b.observe(Some(&usage(150_000)), 100_000, 1);
         assert!(b.overflow("model_context_window_exceeded"));
         assert_eq!(b.window, 150_000 + REPLY_RESERVE, "the largest accepted prompt, plus the reply reserve");
+        // A reply that stopped at the window: prompt plus output, when that is the larger bound.
+        let mut c = Meter::new(1_000_000, "assumed");
+        c.observe(Some(&usage(150_000)), 100_000, 1);
+        assert!(c.reached(150_000 + 30_000));
+        assert_eq!(c.window, 180_000);
+        assert!(!c.reached(200_000), "never raised");
     }
 
     #[test]

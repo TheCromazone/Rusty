@@ -88,6 +88,9 @@ pub struct Reply {
     /// Anthropic's content blocks for this turn, kept so thinking goes back
     /// to the API unchanged. None for other providers.
     pub raw: Option<Value>,
+    /// The output stopped because the context window was full (Anthropic's
+    /// `model_context_window_exceeded`); `finish_reason` still says "length".
+    pub window_full: bool,
 }
 
 /// One provider's endpoint and its keys.

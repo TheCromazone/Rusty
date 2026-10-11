@@ -444,7 +444,8 @@ fn finish(
         }
         .to_string()
     };
-    let mut reply = Reply { usage, finish_reason: Some(finish_reason.clone()), ..Default::default() };
+    let window_full = stop.as_deref() == Some("model_context_window_exceeded");
+    let mut reply = Reply { usage, finish_reason: Some(finish_reason.clone()), window_full, ..Default::default() };
     reply.content =
         blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("");
     reply.tool_calls = blocks
@@ -560,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_is_told_apart_from_a_reply_limit() {
+        let (reply, _) = parse(&[
+            start(0, json!({"type": "text", "text": ""})),
+            delta(0, json!({"type": "text_delta", "text": "partial"})),
+            json!({"type": "message_delta", "delta": {"stop_reason": "model_context_window_exceeded"}}),
+        ]);
+        assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+        assert!(reply.window_full);
+    }
+
+    #[test]
     fn a_cut_off_turn_keeps_no_raw_blocks() {
         let (reply, _) = parse(&[
             start(0, json!({"type": "thinking", "thinking": ""})),
@@ -569,6 +581,7 @@ mod tests {
             json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
         ]);
         assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+        assert!(!reply.window_full, "max_tokens is the reply's own limit");
         assert!(reply.raw.is_none());
         assert!(
             serde_json::from_str::<Value>(&reply.tool_calls[0].arguments).is_err(),

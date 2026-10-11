@@ -789,8 +789,9 @@ impl Agent {
                 self.last_prompt_tokens = u.prompt;
             }
             self.meter.observe(reply.usage.as_ref(), sent, self.history.len());
-            if reply.finish_reason.as_deref() == Some("model_context_window_exceeded") {
-                self.meter.overflow("model_context_window_exceeded");
+            if reply.window_full {
+                let used = reply.usage.map_or(0, |u| (u.prompt + u.completion) as usize);
+                self.meter.reached(used);
             }
             self.trace(&reply, started.elapsed());
 
