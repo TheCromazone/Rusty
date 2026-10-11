@@ -3700,3 +3700,81 @@ fn a_request_asks_for_no_more_output_than_the_window_leaves() {
     let cap = requests[1]["max_tokens"].as_u64().unwrap();
     assert!((4000..16384).contains(&cap) && 20_000 + cap <= 32_000, "{cap}");
 }
+
+#[test]
+fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
+    // A 20k history cap: a summary request can reach the cap plus the 16k reserve.
+    let run = |s: &Sandbox, responses: Vec<(u16, String)>| {
+        let (url, server) = scripted_http(responses);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "20000"])
+            .args(["--compaction-model", "summariser-small", "--stats", "go"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let bodies: Vec<serde_json::Value> = server.join().unwrap().into_iter().map(|(_, body)| body).collect();
+        let models: Vec<String> = bodies.iter().map(|b| b["model"].as_str().unwrap_or_default().to_string()).collect();
+        (out, models)
+    };
+    let steps = || {
+        vec![
+            sse(reported(bash_reply("echo first-step"), 30_000)),
+            sse(reported(bash_reply("echo second-step"), 30_500)),
+        ]
+    };
+    let summary = || sse(text_reply("1. Task: go. 2. Ran echo."));
+    let stats = |out: &Output| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        stderr.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).unwrap()
+    };
+    let listing =
+        |window: u64| (200, format!(r#"{{"data": [{{"id": "summariser-small", "context_length": {window}}}]}}"#));
+
+    // A summariser whose window fits writes the summary.
+    let s = Sandbox::new("compaction-model");
+    let mut responses = vec![listing(64_000)];
+    responses.extend(steps());
+    responses.extend([summary(), sse(text_reply("done"))]);
+    let (out, models) = run(&s, responses);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(models[3], "summariser-small", "{models:?}");
+    assert_eq!(models.iter().filter(|m| *m == "summariser-small").count(), 1, "{models:?}");
+    let st = stats(&out);
+    assert_eq!(st["compactions"][0]["model"], "summariser-small", "{st}");
+    assert_eq!(st["context"]["compaction_model"], "summariser-small", "{st}");
+
+    // Its window unknown, the user is told; an empty summary is written again
+    // by the session's model.
+    let mut responses = vec![(200, r#"{"data": []}"#.to_string())];
+    responses.extend(steps());
+    responses.extend([sse(text_reply("")), summary(), sse(text_reply("done"))]);
+    let (out, models) = run(&s, responses);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("summariser-small's context window is unknown"), "{stdout}");
+    assert_eq!(models[3], "summariser-small", "{models:?}");
+    assert_ne!(models[4], "summariser-small", "{models:?}");
+    assert_eq!(stats(&out)["compactions"][0]["model"], models[4]);
+    assert!(stdout.contains("could not summarise"), "{stdout}");
+
+    // A window smaller than the largest summary request is refused at startup.
+    let (out, models) = run(&s, vec![listing(8_000)]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("8000-token context window") && stderr.contains("36000 tokens"), "{stderr}");
+    assert_eq!(models.len(), 1, "only the model list was asked");
+
+    // So is a summariser no endpoint serves.
+    let out = s
+        .cmd()
+        .args(["--yolo", "--memory", "off", "--compaction-model", "claude-sonnet-4-5", "go"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
+}

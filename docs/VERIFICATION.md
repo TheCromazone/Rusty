@@ -206,6 +206,21 @@ compaction a "changed" path whose current blob equals that one moves to
 hash-object` per compaction. Untracked files and projects outside git are
 left as they were.
 
+`--compaction-model` (`RUSTY_COMPACTION_MODEL`, `compaction_model` in saved
+settings) then let a separate model write compaction summaries, again by the
+owner-approved design. Unset, the session's model writes them as before. A
+summariser that errors or returns an empty summary hands that compaction to
+the session's model once. At startup a summariser no endpoint serves is
+refused, and so is one whose window (from its endpoint or the saved table)
+is smaller than the largest summary request, the summarise threshold plus
+the reply reserve; an unknown window is reported and left to the fallback.
+The summariser's reported usage feeds neither the context meter nor its
+calibration, so a different tokenizer cannot skew the session's fill, and
+its tokens are totalled under its own model.
+Each compaction records the model that wrote its summary, so a comparison
+can tell a summariser's effect from a fallback. It is a separate
+configuration: pin it, or leave it unset, and don't pool runs across it.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
@@ -630,10 +645,11 @@ no key, so a harness can refuse an unsupported setting before any model call.
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
     them, `calls_since_last`, `boundary`, the index in the trajectory's
     `messages` of the summary that replaced history, `resumes_at`, the
-    index of the first message after the compaction, and `reverted`, how
-    many files it found with their edits undone. The messages from
-    `boundary` up to `resumes_at` are the summary and those kept verbatim,
-    which ran before it. A
+    index of the first message after the compaction, `reverted`, how many
+    files it found with their edits undone, and `model`, the model that
+    wrote the summary (`context` names the configured one as
+    `compaction_model`). The messages from `boundary` up to `resumes_at`
+    are the summary and those kept verbatim, which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.
   - `memory` (null when off).

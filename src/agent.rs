@@ -207,6 +207,8 @@ pub struct CompactionEvent {
     /// Files whose edits this compaction found undone, listed as touched,
     /// now unchanged rather than changed.
     pub reverted: usize,
+    /// The model that wrote the summary.
+    pub model: String,
 }
 
 pub struct Agent {
@@ -228,6 +230,12 @@ pub struct Agent {
     /// Compaction thresholds never sit above this many context tokens, so a
     /// large window isn't filled just because it can be.
     pub history_cap: Option<usize>,
+    /// Writes compaction summaries in place of `model`, which takes over when
+    /// it fails or returns nothing.
+    pub compaction_model: Option<String>,
+    /// The summariser's context window, when its endpoint or the saved table
+    /// says.
+    pub compaction_window: Option<usize>,
     /// This step's estimate of the system prompt and tool schemas.
     fixed_now: Option<usize>,
     /// A compaction the model asked for, with its reason and focus; it runs
@@ -327,6 +335,8 @@ impl Agent {
             shell_only: false,
             compaction: context::Compaction::default(),
             history_cap: None,
+            compaction_model: None,
+            compaction_window: None,
             fixed_now: None,
             pending_compaction: None,
             pending_goal: None,
@@ -1085,12 +1095,17 @@ impl Agent {
     /// Sends one request on a background thread and renders it as it streams.
     /// Ctrl-C returns at once with whatever text arrived.
     fn ask(&mut self, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
+        self.ask_model(self.model.clone(), d, messages, tools)
+    }
+
+    fn ask_model(&mut self, model: String, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
+        let cap = self.output_room(&model);
         let rx = self.client.start_chat(
-            self.model.clone(),
+            model,
             messages,
             tools,
             self.temperature,
-            (self.execution_mode, self.request_role, Some(self.output_room())),
+            (self.execution_mode, self.request_role, Some(cap)),
         );
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
@@ -1887,13 +1902,24 @@ impl Agent {
     /// What every request sends besides history: the system prompt and the
     /// tool schemas, estimated.
     /// Built once per step and reused there.
-    /// The most output the next request may ask for: what the window leaves
-    /// beside the context, less a fiftieth for estimation error, and never
-    /// less than the reply reserve that compaction keeps free.
-    fn output_room(&self) -> u32 {
+    /// The most output the next request to `model` may ask for: what its
+    /// window leaves beside the context, less a fiftieth for estimation
+    /// error, and never less than the reply reserve that compaction keeps
+    /// free. A summary request is sized as if it carried the whole context.
+    fn output_room(&self, model: &str) -> u32 {
         let m = &self.meter;
-        let used = m.fill(&self.history, self.fixed_estimate()) + m.window / 50;
-        m.window.saturating_sub(used).max(m.reserve).min(u32::MAX as usize) as u32
+        let window = match self.compaction_window {
+            Some(w) if model != self.model => w,
+            _ => m.window,
+        };
+        let used = m.fill(&self.history, self.fixed_estimate()) + window / 50;
+        window.saturating_sub(used).max(m.reserve).min(u32::MAX as usize) as u32
+    }
+
+    /// The largest summary request a compaction can send: the summarise
+    /// threshold plus the reply reserve.
+    pub fn largest_summary_request(&self) -> usize {
+        self.thresholds().1 + self.meter.reserve
     }
 
     fn fixed_estimate(&self) -> usize {
@@ -1982,6 +2008,7 @@ impl Agent {
             "window_source": m.window_source,
             "reply_reserve": m.reserve,
             "history_cap": self.history_cap,
+            "compaction_model": self.compaction_model.as_deref().unwrap_or(&self.model),
             "calibration": m.calibration(),
             "provider_usage": provider,
             "estimated_usage": m.requests.len() - provider,
@@ -2113,13 +2140,38 @@ impl Agent {
         });
         let role = self.request_role;
         self.request_role = "compaction";
-        let reply = self.ask(&mut Display::new(true), messages, json!([]));
+        let mut writer = self.compaction_model.clone().unwrap_or_else(|| self.model.clone());
+        let mut reply = self.ask_model(writer.clone(), &mut Display::new(true), messages.clone(), json!([]));
+        if let Some(u) = reply.as_ref().ok().and_then(|r| r.usage) {
+            self.totals.add_request(&writer, u.prompt, u.completion);
+        }
+        // A summariser that fails or writes nothing hands the job to the
+        // session's model, once; an interrupt is not a failure.
+        let failed = match &reply {
+            Ok(r) => {
+                r.finish_reason.as_deref() != Some("interrupted") && context::parse_compaction(&r.content).0.is_empty()
+            }
+            Err(_) => true,
+        };
+        if writer != self.model && failed {
+            let why = match &reply {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => "an empty summary".into(),
+            };
+            d.line(&ui::dim(&format!(
+                "  ◇ {writer} could not summarise ({}); using {}",
+                ui::truncate(&why, 80),
+                self.model
+            )));
+            writer = self.model.clone();
+            reply = self.ask_model(writer.clone(), &mut Display::new(true), messages, json!([]));
+            if let Some(u) = reply.as_ref().ok().and_then(|r| r.usage) {
+                self.totals.add_request(&writer, u.prompt, u.completion);
+            }
+        }
         self.request_role = role;
         d.set_status(String::new());
         let reply = reply?;
-        if let Some(u) = reply.usage {
-            self.totals.add_request(&self.model, u.prompt, u.completion);
-        }
         let (summary, memories) = context::parse_compaction(&reply.content);
         if summary.is_empty() {
             bail!("the model returned an empty summary");
@@ -2154,6 +2206,7 @@ impl Agent {
             boundary: self.archived.len(),
             resumes_at: self.archived.len() + self.history.len(),
             reverted,
+            model: writer,
         });
         d.line(&ui::dim(&format!(
             "  ⇣ compacted ~{} → ~{} tokens{}",
