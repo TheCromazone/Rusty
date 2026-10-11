@@ -282,34 +282,54 @@ pub fn manual_split(history: &[Value]) -> Option<usize> {
     (history.len() >= 2).then_some(history.len())
 }
 
-/// The user's messages from a span of history, verbatim, newest kept when
-/// they exceed `max_chars`. Compaction carries these over untouched.
+/// The user's messages from a span of history, verbatim where they fit in
+/// `max_chars`. Compaction carries these over untouched. The first message
+/// and the block carried by an earlier compaction always survive: when the
+/// total is too long, older entries are cut to their first line, oldest
+/// first, and only then are newer middle entries dropped, oldest first. The
+/// newest message is always kept whole.
 pub fn user_messages(history: &[Value], max_chars: usize) -> String {
-    let mut picked: Vec<&str> = Vec::new();
-    let mut used = 0;
-    for m in history.iter().rev().filter(|m| m["role"] == "user") {
+    let mut entries: Vec<String> = Vec::new();
+    // Entries before this index came from an earlier compaction.
+    let mut carried = 0;
+    for m in history.iter().filter(|m| m["role"] == "user") {
         let Some(text) = m["content"].as_str() else { continue };
         if text.starts_with("[Summary of the conversation so far]") {
             // Already-carried messages live inside the previous summary block.
             if let Some((_, kept)) = text.split_once(USER_MESSAGES_HEADER) {
-                picked.push(kept.trim());
+                entries.extend(kept.trim().split(CARRY_SEPARATOR).filter(|e| !e.is_empty()).map(String::from));
+                carried = entries.len();
             }
-            break;
+            continue;
         }
         if text.starts_with(NOTE) {
             // rusty's own nudges and reviews are not things the user said.
             continue;
         }
-        let text = crate::ui::truncate(text, 2_000);
-        if used + text.len() > max_chars {
+        entries.push(crate::ui::truncate(text, 2_000).to_string());
+    }
+    let total = |e: &[String]| e.iter().map(|x| x.len() + CARRY_SEPARATOR.len()).sum::<usize>();
+    let last = entries.len().saturating_sub(1);
+    // Cut older entries to a first line, oldest first; the first and newest stay whole.
+    for i in 1..last {
+        if total(&entries) <= max_chars {
             break;
         }
-        used += text.len();
-        picked.push(text);
+        let line = entries[i].lines().next().unwrap_or("");
+        let short = crate::ui::truncate(line, 200);
+        if short.len() < entries[i].len() {
+            entries[i] = format!("{short} …");
+        }
     }
-    picked.reverse();
-    picked.join("\n---\n")
+    // Then drop newer middle entries; the carried block and the newest stay.
+    while total(&entries) > max_chars {
+        let Some(i) = (carried.max(1)..last.min(entries.len().saturating_sub(1))).next() else { break };
+        entries.remove(i);
+    }
+    entries.join(CARRY_SEPARATOR)
 }
+
+const CARRY_SEPARATOR: &str = "\n---\n";
 
 pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
 
@@ -415,6 +435,34 @@ mod tests {
         ];
         let again = user_messages(&second, 8000);
         assert!(again.contains("fix the parser") && again.contains("also add tests"));
+    }
+
+    #[test]
+    fn carried_messages_survive_when_new_ones_overflow_the_cap() {
+        let summary = |carried: &str| json!({"role": "user", "content": format!("[Summary of the conversation so far]\nstuff\n\n{USER_MESSAGES_HEADER}\n{carried}")});
+        let first = vec![
+            json!({"role": "user", "content": "fix the parser\nit drops the last field"}),
+            json!({"role": "user", "content": "and keep the CLI flags stable"}),
+        ];
+        let carried = user_messages(&first, 8_000);
+        // Since then, more than the cap of new messages.
+        let mut history = vec![summary(&carried)];
+        for i in 0..6 {
+            history.push(json!({"role": "user", "content": format!("step {i}: {}\nmore detail", "x".repeat(1_900))}));
+        }
+        history.push(json!({"role": "user", "content": "now ship it"}));
+        let again = user_messages(&history, 8_000);
+        assert!(again.starts_with("fix the parser\nit drops the last field"), "the first message stays whole: {again}");
+        assert!(again.contains("and keep the CLI flags stable"), "the carried block survives");
+        assert!(again.ends_with("now ship it"), "the newest stays");
+        assert!(again.len() <= 8_000, "{}", again.len());
+        assert!(
+            again.contains("step 0:") && again.contains(" …"),
+            "older entries are cut to a first line before any is dropped"
+        );
+        // A third compaction still carries the first message.
+        let third = user_messages(&[summary(&again), json!({"role": "user", "content": "one more"})], 8_000);
+        assert!(third.starts_with("fix the parser") && third.ends_with("one more"));
     }
 
     #[test]
