@@ -380,8 +380,18 @@ fn agent(
     }
 }
 
-/// Runs every session; timed out if any one of them was.
-fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> Result<Exit> {
+/// Runs every session; timed out if any one of them was. `checked` gets the
+/// sessions that started without any of `secrets` in the working copy.
+#[allow(clippy::too_many_arguments)]
+fn run_multi(
+    cfg: &Config,
+    task: &Task,
+    work: &Path,
+    home: &Path,
+    run: &Run,
+    secrets: &[String],
+    checked: &mut Vec<usize>,
+) -> Result<Exit> {
     let turns = std::fs::read_to_string(task.dir.join("turns.txt"))?;
     let sessions = sessions(&turns);
     validate(&sessions).with_context(|| format!("{}: turns.txt", task.name))?;
@@ -396,6 +406,9 @@ fn run_multi(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run) -> 
             continue;
         }
         n += 1;
+        if !holds_any(work, secrets) {
+            checked.push(n);
+        }
         let exit = if s.goal {
             let mut args = vec!["--goal", s.lines[0].as_str()];
             if let Some(check) = &s.verify {
@@ -498,8 +511,10 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     let (model, rep) = (run.model, run.rep);
     let _ = copy_dir(&task.dir.join("files"), work);
     let start = Instant::now();
+    let secrets = memory_only(task);
+    let mut checked = Vec::new();
     let exit = if task.dir.join("turns.txt").is_file() {
-        run_multi(cfg, task, work, home, run)?
+        run_multi(cfg, task, work, home, run, &secrets, &mut checked)?
     } else {
         let prompt = std::fs::read_to_string(task.dir.join("prompt.txt"))?;
         let check_path = task.dir.join("verify.txt");
@@ -508,6 +523,9 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
             bail!("{}: verify.txt must contain a nonempty acceptance command", task.name);
         }
         let args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
+        if !holds_any(work, &secrets) {
+            checked.push(1);
+        }
         agent(cfg, work, home, run, 1, &[], &args, None)?
     };
     let secs = start.elapsed().as_secs();
@@ -527,7 +545,7 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
     // A run that read the harness's records (its own home, where earlier
     // sessions' transcripts and history live, or another run's directories)
     // measured the harness, not the agent: it is not scored, whatever the check said.
-    let leak = outside_reads(home, work).or_else(|| seen_before_used(home, task));
+    let leak = outside_reads(home, work).or_else(|| seen_before_used(home, &secrets, &checked));
     let verdict = match (&leak, throttled) {
         (Some(_), _) => "leak",
         (None, true) => "infra",
@@ -825,16 +843,37 @@ fn outside_reads(home: &Path, work: &Path) -> Option<String> {
     None
 }
 
-/// A later session (the second on) that met one of the task's `leak.txt`
-/// strings in a tool result before using it itself got it from outside its
-/// memory: another run's files, `/tmp`, the harness's records. Memory reaches
-/// a session through its prompt or the `recall` tool, so those don't count.
-fn seen_before_used(home: &Path, task: &Task) -> Option<String> {
-    let text = std::fs::read_to_string(task.dir.join("leak.txt")).ok()?;
-    let secrets: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    let mut later: Vec<String> = trajectories(home).into_iter().filter(|f| f != "trajectory.json").collect();
-    later.sort();
-    for f in later {
+/// The task's `leak.txt`: strings that should reach a session only through
+/// memory. Empty when the task has none.
+fn memory_only(task: &Task) -> Vec<String> {
+    let text = std::fs::read_to_string(task.dir.join("leak.txt")).unwrap_or_default();
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// Whether any file under `dir` (1 MiB or less) contains one of `secrets`.
+fn holds_any(dir: &Path, secrets: &[String]) -> bool {
+    if secrets.is_empty() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    entries.flatten().any(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => holds_any(&e.path(), secrets),
+        Ok(t) if t.is_file() && e.metadata().is_ok_and(|m| m.len() <= 1 << 20) => {
+            let bytes = std::fs::read(e.path()).unwrap_or_default();
+            secrets.iter().any(|s| bytes.windows(s.len()).any(|w| w == s.as_bytes()))
+        }
+        _ => false,
+    })
+}
+
+/// A checked session (one whose working copy started without the string)
+/// that met one of `secrets` in a tool result before using it itself got it
+/// from outside its memory: another run's files, `/tmp`, the harness.
+/// Memory reaches a session through its prompt or the `recall` tool, so
+/// those don't count.
+fn seen_before_used(home: &Path, secrets: &[String], checked: &[usize]) -> Option<String> {
+    for &n in checked {
+        let f = trajectory(n);
         let read = std::fs::read_to_string(home.join(&f)).ok();
         let Some(t) = read.and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
         let mut names = std::collections::HashMap::new();
@@ -843,14 +882,14 @@ fn seen_before_used(home: &Path, task: &Task) -> Option<String> {
             if m["role"] == "tool" {
                 let name = m["tool_call_id"].as_str().and_then(|id| names.get(id)).map_or("", |n: &String| n.as_str());
                 let content = m["content"].to_string();
-                if name != "recall" && secrets.iter().zip(&used).any(|(s, u)| !u && content.contains(s)) {
+                if name != "recall" && secrets.iter().zip(&used).any(|(s, u)| !u && content.contains(s.as_str())) {
                     return Some(format!("{f} met a memory-only string in a {name} result"));
                 }
                 continue;
             }
             let said = m.to_string();
             for (s, u) in secrets.iter().zip(used.iter_mut()) {
-                *u |= said.contains(s);
+                *u |= said.contains(s.as_str());
             }
             for c in m["tool_calls"].as_array().into_iter().flatten() {
                 if let (Some(id), Some(n)) = (c["id"].as_str(), c["function"]["name"].as_str()) {
@@ -1204,32 +1243,41 @@ mod tests {
 
     #[test]
     fn a_memory_only_string_must_come_from_memory() {
-        let (task_dir, home) = (temp_dir().unwrap(), temp_dir().unwrap());
-        std::fs::write(task_dir.join("leak.txt"), "k7f3-seed\n").unwrap();
+        let (task_dir, home, work) = (temp_dir().unwrap(), temp_dir().unwrap(), temp_dir().unwrap());
+        std::fs::write(task_dir.join("leak.txt"), "k7f3-seed\n\n").unwrap();
         let task = Task { name: "t".into(), dir: task_dir.clone() };
+        let secrets = memory_only(&task);
+        assert_eq!(secrets, ["k7f3-seed"]);
+        // A session whose working copy holds the string learns it there and is not checked.
+        std::fs::create_dir_all(work.join("docs")).unwrap();
+        std::fs::write(work.join("docs/ONBOARDING.md"), "seed k7f3-seed").unwrap();
+        assert!(holds_any(&work, &secrets));
+        std::fs::remove_file(work.join("docs/ONBOARDING.md")).unwrap();
+        assert!(!holds_any(&work, &secrets) && !holds_any(&work, &[]));
+
         let call = |id: &str, name: &str, args: &str| serde_json::json!({"role": "assistant", "tool_calls": [{"id": id, "function": {"name": name, "arguments": args}}]});
         let result = |id: &str, text: &str| serde_json::json!({"role": "tool", "tool_call_id": id, "content": text});
         let session = |n: usize, messages: Vec<Value>| {
             std::fs::write(home.join(trajectory(n)), serde_json::json!({ "messages": messages }).to_string()).unwrap()
         };
-        // Session 1 may read it anywhere: that is where it is learned.
         session(1, vec![call("a", "read_file", "ONBOARDING.md"), result("a", "seed k7f3-seed")]);
-        assert_eq!(seen_before_used(&home, &task), None);
-        // Later, from the prompt's memory or recall, then echoed back: fine.
+        assert_eq!(seen_before_used(&home, &secrets, &[]), None, "session 1 held it, so isn't checked");
+        assert!(seen_before_used(&home, &secrets, &[1]).is_some(), "the same read is a leak when checked");
+        // From the prompt's memory or recall, then echoed back: fine.
         session(2, vec![call("b", "bash", "STATS_SEED=k7f3-seed make"), result("b", "k7f3-seed ok")]);
-        assert_eq!(seen_before_used(&home, &task), None);
+        assert_eq!(seen_before_used(&home, &secrets, &[2]), None);
         session(2, vec![call("c", "recall", "seed"), result("c", "- k7f3-seed (unverified)")]);
-        assert_eq!(seen_before_used(&home, &task), None);
+        assert_eq!(seen_before_used(&home, &secrets, &[2]), None);
         // Found by searching the filesystem first: a leak.
         session(2, vec![call("d", "bash", "grep -r SEED /tmp"), result("d", "/tmp/notes.txt: k7f3-seed")]);
         assert_eq!(
-            seen_before_used(&home, &task).as_deref(),
+            seen_before_used(&home, &secrets, &[2]).as_deref(),
             Some("trajectory.2.json met a memory-only string in a bash result")
         );
         // Tasks without leak.txt have nothing to check.
-        std::fs::remove_file(task_dir.join("leak.txt")).unwrap();
-        assert_eq!(seen_before_used(&home, &task), None);
-        let _ = std::fs::remove_dir_all(&task_dir);
-        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(seen_before_used(&home, &[], &[2]), None);
+        for d in [&task_dir, &home, &work] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
