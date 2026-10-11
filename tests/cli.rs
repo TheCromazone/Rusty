@@ -3592,9 +3592,12 @@ fn the_window_picks_the_mode_and_history_cap_unless_chosen() {
         (huge["compaction"].as_str(), huge["context"]["history_cap"].as_u64()),
         (Some("standard"), Some(128000))
     );
-    // A chosen mode or cap wins.
+    // A chosen mode or cap wins; the default cap follows the window whatever the mode.
     let chosen = run(&s, "1000000", &["--compaction", "passive"]);
-    assert_eq!((chosen["compaction"].as_str(), chosen["context"]["history_cap"].as_u64()), (Some("passive"), None));
+    assert_eq!(
+        (chosen["compaction"].as_str(), chosen["context"]["history_cap"].as_u64()),
+        (Some("passive"), Some(128000))
+    );
     let capped = run(&s, "128000", &["--history-cap-tokens", "50000"]);
     assert_eq!(capped["context"]["history_cap"], 50000);
 }
@@ -3623,4 +3626,26 @@ fn a_history_cap_compacts_well_inside_a_large_window() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
     assert_eq!(stats["compactions"][0]["trigger"], "level", "{stats}");
+}
+
+#[test]
+fn a_request_asks_for_no_more_output_than_the_window_leaves() {
+    // At a 32k window, standard's 16k reply fits beside a small prompt but
+    // not beside 20k reported tokens.
+    let s = Sandbox::new("output-room");
+    let (url, server) = scripted_endpoint(vec![reported(bash_reply("echo first-step"), 20_000), text_reply("done")]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "32000")
+        .args(["--yolo", "--mode", "standard", "--compaction", "standard", "--memory", "off", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["max_tokens"], 16384);
+    let cap = requests[1]["max_tokens"].as_u64().unwrap();
+    assert!((4000..16384).contains(&cap) && 20_000 + cap <= 32_000, "{cap}");
 }

@@ -1083,8 +1083,7 @@ impl Agent {
             messages,
             tools,
             self.temperature,
-            self.execution_mode,
-            self.request_role,
+            (self.execution_mode, self.request_role, Some(self.output_room())),
         );
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
@@ -1826,7 +1825,9 @@ impl Agent {
         ];
         let reply = self
             .client
-            .chat(&model, &messages, &json!([]), 0.0, (ExecutionMode::Vibe, "memory"), &mut |_| !signal::interrupted())
+            .chat(&model, &messages, &json!([]), 0.0, (ExecutionMode::Vibe, "memory", None), &mut |_| {
+                !signal::interrupted()
+            })
             .ok()?;
         if let Some(u) = reply.usage {
             self.totals.add_request(&model, u.prompt, u.completion);
@@ -1879,6 +1880,15 @@ impl Agent {
     /// What every request sends besides history: the system prompt and the
     /// tool schemas, estimated.
     /// Built once per step and reused there.
+    /// The most output the next request may ask for: what the window leaves
+    /// beside the context, less a fiftieth for estimation error, and never
+    /// less than the reply reserve that compaction keeps free.
+    fn output_room(&self) -> u32 {
+        let m = &self.meter;
+        let used = m.fill(&self.history, self.fixed_estimate()) + m.window / 50;
+        m.window.saturating_sub(used).max(m.reserve).min(u32::MAX as usize) as u32
+    }
+
     fn fixed_estimate(&self) -> usize {
         if let Some(n) = self.fixed_now {
             return n;
