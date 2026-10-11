@@ -132,6 +132,32 @@ memory tasks test different things:
 
   Both can be solved without memory.
 
+**What a first matrix showed** (development evidence, not a result:
+nemotron-3-super, main 74d40a2, three repeats per level, October 2026). No
+level passed `memory-only-fact`. Its one pass, and two other runs, got or
+looked for the seed outside memory: in the run's home, in another run's
+directory, and in a note a memory-off run had written to `/tmp`. The eval
+now scores all three `leak`. Watching the memory store during six runs
+separated two failures:
+
+- **Delivery.** In three of the six, the model listed `ONBOARDING.md` in the
+  lesson's `files`, since the tool asks for "files the memory is about". The
+  reset deletes that note, so freshness was 0 and session 2 was never
+  offered the lesson. A fact anchored to where it was read, rather than to
+  what it describes, disappears with its source.
+- **Use.** In the other three the lesson was offered, and session 2 never
+  used it: it tried to recover the seed from the test's hash instead, and
+  ran out of time.
+
+Since this model didn't use an offered lesson, fixing delivery alone would
+not change its result. The next step is to measure use directly, by seeding
+the lesson (from the user and from the agent) into a fresh session 2 and
+checking whether it runs the suite with the seed, before changing how
+anchors or advice work. Elsewhere in the matrix, memory neither clearly
+helped nor hurt: `stale-anchor` and `compact-focus` passed at every level,
+and `poisoned-lesson` and `compaction-rule` missed with memory off and at
+most levels, with no consistent direction in three repeats.
+
 ## Bounded hot path and disk
 
 - Sessions: RAM only, at most 32, each with a 4 KiB request and the last four

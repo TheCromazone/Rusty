@@ -466,6 +466,11 @@ own trajectory. A run whose tool calls name a path outside its working copy,
 such as its home, `$RUSTY_HOME` or another run's directory, is scored `leak`:
 reported apart and not counted, whatever the check said. Only named paths
 are seen, so a search of a parent directory that never names one is missed.
+A task can also list, in `leak.txt`, strings a later session should get only
+from memory. If the second or a later session meets one in a tool result
+before using it itself, that is a `leak` too: the string came from another
+run's files, `/tmp` or the harness. Results from `recall` are memory and
+don't count.
 
 Run the deterministic runtime and scoring counterexamples before live work:
 
