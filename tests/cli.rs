@@ -3241,6 +3241,7 @@ fn capabilities_list_only_values_the_flags_accept() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(caps["memory"], serde_json::json!(["off", "recall", "learn", "reflect", "deep"]));
+    assert_eq!(caps["compaction"], serde_json::json!(["aggressive", "standard", "passive", "smart"]));
     assert_eq!(caps["mcp"]["transports"], serde_json::json!(["stdio"]));
     // An old value the flag now rejects is not offered.
     let out = s.cmd().args(["--memory", "legacy", "hi"]).output().unwrap();
@@ -3277,4 +3278,91 @@ fn a_shell_toolset_offers_and_runs_only_bash() {
     assert!(requests[2]["messages"].to_string().contains("kept"));
     let out = s.cmd().args(["--toolset", "editor", "hi"]).output().unwrap();
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("unknown toolset"));
+}
+
+/// A smart-mode run with a 40k window, where one 28k-character tool output
+/// puts history at about a third of its budget.
+fn smart_run(s: &Sandbox, replies: Vec<serde_json::Value>) -> (Output, Vec<serde_json::Value>) {
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "40000")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--compaction", "smart", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    (out, server.join().unwrap())
+}
+
+#[test]
+fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
+    let compact = |reason: &str| tool_reply("compact", serde_json::json!({"reason": reason}));
+    let notice = "Rusty is auto-compacting because the next task is unrelated. Use /compact settings to turn it off.";
+
+    // Nearly empty context: refused, and nothing is announced.
+    let s = Sandbox::new("compaction-smart-floor");
+    let (out, requests) = smart_run(&s, vec![compact("the next task is unrelated"), text_reply("done")]);
+    let offered = requests[0]["tools"].to_string();
+    assert!(offered.contains("\"compact\""), "smart mode offers the tool: {offered}");
+    let first = requests[0]["messages"].to_string();
+    assert!(first.contains("call compact when the next step is substantially different work"), "{first}");
+    assert!(first.contains("Context in use: 0% of the history budget"), "{first}");
+    assert!(requests[1]["messages"].to_string().contains("compaction is refused below 20%"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("auto-compacting"));
+
+    // A third full: scheduled, announced, and run before the next step.
+    let s = Sandbox::new("compaction-smart");
+    let (out, requests) = smart_run(
+        &s,
+        vec![
+            bash_reply("python3 -c \"print('x' * 28000)\""),
+            tool_reply("compact", serde_json::json!({"reason": "the next task is unrelated.", "focus": "the go task"})),
+            text_reply("1. Task: go. 2. Printed a long line of x."),
+            text_reply("done"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(notice), "{stdout}");
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2]["messages"].to_string().contains("the go task"), "the focus reaches the summary request");
+    let after = requests[3]["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]") && !after.contains(&"x".repeat(1000)), "{after}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"compaction\":\"smart\""));
+}
+
+#[test]
+fn fixed_compaction_modes_offer_no_tool_and_are_reported() {
+    let s = Sandbox::new("compaction-fixed");
+    let (url, server) = scripted_endpoint(vec![text_reply("done")]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--compaction", "passive", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert!(!requests[0]["tools"].to_string().contains("\"compact\""));
+    assert!(!requests[0]["messages"].to_string().contains("Context in use"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"compaction\":\"passive\""));
+    let out = s.cmd().args(["--compaction", "eager", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("unknown compaction `eager`"));
+}
+
+#[test]
+fn compact_settings_show_change_and_persist_the_mode() {
+    let s = Sandbox::new("compaction-settings");
+    let out = s.repl(&["/compact settings", "/compact settings smart", "/compact settings eager"]);
+    assert!(out.contains("compaction · standard: trims old tool output past 60%, summarises past 80%"), "{out}");
+    assert!(out.contains("compaction · smart: the model may compact when the work changes; otherwise"), "{out}");
+    assert!(out.contains("(saved)") && out.contains("unknown compaction `eager`"), "{out}");
+    // The next session starts in the saved mode.
+    let out = s.repl(&["/compact settings"]);
+    assert!(out.contains("compaction · smart"), "{out}");
+    let out = s.repl(&["/compact settings aggressive", "/compact settings passive"]);
+    assert!(out.contains("trims old tool output past 40%, summarises past 60%"), "{out}");
+    assert!(out.contains("trims old tool output past 75%, summarises past 95%"), "{out}");
 }

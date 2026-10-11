@@ -223,6 +223,8 @@ pub struct Settings {
     /// None means rusty picks per request.
     pub execution_mode: Option<crate::execution::ExecutionMode>,
     pub delegation_override: bool,
+    /// When history is compacted (see `context::Compaction`).
+    pub compaction: String,
 }
 
 impl Default for Settings {
@@ -236,6 +238,7 @@ impl Default for Settings {
             agents: AgentsConfig::default(),
             execution_mode: None,
             delegation_override: false,
+            compaction: "standard".into(),
         }
     }
 }

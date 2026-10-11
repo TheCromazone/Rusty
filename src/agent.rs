@@ -198,6 +198,11 @@ pub struct Agent {
     pub delegation_override: bool,
     /// `--toolset shell`: the lead gets bash and the control tools only.
     pub shell_only: bool,
+    /// When history is compacted; `smart` adds the `compact` tool.
+    pub compaction: context::Compaction,
+    /// A compaction the model asked for, with its reason and focus; it runs
+    /// before the next step, so a tool call is never split from its result.
+    pending_compaction: Option<(String, Option<String>)>,
     pending_goal: Option<Value>,
     /// Careful mode still owes one checker review for this turn or goal.
     checker_owed: bool,
@@ -281,6 +286,8 @@ impl Agent {
             model_override: None,
             delegation_override: false,
             shell_only: false,
+            compaction: context::Compaction::default(),
+            pending_compaction: None,
             pending_goal: None,
             checker_owed: false,
             cwd,
@@ -477,6 +484,15 @@ impl Agent {
         );
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
+        if self.smart_compaction() {
+            s.push_str(&format!(
+                "\nContext: call compact when the next step is substantially different work from what you just \
+                 did (a different task, or a different codebase), or when the task ahead looks long, provided the \
+                 context is more than {}% full. The note at the end of each request says how full it is. Don't \
+                 compact in the middle of one piece of work.\n",
+                context::SMART_INVITE
+            ));
+        }
         match self.agents.mode {
             AgentsMode::Off => {}
             AgentsMode::Sub => s.push_str(
@@ -593,6 +609,19 @@ impl Agent {
         ));
         defs.push(t("recall", "Search long-term memory.", json!({"query": {"type": "string"}}), &["query"]));
         defs.push(t("forget", "Delete a memory that is wrong or stale.", json!({"id": {"type": "string"}}), &["id"]));
+        if self.smart_compaction() {
+            defs.push(t(
+                "compact",
+                "Summarise the conversation so far and continue from the summary. Call it when the next step is \
+                 substantially different work from what you just did, or the task ahead is long. The user's \
+                 messages, the plan and a working set of files and commands are kept word for word.",
+                json!({
+                    "reason": {"type": "string", "description": "Why now, in a few words, e.g. 'the next task is unrelated'"},
+                    "focus": {"type": "string", "description": "What the summary must keep in detail (optional)"}
+                }),
+                &["reason"],
+            ));
+        }
         defs.push(t(
             "plan",
             "Replace the task plan. Use it for any work with more than two steps.",
@@ -716,8 +745,12 @@ impl Agent {
             messages.push(json!({"role": "system", "content": system}));
             messages.extend(self.history.iter().cloned());
             // Last, so the cached prefix stays the same; never stored in history.
-            if let Some(status) = self.client.budget.status().filter(|_| !self.is_worker) {
-                messages.push(json!({"role": "user", "content": format!("{}{status}", context::NOTE)}));
+            let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
+            if self.smart_compaction() {
+                notes.push(format!("Context in use: {}% of the history budget.", self.context_used()));
+            }
+            if !notes.is_empty() {
+                messages.push(json!({"role": "user", "content": format!("{}{}", context::NOTE, notes.join("\n"))}));
             }
 
             let started = Instant::now();
@@ -1071,6 +1104,7 @@ impl Agent {
                 self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
                 Ok("plan updated".into())
             }
+            "compact" => Ok(self.request_compaction(&args, d)),
             "task" => Ok(self.run_workers(vec![job(&args)], d, "worker")),
             "swarm" => {
                 let jobs: Vec<(String, String)> = args["tasks"].as_array().into_iter().flatten().map(job).collect();
@@ -1784,18 +1818,57 @@ impl Agent {
     }
 
     fn manage_context(&mut self, d: &mut Display) {
+        if let Some((reason, focus)) = self.pending_compaction.take() {
+            if let Err(e) = self.compact_with(d, focus.as_deref(), true) {
+                d.line(&ui::err(&format!("  compaction ({reason}) failed: {e:#}")));
+            }
+        }
         let budget = context::history_budget(self.system_tokens());
-        if context::estimate(&self.history) > budget * 6 / 10 {
+        if context::estimate(&self.history) > budget * self.compaction.trim_at() / 100 {
             let saved = context::elide_old_tool_outputs(&mut self.history);
             if saved > 0 {
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if context::estimate(&self.history) > budget * 8 / 10 {
+        if context::estimate(&self.history) > budget * self.compaction.summarize_at() / 100 {
             if let Err(e) = self.compact_with(d, None, false) {
                 d.line(&ui::err(&format!("  compaction failed: {e:#}")));
             }
         }
+    }
+
+    /// Whether the model may compact on its own: smart mode, for the lead,
+    /// with the full tool set.
+    fn smart_compaction(&self) -> bool {
+        self.compaction == context::Compaction::Smart && !self.is_worker && !self.shell_only
+    }
+
+    /// History's share of its budget, in percent.
+    fn context_used(&self) -> usize {
+        context::percent(context::estimate(&self.history), context::history_budget(self.system_tokens()))
+    }
+
+    /// The `compact` tool: refused below the floor, otherwise scheduled for
+    /// the start of the next step and announced to the user.
+    fn request_compaction(&mut self, args: &Value, d: &mut Display) -> String {
+        if !self.smart_compaction() {
+            return "error: compaction is automatic in this mode".into();
+        }
+        let used = self.context_used();
+        if used < context::SMART_FLOOR {
+            return format!(
+                "error: context is only {used}% full; compaction is refused below {}%. Continue without it.",
+                context::SMART_FLOOR
+            );
+        }
+        let reason = args["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty());
+        let reason = ui::truncate(reason.unwrap_or("the next step is different work"), 120).to_string();
+        let focus = args["focus"].as_str().map(str::trim).filter(|f| !f.is_empty()).map(String::from);
+        d.line(&ui::dim(&format!(
+            "  Rusty is auto-compacting because {reason}. Use /compact settings to turn it off."
+        )));
+        self.pending_compaction = Some((reason, focus));
+        format!("compaction scheduled at {used}% of the history budget; it runs before your next step")
     }
 
     /// `/compact [focus]`: summarise now, steered by what the user wants kept.
@@ -1891,6 +1964,7 @@ impl Agent {
             "version": env!("CARGO_PKG_VERSION"),
             "model": self.model,
             "memory_mode": self.memory_level.name(),
+            "compaction": self.compaction.name(),
             "memory": self.advisor.as_ref().map(|h| &h.metrics),
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),

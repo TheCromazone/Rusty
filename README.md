@@ -170,6 +170,7 @@ the staged repair/search roadmap.
 | `/agents off\|sub\|swarm\|auto` | delegation · `/agents model <id>` sets the subagent model |
 | `/swarm size\|models\|spread` | workers at once (up to 16; a swarm call takes up to 32 tasks and workers share findings), model rotation, temperature spread |
 | `/compact [focus]` | summarise now, keeping what you name in detail |
+| `/compact settings [mode]` | when to compact: `aggressive` (summarise at 60% of history's budget), `standard` (80%, the default), `passive` (95%) or `smart` (the model compacts when the work changes) |
 | `/target` · `/audit [n]` · `/changes` | where infra commands will land · the infra audit log · what this session changed |
 | `/triage` `/change` `/postmortem` | infra skills: incident triage, a change plan with rollback, a blameless write-up |
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |

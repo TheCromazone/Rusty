@@ -70,8 +70,14 @@ answering the question.
 The window is split into allowances: system and project instructions,
 memory (3k chars), pinned plan and goal, a 16k reply reserve, and history.
 When history passes 60% of its share, old tool output shrinks. Past 80%, older
-turns are summarised. Measured token counts from the API are shown after every
-turn, so you always know where you stand.
+turns are summarised. `/compact settings` (or `--compaction`) moves that pair:
+`aggressive` trims at 40% and summarises at 60%, `standard` (the default) at
+60% and 80%, `passive` at 75% and 95%. `smart` keeps the standard pair as a
+backstop and adds a `compact` tool. The model is asked to use it when the next
+step is substantially different work, or a long task, once history is more than
+25% full; below 20% it is refused. Each time, the user sees one line: "Rusty is
+auto-compacting because …". Measured token counts from the API are shown after
+every turn, so you always know where you stand.
 
 Delegation is also a token decision. A subagent spends its own context on
 exploration and hands back a page. A swarm does the same in parallel, with a
