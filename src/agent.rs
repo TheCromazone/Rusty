@@ -200,6 +200,10 @@ pub struct CompactionEvent {
     pub calls_at: usize,
     /// Index in the trajectory's `messages` of the summary that replaced history.
     pub boundary: usize,
+    /// Index of the first message after the compaction. Between `boundary`
+    /// and here sit the summary and the messages kept verbatim, which ran
+    /// before the compaction.
+    pub resumes_at: usize,
 }
 
 pub struct Agent {
@@ -2031,6 +2035,7 @@ impl Agent {
             calls_since_last: self.tool_calls_run - self.compactions.last().map_or(0, |c| c.calls_at),
             calls_at: self.tool_calls_run,
             boundary: self.archived.len(),
+            resumes_at: self.archived.len() + self.history.len(),
         });
         d.line(&ui::dim(&format!(
             "  ⇣ compacted ~{} → ~{} tokens{}",

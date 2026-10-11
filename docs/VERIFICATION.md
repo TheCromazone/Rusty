@@ -588,10 +588,12 @@ no key, so a harness can refuse an unsupported setting before any model call.
   - `compactions` (builds after the reporting pin): one entry per
     compaction with its `trigger` (`level`, `smart`, `manual` or
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
-    them, `calls_since_last`, and `boundary`, the index in the
-    trajectory's `messages` of the summary that replaced history. A report
-    can read what followed each boundary (repeated calls, a first-step
-    error, files read again) from the messages after it.
+    them, `calls_since_last`, `boundary`, the index in the trajectory's
+    `messages` of the summary that replaced history, and `resumes_at`, the
+    index of the first message after the compaction. The messages between
+    them are the summary and those kept verbatim, which ran before it. A
+    report reads what followed each compaction (repeated calls, a
+    first-step error, files read again) from `resumes_at` on.
   - `memory` (null when off).
 - **`--trajectory`** writes the conversation and the same `model_budget`,
   `claims` and `safety`, at the top level.
