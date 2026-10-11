@@ -3655,7 +3655,7 @@ fn a_compaction_reports_an_undone_edit_as_unchanged() {
     };
     let read = |path: &str| reported(tool_reply("read_file", serde_json::json!({"path": path})), 50_000);
     // The edits fall before the two steps a smart compaction keeps, so they are summarised.
-    let (_, requests) = smart_run(
+    let (out, requests) = smart_run(
         &s,
         vec![
             read("a.txt"),
@@ -3674,6 +3674,9 @@ fn a_compaction_reports_an_undone_edit_as_unchanged() {
     assert!(after.contains("[Summary of the conversation so far]"), "a compaction ran: {after}");
     assert!(after.contains("- changed: b.txt"), "{after}");
     assert!(after.contains("- touched, now unchanged: a.txt"), "{after}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["reverted"], 1, "{stats}");
 }
 
 #[test]

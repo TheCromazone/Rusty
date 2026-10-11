@@ -204,6 +204,9 @@ pub struct CompactionEvent {
     /// and here sit the summary and the messages kept verbatim, which ran
     /// before the compaction.
     pub resumes_at: usize,
+    /// Files whose edits this compaction found undone, listed as touched,
+    /// now unchanged rather than changed.
+    pub reverted: usize,
 }
 
 pub struct Agent {
@@ -1916,22 +1919,26 @@ impl Agent {
 
     /// The working set with files back as they were at startup moved out of
     /// `changed`. Without a start record (not a git work tree), unchanged.
-    fn collapse_reverts(&self, working_set: &str) -> String {
-        let Some(start) = &self.start_blobs else { return working_set.to_string() };
+    /// The working set with undone edits moved to their own line, and how
+    /// many files moved.
+    fn collapse_reverts(&self, working_set: &str) -> (String, usize) {
+        let Some(start) = &self.start_blobs else { return (working_set.to_string(), 0) };
         let changed: Vec<String> = working_set
             .lines()
             .find_map(|l| l.strip_prefix("- changed: "))
             .map(|l| l.split(", ").map(|f| f.trim_start_matches("./").to_string()).collect())
             .unwrap_or_default();
         if changed.is_empty() {
-            return working_set.to_string();
+            return (working_set.to_string(), 0);
         }
         let now: std::collections::HashMap<String, Option<String>> =
             crate::snapshot::hash_now(&self.cwd, &changed).into_iter().collect();
-        context::collapse_reverts(working_set, |f| {
+        let unchanged = |f: &str| {
             let f = f.trim_start_matches("./");
             now.get(f).is_some_and(|blob| blob.as_ref() == start.get(f))
-        })
+        };
+        let moved = changed.iter().filter(|f| unchanged(f)).count();
+        (context::collapse_reverts(working_set, unchanged), moved)
     }
 
     /// Characters of the user's messages a compaction carries now.
@@ -2095,7 +2102,7 @@ impl Agent {
             return Ok(());
         }
         let carried = context::user_messages(&self.history[..split], self.carry_chars());
-        let working_set = self.collapse_reverts(&context::working_set(&self.history[..split]));
+        let (working_set, reverted) = self.collapse_reverts(&context::working_set(&self.history[..split]));
         let mut messages =
             vec![json!({"role": "system", "content": "You write precise hand-off summaries of coding sessions."})];
         messages.extend(self.history[..split].iter().cloned());
@@ -2146,6 +2153,7 @@ impl Agent {
             calls_at: self.tool_calls_run,
             boundary: self.archived.len(),
             resumes_at: self.archived.len() + self.history.len(),
+            reverted,
         });
         d.line(&ui::dim(&format!(
             "  ⇣ compacted ~{} → ~{} tokens{}",

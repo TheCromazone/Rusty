@@ -629,9 +629,11 @@ no key, so a harness can refuse an unsupported setting before any model call.
     compaction with its `trigger` (`level`, `smart`, `manual` or
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
     them, `calls_since_last`, `boundary`, the index in the trajectory's
-    `messages` of the summary that replaced history, and `resumes_at`, the
-    index of the first message after the compaction. The messages between
-    them are the summary and those kept verbatim, which ran before it. A
+    `messages` of the summary that replaced history, `resumes_at`, the
+    index of the first message after the compaction, and `reverted`, how
+    many files it found with their edits undone. The messages from
+    `boundary` up to `resumes_at` are the summary and those kept verbatim,
+    which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.
   - `memory` (null when off).
