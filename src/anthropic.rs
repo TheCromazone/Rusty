@@ -307,6 +307,7 @@ fn parse_lines(
                 let u = &v["message"]["usage"];
                 if let Some(n) = input_usage(u) {
                     usage.prompt = n;
+                    (usage.cache_read, usage.cache_write) = cache_usage(u);
                     input_known = true;
                 }
                 usage.completion = u["output_tokens"].as_u64().unwrap_or(0);
@@ -376,6 +377,7 @@ fn parse_lines(
         }
         if let Some(n) = input_usage(&v["usage"]) {
             usage.prompt = n;
+            (usage.cache_read, usage.cache_write) = cache_usage(&v["usage"]);
             input_known = true;
         }
         let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
@@ -395,6 +397,12 @@ fn input_usage(u: &Value) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+/// Cache reads and writes, already counted in `input_usage`'s total.
+fn cache_usage(u: &Value) -> (u64, u64) {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    (n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
 }
 
 fn append(block: &mut Value, key: &str, s: &str) {

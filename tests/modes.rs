@@ -137,6 +137,8 @@ fn run(name: &str, args: &[&str], stdin: Option<&str>) -> Run {
         .env("RUSTY_NO_DOTENV", "1")
         .env("RUSTY_INFRA", "off")
         .env("NVIDIA_API_KEY", "offline-test-key")
+        // Pinned, so a run asks no endpoint for its model list first.
+        .env("RUSTY_CONTEXT_TOKENS", "128000")
         .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
         .env("NO_COLOR", "1")
         .args(args)
@@ -303,6 +305,8 @@ fn a_swarm_tells_the_lead_which_neighbouring_files_no_worker_opened() {
         .env("RUSTY_NO_DOTENV", "1")
         .env("RUSTY_INFRA", "off")
         .env("NVIDIA_API_KEY", "offline-test-key")
+        // Pinned, so a run asks no endpoint for its model list first.
+        .env("RUSTY_CONTEXT_TOKENS", "128000")
         .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
         .env("NO_COLOR", "1")
         .args(["--agents", "swarm", "--mode", "standard", "--yolo", "--", "audit the config"])

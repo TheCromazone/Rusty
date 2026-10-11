@@ -157,8 +157,14 @@ After the reporting pin, compaction modes (`--compaction`, `/compact
 settings`) were added at the owner's request, motivated by Fan et al., "An
 Empirical Study of Harness Design for Coding Agents" (arXiv:2609.20804), not
 by task failures. They are not in the reporting configuration. The default,
-`standard`, compacts where Rusty always did, and any other mode is a separate
-experiment.
+`standard`, keeps Rusty's 60% and 80% thresholds, and any other mode is a
+separate experiment.
+
+Context accounting (`--context-tokens`, the `context` record) followed at the
+owner's request, motivated by the same study and by making compaction work
+the same on any model. It changes where `standard` fires: thresholds now
+count the system prompt and tool schemas, measured from the provider's
+reported usage, where the pin estimated history alone.
 
 ## What careful mode changes
 
@@ -522,6 +528,12 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   (`aggressive`, `standard`, `passive` or `smart`; listed by
   `--capabilities`). It falls back to the saved setting, so a run on such a
   build should pin it, normally to `--compaction standard`.
+- **Context window.** Builds after the reporting pin measure context fill
+  from the provider's reported prompt tokens and look up the window: from
+  `--context-tokens`, else the endpoint's model list (one GET at startup),
+  else saved settings, else 128k. Pin `--context-tokens` to keep that GET
+  off the gateway and the window fixed. The reporting pin assumes 128k and
+  estimates fill from characters.
 - **`--verify`** is optional. Without it, the goal closes on the model's word
   and exit status 2 can't happen.
 - **MCP.** Servers come from `.mcp.json` in the project, or from
@@ -569,7 +581,10 @@ no key, so a harness can refuse an unsupported setting before any model call.
   - `claims`: what happened to the model's completion claims (see above);
   - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;
-  - `compaction` (builds after the reporting pin);
+  - `compaction` and `context` (builds after the reporting pin): window,
+    `window_source`, `calibration`, how many requests carried provider
+    usage, and cache reads and writes. The trajectory also lists each
+    request's `usage`.
   - `memory` (null when off).
 - **`--trajectory`** writes the conversation and the same `model_budget`,
   `claims` and `safety`, at the top level.

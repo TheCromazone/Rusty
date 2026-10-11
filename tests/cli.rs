@@ -57,6 +57,8 @@ impl Sandbox {
             .env("RUSTY_TEST_CALLS", self.bin.parent().unwrap().join("calls.log"))
             .env("RUSTY_NO_DOTENV", "1")
             .env("NVIDIA_API_KEY", "offline-test-key")
+            // Pinned, so a run asks no endpoint for its model list first.
+            .env("RUSTY_CONTEXT_TOKENS", "128000")
             .env("NO_COLOR", "1")
             .env_remove("AWS_PROFILE")
             .env_remove("AWS_DEFAULT_PROFILE")
@@ -1220,6 +1222,18 @@ fn scripted_http(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHan
         requests
     });
     (url, handle)
+}
+
+/// `reply` with the provider reporting `prompt` input tokens.
+fn reported(mut reply: serde_json::Value, prompt: u64) -> serde_json::Value {
+    reply["usage"] = serde_json::json!({"prompt_tokens": prompt, "completion_tokens": 5});
+    reply
+}
+
+/// `reply` without any usage, as from an endpoint that reports none.
+fn unreported(mut reply: serde_json::Value) -> serde_json::Value {
+    reply.as_object_mut().unwrap().remove("usage");
+    reply
 }
 
 fn tool_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
@@ -2739,9 +2753,10 @@ fn a_goal_turn_that_ends_with_a_running_command_continues_the_goal() {
 #[test]
 fn trajectory_keeps_commands_that_compaction_summarised_away() {
     let s = Sandbox::new("trajectory-compaction");
+    // No reported usage, so the context meter estimates the whole context.
     let replies = vec![
-        bash_reply("echo first-marker; seq 100000 199999"),
-        bash_reply("echo second"),
+        unreported(bash_reply("echo first-marker; seq 100000 199999")),
+        unreported(bash_reply("echo second")),
         text_reply("Ran two commands; the second printed filler."),
         text_reply("finished"),
     ];
@@ -3242,6 +3257,8 @@ fn capabilities_list_only_values_the_flags_accept() {
     let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(caps["memory"], serde_json::json!(["off", "recall", "learn", "reflect", "deep"]));
     assert_eq!(caps["compaction"], serde_json::json!(["aggressive", "standard", "passive", "smart"]));
+    assert_eq!(caps["context"]["tokens_flag"], true);
+    assert!(caps["stats"].to_string().contains("\"context\""));
     assert_eq!(caps["mcp"]["transports"], serde_json::json!(["stdio"]));
     // An old value the flag now rejects is not offered.
     let out = s.cmd().args(["--memory", "legacy", "hi"]).output().unwrap();
@@ -3280,14 +3297,14 @@ fn a_shell_toolset_offers_and_runs_only_bash() {
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("unknown toolset"));
 }
 
-/// A smart-mode run with a 40k window, where one 28k-character tool output
-/// puts history at about a third of its budget.
+/// A smart-mode run with a 200k window; how full it is comes from the
+/// prompt tokens each scripted reply reports.
 fn smart_run(s: &Sandbox, replies: Vec<serde_json::Value>) -> (Output, Vec<serde_json::Value>) {
     let (url, server) = scripted_endpoint(replies);
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
-        .env("RUSTY_CONTEXT_TOKENS", "40000")
+        .env("RUSTY_CONTEXT_TOKENS", "200000")
         .args(["--yolo", "--mode", "standard", "--memory", "off", "--compaction", "smart", "--stats", "go"])
         .stdin(Stdio::null())
         .output()
@@ -3308,17 +3325,23 @@ fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
     assert!(offered.contains("\"compact\""), "smart mode offers the tool: {offered}");
     let first = requests[0]["messages"].to_string();
     assert!(first.contains("call compact when the next step is substantially different work"), "{first}");
-    assert!(first.contains("Context in use: 0% of the history budget"), "{first}");
+    assert!(first.contains("Context in use: 1% of the usable window"), "{first}");
     assert!(requests[1]["messages"].to_string().contains("compaction is refused below 20%"));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("auto-compacting"));
 
-    // A third full: scheduled, announced, and run before the next step.
+    // A third full by the provider's count: scheduled, announced, and run before the next step.
     let s = Sandbox::new("compaction-smart");
     let (out, requests) = smart_run(
         &s,
         vec![
-            bash_reply("python3 -c \"print('x' * 28000)\""),
-            tool_reply("compact", serde_json::json!({"reason": "the next task is unrelated.", "focus": "the go task"})),
+            reported(bash_reply("python3 -c \"print('x' * 28000)\""), 58_000),
+            reported(
+                tool_reply(
+                    "compact",
+                    serde_json::json!({"reason": "the next task is unrelated.", "focus": "the go task"}),
+                ),
+                62_000,
+            ),
             text_reply("1. Task: go. 2. Printed a long line of x."),
             text_reply("done"),
         ],
@@ -3365,4 +3388,106 @@ fn compact_settings_show_change_and_persist_the_mode() {
     let out = s.repl(&["/compact settings aggressive", "/compact settings passive"]);
     assert!(out.contains("trims old tool output past 40%, summarises past 60%"), "{out}");
     assert!(out.contains("trims old tool output past 75%, summarises past 95%"), "{out}");
+}
+
+/// A run whose window isn't pinned, against `responses`; returns stdout, the
+/// `--stats` line and the requests.
+fn unpinned_run(s: &Sandbox, responses: Vec<(u16, String)>) -> (String, serde_json::Value, Vec<serde_json::Value>) {
+    let (url, server) = scripted_http(responses);
+    let out = s
+        .cmd()
+        .env_remove("RUSTY_CONTEXT_TOKENS")
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--model", "test/model", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats = stderr.lines().rev().find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).unwrap();
+    let requests = server.join().unwrap().into_iter().map(|(_, body)| body).collect();
+    (String::from_utf8_lossy(&out.stdout).into_owned(), stats, requests)
+}
+
+fn sse(reply: serde_json::Value) -> (u16, String) {
+    (200, format!("data: {reply}\n\ndata: [DONE]\n\n"))
+}
+
+#[test]
+fn the_context_window_comes_from_the_flag_the_endpoint_or_an_overflow() {
+    // The endpoint's model list publishes it.
+    let s = Sandbox::new("window-endpoint");
+    let models =
+        r#"{"data": [{"id": "other/model", "context_length": 9000}, {"id": "test/model", "max_model_len": 50000}]}"#;
+    let (stdout, stats, requests) =
+        unpinned_run(&s, vec![(200, models.into()), sse(reported(text_reply("done"), 1_200))]);
+    assert_eq!(stats["context"]["window"], 50000);
+    assert_eq!(stats["context"]["window_source"], "endpoint");
+    assert_eq!(stats["context"]["provider_usage"], 1);
+    assert!(requests[0].is_null(), "the model list is a GET");
+    assert!(!stdout.contains("assumed"), "{stdout}");
+
+    // Nothing published: 128k is assumed, and the user is told.
+    let s = Sandbox::new("window-assumed");
+    let (stdout, stats, _) = unpinned_run(&s, vec![(200, r#"{"data": []}"#.into()), sse(text_reply("done"))]);
+    assert_eq!(
+        (stats["context"]["window"].as_u64(), stats["context"]["window_source"].as_str()),
+        (Some(128000), Some("assumed"))
+    );
+    assert!(stdout.contains("context window assumed 128000 tokens"), "{stdout}");
+    assert_eq!(stats["context"]["estimated_usage"], 1);
+
+    // An overflow error names the real window: corrected, and the request retried once.
+    let s = Sandbox::new("window-overflow");
+    let overflow = r#"{"error": {"message": "This model's maximum context length is 32,768 tokens. However, you requested 140000 tokens."}}"#;
+    let (stdout, stats, requests) = unpinned_run(
+        &s,
+        vec![(200, r#"{"data": []}"#.into()), (400, overflow.into()), sse(reported(text_reply("done"), 900))],
+    );
+    assert_eq!(
+        (stats["context"]["window"].as_u64(), stats["context"]["window_source"].as_str()),
+        (Some(32768), Some("overflow"))
+    );
+    assert!(stdout.contains("the context window is 32768 tokens"), "{stdout}");
+    assert_eq!(requests.len(), 3);
+
+    // The flag wins and asks nothing.
+    let s = Sandbox::new("window-flag");
+    let (url, server) = scripted_endpoint(vec![text_reply("done")]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--memory", "off", "--context-tokens", "64000", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains(r#""window":64000,"window_source":"flag""#));
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn cache_reads_are_kept_apart_from_the_prompt_total() {
+    let s = Sandbox::new("usage-cache");
+    let mut reply = text_reply("done");
+    reply["usage"] = serde_json::json!({"prompt_tokens": 5000, "completion_tokens": 7, "prompt_tokens_details": {"cached_tokens": 4096}});
+    let (url, server) = scripted_endpoint(vec![reply]);
+    let path = s.home.join("usage.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--memory", "off", "--stats", "--trajectory"])
+        .arg(&path)
+        .arg("go")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    server.join().unwrap();
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        trace["usage"][0],
+        serde_json::json!({"prompt": 5000, "completion": 7, "cache_read": 4096, "cache_write": 0, "source": "provider"})
+    );
+    assert_eq!(trace["context"]["cache_read"], 4096);
+    assert!(trace["context"]["calibration"].as_f64().unwrap() > 1.0, "5000 reported against a smaller estimate");
 }
