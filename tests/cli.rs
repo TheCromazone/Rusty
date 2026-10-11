@@ -2788,6 +2788,17 @@ fn trajectory_keeps_commands_that_compaction_summarised_away() {
         .unwrap();
     let summary = messages.iter().position(|m| m.to_string().contains("[Summary of the conversation so far]")).unwrap();
     assert!(first < summary);
+    // The compaction is recorded where the summary sits, with what led to it.
+    let c = &trace["compactions"][0];
+    assert_eq!(c["trigger"], "level", "{c}");
+    assert_eq!(c["boundary"].as_u64(), Some(summary as u64), "{c}");
+    // Messages after the summary up to resumes_at were kept, not new; the first
+    // message from resumes_at on came after the compaction.
+    let resumes = c["resumes_at"].as_u64().unwrap() as usize;
+    assert!(resumes > summary && resumes <= messages.len(), "{c}");
+    assert!(messages[summary + 1..resumes].iter().any(|m| m.to_string().contains("echo second")), "{c}");
+    assert_eq!(c["calls_since_last"], 2, "{c}");
+    assert!(c["tokens_after"].as_u64() < c["tokens_before"].as_u64(), "{c}");
     assert!(!s.home.join("compacted.partial").exists());
 }
 
@@ -3352,7 +3363,12 @@ fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
     assert!(requests[2]["messages"].to_string().contains("the go task"), "the focus reaches the summary request");
     let after = requests[3]["messages"].to_string();
     assert!(after.contains("[Summary of the conversation so far]") && !after.contains(&"x".repeat(1000)), "{after}");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("\"compaction\":\"smart\""));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("\"compaction\":\"smart\""));
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"].as_array().map(Vec::len), Some(1), "{stats}");
+    assert_eq!(stats["compactions"][0]["trigger"], "smart");
+    assert_eq!(stats["compactions"][0]["calls_since_last"], 2, "the bash call and the compact call");
 }
 
 #[test]

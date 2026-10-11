@@ -184,6 +184,28 @@ impl Totals {
     }
 }
 
+/// One compaction, for the benchmark report: what set it off, how full the
+/// context was before and after, and where it falls in the trajectory.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactionEvent {
+    /// `level` (a mode's threshold), `smart` (the model asked), `manual`
+    /// (`/compact`) or `overflow` (the provider refused the request).
+    pub trigger: &'static str,
+    /// Context tokens before and after, as the meter measures them.
+    pub tokens_before: usize,
+    pub tokens_after: usize,
+    /// Tool calls run since the previous compaction, or since the start.
+    pub calls_since_last: usize,
+    /// Tool calls run before this compaction, all told.
+    pub calls_at: usize,
+    /// Index in the trajectory's `messages` of the summary that replaced history.
+    pub boundary: usize,
+    /// Index of the first message after the compaction. Between `boundary`
+    /// and here sit the summary and the messages kept verbatim, which ran
+    /// before the compaction.
+    pub resumes_at: usize,
+}
+
 pub struct Agent {
     pub backend: crate::backend::Backend,
     client: Arc<Client>,
@@ -211,6 +233,10 @@ pub struct Agent {
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
+    /// Every compaction this session, for `--stats` and the trajectory.
+    pub compactions: Vec<CompactionEvent>,
+    /// Tool calls run so far, so a compaction can say how many came since the last.
+    tool_calls_run: usize,
     /// Where `--trajectory` goes; long runs refresh it as they go so a run
     /// killed from outside still leaves a record.
     pub trajectory_path: Option<PathBuf>,
@@ -314,6 +340,8 @@ impl Agent {
             totals: Totals::default(),
             last_prompt_tokens: 0,
             meter: context::Meter::default(),
+            compactions: Vec::new(),
+            tool_calls_run: 0,
             last_turn_stalled: false,
             project_notes,
             snapshot: String::new(),
@@ -770,7 +798,7 @@ impl Agent {
                         "  the context window is {} tokens, from the provider's error; compacting and retrying",
                         self.meter.window
                     )));
-                    if let Err(c) = self.compact_with(&mut d, None, false) {
+                    if let Err(c) = self.compact_with(&mut d, None, false, "overflow") {
                         d.line(&ui::err(&format!("  compaction failed: {c:#}")));
                     }
                     continue;
@@ -1075,6 +1103,7 @@ impl Agent {
     }
 
     fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+        self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return format!("error: unknown tool `{}`; this run offers only bash", call.name);
         }
@@ -1847,7 +1876,7 @@ impl Agent {
 
     fn manage_context(&mut self, d: &mut Display) {
         if let Some((reason, focus)) = self.pending_compaction.take() {
-            if let Err(e) = self.compact_with(d, focus.as_deref(), true) {
+            if let Err(e) = self.compact_with(d, focus.as_deref(), true, "smart") {
                 d.line(&ui::err(&format!("  compaction ({reason}) failed: {e:#}")));
             }
         }
@@ -1860,7 +1889,7 @@ impl Agent {
             }
         }
         if self.meter.fill(&self.history, fixed) > capacity * self.compaction.summarize_at() / 100 {
-            if let Err(e) = self.compact_with(d, None, false) {
+            if let Err(e) = self.compact_with(d, None, false, "level") {
                 d.line(&ui::err(&format!("  compaction failed: {e:#}")));
             }
         }
@@ -1919,14 +1948,20 @@ impl Agent {
     /// `/compact [focus]`: summarise now, steered by what the user wants kept.
     pub fn compact(&mut self, focus: Option<&str>) -> Result<()> {
         let mut d = Display::new(false);
-        self.compact_with(&mut d, focus, true)
+        self.compact_with(&mut d, focus, true, "manual")
     }
 
     /// Summarises older turns into one message. Every user message is kept
     /// word for word, a working set (files changed and read, recent commands,
     /// the last error) is rebuilt from the tool log, and lasting facts the
     /// summary surfaces are saved to memory.
-    fn compact_with(&mut self, d: &mut Display, focus: Option<&str>, manual: bool) -> Result<()> {
+    fn compact_with(
+        &mut self,
+        d: &mut Display,
+        focus: Option<&str>,
+        manual: bool,
+        trigger: &'static str,
+    ) -> Result<()> {
         let split =
             if manual { context::manual_split(&self.history) } else { context::compaction_split(&self.history) };
         let Some(split) = split else {
@@ -1934,6 +1969,8 @@ impl Agent {
             return Ok(());
         };
         let before = context::estimate(&self.history);
+        let fixed = self.fixed_estimate();
+        let fill_before = self.meter.fill(&self.history, fixed);
         if manual && before < 2_000 {
             d.line(&ui::dim(&format!("  nothing worth compacting yet (~{} tokens)", ui::human(before as u64))));
             return Ok(());
@@ -1991,6 +2028,15 @@ impl Agent {
             self.history.push(json!({"role": "assistant", "content": "Got it. I'll continue from this summary."}));
         }
         self.history.extend(tail);
+        self.compactions.push(CompactionEvent {
+            trigger,
+            tokens_before: fill_before,
+            tokens_after: self.meter.fill(&self.history, fixed),
+            calls_since_last: self.tool_calls_run - self.compactions.last().map_or(0, |c| c.calls_at),
+            calls_at: self.tool_calls_run,
+            boundary: self.archived.len(),
+            resumes_at: self.archived.len() + self.history.len(),
+        });
         d.line(&ui::dim(&format!(
             "  ⇣ compacted ~{} → ~{} tokens{}",
             ui::human(before as u64),
@@ -2014,6 +2060,7 @@ impl Agent {
             "compaction": self.compaction.name(),
             "context": self.context_record(),
             "usage": self.meter.requests,
+            "compactions": self.compactions,
             "memory": self.advisor.as_ref().map(|h| &h.metrics),
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),

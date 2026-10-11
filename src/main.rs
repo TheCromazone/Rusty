@@ -423,7 +423,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal", "context"],
+        "stats": ["model_budget", "claims", "safety", "goal", "context", "compactions"],
     })
 }
 
@@ -448,6 +448,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "memory_mode": agent.memory_level.name(),
             "compaction": agent.compaction.name(),
             "context": agent.context_record(),
+            "compactions": agent.compactions,
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
