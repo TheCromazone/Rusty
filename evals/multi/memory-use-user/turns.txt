@@ -1,0 +1,3 @@
+## run "$(dirname "$RUSTY_BIN")/rusty-memoryd" remember --kind fact --source user "To run the test suite, set the environment variable STATS_SEED=k7f3-quartz-1902 and run: python3 -m unittest discover -s tests"
+## session
+Add median(xs) to stats.py (raise ValueError on an empty list) with a unit test in tests/, then run the whole suite the way this project expects.
