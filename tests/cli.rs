@@ -2792,6 +2792,11 @@ fn trajectory_keeps_commands_that_compaction_summarised_away() {
     let c = &trace["compactions"][0];
     assert_eq!(c["trigger"], "level", "{c}");
     assert_eq!(c["boundary"].as_u64(), Some(summary as u64), "{c}");
+    // Messages after the summary up to resumes_at were kept, not new; the first
+    // message from resumes_at on came after the compaction.
+    let resumes = c["resumes_at"].as_u64().unwrap() as usize;
+    assert!(resumes > summary && resumes <= messages.len(), "{c}");
+    assert!(messages[summary + 1..resumes].iter().any(|m| m.to_string().contains("echo second")), "{c}");
     assert_eq!(c["calls_since_last"], 2, "{c}");
     assert!(c["tokens_after"].as_u64() < c["tokens_before"].as_u64(), "{c}");
     assert!(!s.home.join("compacted.partial").exists());
