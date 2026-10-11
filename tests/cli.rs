@@ -3333,19 +3333,22 @@ fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
     let s = Sandbox::new("compaction-smart-floor");
     let (out, requests) = smart_run(&s, vec![compact("the next task is unrelated"), text_reply("done")]);
     let offered = requests[0]["tools"].to_string();
-    assert!(offered.contains("\"compact\""), "smart mode offers the tool: {offered}");
+    assert!(offered.contains("\"compact\"") && offered.contains("not while stuck on an error"), "{offered}");
     let first = requests[0]["messages"].to_string();
     assert!(first.contains("call compact when the next step is substantially different work"), "{first}");
     assert!(first.contains("Context in use: 1% of the usable window"), "{first}");
     assert!(requests[1]["messages"].to_string().contains("compaction is refused below 20%"));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("auto-compacting"));
 
-    // A third full by the provider's count: scheduled, announced, and run before the next step.
+    // A third full by the provider's count: scheduled, announced, and run before the
+    // next step, keeping the last two steps verbatim.
     let s = Sandbox::new("compaction-smart");
     let (out, requests) = smart_run(
         &s,
         vec![
-            reported(bash_reply("python3 -c \"print('x' * 28000)\""), 58_000),
+            reported(bash_reply("echo first-step"), 20_000),
+            reported(bash_reply("echo second-step"), 40_000),
+            reported(bash_reply("echo third-step"), 58_000),
             reported(
                 tool_reply(
                     "compact",
@@ -3353,22 +3356,74 @@ fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
                 ),
                 62_000,
             ),
-            text_reply("1. Task: go. 2. Printed a long line of x."),
+            text_reply("1. Task: go. 2. Ran three echo commands."),
             text_reply("done"),
         ],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(notice), "{stdout}");
-    assert_eq!(requests.len(), 4);
-    assert!(requests[2]["messages"].to_string().contains("the go task"), "the focus reaches the summary request");
-    let after = requests[3]["messages"].to_string();
-    assert!(after.contains("[Summary of the conversation so far]") && !after.contains(&"x".repeat(1000)), "{after}");
+    assert_eq!(requests.len(), 6);
+    let summarised = requests[4]["messages"].to_string();
+    assert!(summarised.contains("the go task") && summarised.contains("first-step"), "{summarised}");
+    assert!(!summarised.contains("third-step"), "the kept steps are not summarised");
+    let after = requests[5]["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]"), "{after}");
+    assert!(after.contains("second-step") && after.contains("third-step"), "the last two steps stay verbatim");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("\"compaction\":\"smart\""));
     let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
     assert_eq!(stats["compactions"].as_array().map(Vec::len), Some(1), "{stats}");
     assert_eq!(stats["compactions"][0]["trigger"], "smart");
-    assert_eq!(stats["compactions"][0]["calls_since_last"], 2, "the bash call and the compact call");
+    assert_eq!(stats["compactions"][0]["calls_since_last"], 4, "three bash calls and the compact call");
+}
+
+#[test]
+fn smart_compaction_is_refused_while_stuck_busy_or_too_soon() {
+    let compact = || reported(tool_reply("compact", serde_json::json!({"reason": "new work"})), 60_000);
+    let refusal = |requests: &[serde_json::Value], i: usize| requests[i]["messages"].to_string();
+
+    // An unresolved error.
+    let s = Sandbox::new("compaction-refused-error");
+    let (_, requests) = smart_run(
+        &s,
+        vec![
+            reported(bash_reply("echo a"), 50_000),
+            reported(bash_reply("echo b"), 52_000),
+            reported(bash_reply("ls /no/such/dir"), 55_000),
+            compact(),
+            text_reply("done"),
+        ],
+    );
+    assert!(refusal(&requests, 4).contains("the last error is unresolved"));
+
+    // Another call in the same step.
+    let s = Sandbox::new("compaction-refused-pending");
+    let both = serde_json::json!({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"echo x\"}"}},
+        {"index": 1, "id": "c2", "type": "function", "function": {"name": "compact", "arguments": "{\"reason\":\"new work\"}"}}
+    ]}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 60000, "completion_tokens": 5}});
+    let (_, requests) = smart_run(
+        &s,
+        vec![reported(bash_reply("echo a"), 50_000), reported(bash_reply("echo b"), 52_000), both, text_reply("done")],
+    );
+    assert!(refusal(&requests, 3).contains("other calls in this step are still pending"));
+
+    // Too soon after the last compaction.
+    let s = Sandbox::new("compaction-refused-soon");
+    let (_, requests) = smart_run(
+        &s,
+        vec![
+            reported(bash_reply("echo a"), 50_000),
+            reported(bash_reply("echo b"), 52_000),
+            reported(bash_reply("echo c"), 55_000),
+            compact(),
+            text_reply("1. Task: go."),
+            reported(bash_reply("echo d"), 60_000),
+            compact(),
+            text_reply("done"),
+        ],
+    );
+    assert!(refusal(&requests, 7).contains("only 1 tool calls since the last compaction"), "{}", refusal(&requests, 7));
 }
 
 #[test]

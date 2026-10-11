@@ -88,6 +88,12 @@ impl Compaction {
 pub const SMART_FLOOR: usize = 20;
 /// The share above which the prompt invites the model to compact.
 pub const SMART_INVITE: usize = 25;
+/// Steps a smart compaction keeps verbatim.
+pub const SMART_TAIL: usize = 2;
+/// Tool calls that must pass after any compaction before the model's next.
+pub const SMART_SPACING: usize = 10;
+/// How the working set marks an error no later command has cleared.
+pub const UNRESOLVED_ERROR: &str = "- last unresolved error:";
 
 /// `used` as a whole percent of `budget`.
 pub fn percent(used: usize, budget: usize) -> usize {
@@ -444,9 +450,32 @@ pub fn working_set(history: &[Value]) -> String {
         }
     }
     if !last_error.is_empty() {
-        out.push_str(&format!("- last unresolved error: {last_error}\n"));
+        out.push_str(&format!("{UNRESOLVED_ERROR} {last_error}\n"));
     }
     out
+}
+
+/// For a compaction the model asked for: where to cut so its last `k`
+/// steps (each assistant message with its tool results) stay verbatim. A
+/// step that only calls `compact` doesn't count. None when nothing older
+/// than those steps is left to summarise.
+pub fn tail_split(history: &[Value], k: usize) -> Option<usize> {
+    let mut steps = 0;
+    for i in (0..history.len()).rev() {
+        let m = &history[i];
+        if m["role"] != "assistant" {
+            continue;
+        }
+        let calls = m["tool_calls"].as_array().map(Vec::as_slice).unwrap_or_default();
+        if !calls.is_empty() && calls.iter().all(|c| c["function"]["name"] == "compact") {
+            continue;
+        }
+        steps += 1;
+        if steps == k {
+            return (i > 1).then_some(i);
+        }
+    }
+    None
 }
 
 /// For a manual /compact: everything. The user's messages and the working
@@ -676,6 +705,23 @@ mod tests {
         ];
         let again = user_messages(&second, 8000);
         assert!(again.contains("fix the parser") && again.contains("also add tests"));
+    }
+
+    #[test]
+    fn a_smart_compaction_keeps_the_last_two_steps() {
+        let step = |name: &str| json!({"role": "assistant", "content": "", "tool_calls": [{"id": name, "function": {"name": name, "arguments": "{}"}}]});
+        let result = |id: &str| json!({"role": "tool", "tool_call_id": id, "content": "ok"});
+        let mut h = vec![json!({"role": "user", "content": "go"})];
+        for name in ["read_file", "bash", "edit_file"] {
+            h.push(step(name));
+            h.push(result(name));
+        }
+        h.push(step("compact"));
+        h.push(result("compact"));
+        // The compact call doesn't count: bash and edit_file are kept.
+        assert_eq!(tail_split(&h, 2), Some(3));
+        assert_eq!(tail_split(&h[..5], 2), None, "two steps and nothing older");
+        assert_eq!(tail_split(&h, 1), Some(5));
     }
 
     #[test]

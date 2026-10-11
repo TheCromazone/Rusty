@@ -82,10 +82,14 @@ When the context passes 60% of the usable window (the window less the reply
 reserve), old tool output shrinks. Past 80%, older turns are summarised. `/compact settings` (or `--compaction`) moves that pair:
 `aggressive` trims at 40% and summarises at 60%, `standard` (the default) at
 60% and 80%, `passive` at 75% and 95%. `smart` keeps the standard pair as a
-backstop and adds a `compact` tool. The model is asked to use it when the next
-step is substantially different work, or a long task, once history is more than
-25% full; below 20% it is refused. Each time, the user sees one line: "Rusty is
-auto-compacting because …". Measured token counts from the API are shown after
+backstop and adds a `compact` tool. The model is asked to use it when a
+sub-task is resolved and the next step is different work, or the work is
+converging on a long finish, once the context is more than 25% full. The
+harness refuses it below 20%, while the last error is unresolved, while
+another call in the same step or a background command is pending, and within
+ten tool calls of the previous compaction. An accepted one keeps the model's
+last two steps verbatim and summarises what came before. Each time, the user
+sees one line: "Rusty is auto-compacting because …". Measured token counts from the API are shown after
 every turn, so you always know where you stand.
 
 Delegation is also a token decision. A subagent spends its own context on

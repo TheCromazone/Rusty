@@ -174,6 +174,13 @@ included. Now the first and newest messages always survive whole; over the
 cap, older entries are cut to their first line, then middle entries are
 dropped oldest first, newer ones before carried ones.
 
+Smart compaction then kept the model's last two steps verbatim instead of
+summarising everything, put a when-to-compact rubric in the tool
+description, and gained harness-side refusals: an unresolved error, a
+pending call or background command, and fewer than ten tool calls since the
+last compaction. These follow the owner-approved compaction design, not task
+failures. Smart mode is opt-in and outside the reporting configuration.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here

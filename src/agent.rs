@@ -644,9 +644,12 @@ impl Agent {
         if self.smart_compaction() {
             defs.push(t(
                 "compact",
-                "Summarise the conversation so far and continue from the summary. Call it when the next step is \
-                 substantially different work from what you just did, or the task ahead is long. The user's \
-                 messages, the plan and a working set of files and commands are kept word for word.",
+                "Summarise the conversation so far and continue from the summary; your last two steps, the \
+                 user's messages, the plan and a working set of files and commands are kept word for word. Call \
+                 it when a sub-task is resolved and the next step is different work (a different task or \
+                 codebase), or when the work is converging on a long finish. Not in the middle of working \
+                 something out, and not while stuck on an error: it is refused while an error is unresolved, \
+                 while another call is pending, and within ten tool calls of the last compaction.",
                 json!({
                     "reason": {"type": "string", "description": "Why now, in a few words, e.g. 'the next task is unrelated'"},
                     "focus": {"type": "string", "description": "What the summary must keep in detail (optional)"}
@@ -1876,7 +1879,7 @@ impl Agent {
 
     fn manage_context(&mut self, d: &mut Display) {
         if let Some((reason, focus)) = self.pending_compaction.take() {
-            if let Err(e) = self.compact_with(d, focus.as_deref(), true, "smart") {
+            if let Err(e) = self.compact_with(d, focus.as_deref(), false, "smart") {
                 d.line(&ui::err(&format!("  compaction ({reason}) failed: {e:#}")));
             }
         }
@@ -1922,6 +1925,32 @@ impl Agent {
         context::percent(self.meter.fill(&self.history, self.fixed_estimate()), self.meter.capacity())
     }
 
+    /// What the harness can see that makes this a bad moment to compact.
+    fn compaction_refused(&mut self) -> Option<String> {
+        // This call is already counted.
+        let since = self.compactions.last().map(|c| self.tool_calls_run.saturating_sub(c.calls_at + 1));
+        if let Some(n) = since.filter(|n| *n < context::SMART_SPACING) {
+            return Some(format!(
+                "only {n} tool calls since the last compaction (at least {})",
+                context::SMART_SPACING
+            ));
+        }
+        let step = self.history.iter().rev().find(|m| m["role"] == "assistant");
+        if step.and_then(|m| m["tool_calls"].as_array()).is_some_and(|c| c.len() > 1) {
+            return Some("other calls in this step are still pending; call compact on its own".into());
+        }
+        if self.activities.running() > 0 {
+            return Some("a background command is still running".into());
+        }
+        if context::working_set(&self.history).contains(context::UNRESOLVED_ERROR) {
+            return Some("the last error is unresolved".into());
+        }
+        if context::tail_split(&self.history, context::SMART_TAIL).is_none() {
+            return Some(format!("nothing older than your last {} steps to summarise", context::SMART_TAIL));
+        }
+        None
+    }
+
     /// The `compact` tool: refused below the floor, otherwise scheduled for
     /// the start of the next step and announced to the user.
     fn request_compaction(&mut self, args: &Value, d: &mut Display) -> String {
@@ -1934,6 +1963,9 @@ impl Agent {
                 "error: context is only {used}% full; compaction is refused below {}%. Continue without it.",
                 context::SMART_FLOOR
             );
+        }
+        if let Some(why) = self.compaction_refused() {
+            return format!("error: compaction refused: {why}. Continue without it.");
         }
         let reason = args["reason"].as_str().map(|r| r.trim().trim_end_matches('.')).filter(|r| !r.is_empty());
         let reason = ui::truncate(reason.unwrap_or("the next step is different work"), 120).to_string();
@@ -1962,8 +1994,13 @@ impl Agent {
         manual: bool,
         trigger: &'static str,
     ) -> Result<()> {
-        let split =
-            if manual { context::manual_split(&self.history) } else { context::compaction_split(&self.history) };
+        // The model's own compaction keeps its last steps verbatim; a threshold
+        // keeps the newest third; /compact summarises everything.
+        let split = match trigger {
+            "smart" => context::tail_split(&self.history, context::SMART_TAIL),
+            _ if manual => context::manual_split(&self.history),
+            _ => context::compaction_split(&self.history),
+        };
         let Some(split) = split else {
             d.line(&ui::dim("  nothing to compact yet"));
             return Ok(());
@@ -1975,7 +2012,7 @@ impl Agent {
             d.line(&ui::dim(&format!("  nothing worth compacting yet (~{} tokens)", ui::human(before as u64))));
             return Ok(());
         }
-        if !manual && context::estimate(&self.history[..split]) * 4 < before {
+        if !manual && trigger != "smart" && context::estimate(&self.history[..split]) * 4 < before {
             // The bulk is in recent messages, so summarising older ones won't help.
             let saved = context::elide_tool_outputs(&mut self.history, 1);
             if saved > 0 {
