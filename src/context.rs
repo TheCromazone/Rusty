@@ -283,11 +283,11 @@ pub fn manual_split(history: &[Value]) -> Option<usize> {
 }
 
 /// The user's messages from a span of history, verbatim where they fit in
-/// `max_chars`. Compaction carries these over untouched. The first message
-/// and the block carried by an earlier compaction always survive: when the
-/// total is too long, older entries are cut to their first line, oldest
-/// first, and only then are newer middle entries dropped, oldest first. The
-/// newest message is always kept whole.
+/// `max_chars`. Compaction carries these over. The first message and the
+/// newest always survive whole. When the total is too long, older entries
+/// are cut to their first line, oldest first; then the middle entries since
+/// the last compaction are dropped, oldest first; then, if a long session's
+/// carried block still doesn't fit, its middle entries go too, oldest first.
 pub fn user_messages(history: &[Value], max_chars: usize) -> String {
     let mut entries: Vec<String> = Vec::new();
     // Entries before this index came from an earlier compaction.
@@ -306,7 +306,8 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
             // rusty's own nudges and reviews are not things the user said.
             continue;
         }
-        entries.push(crate::ui::truncate(text, 2_000).to_string());
+        // A separator inside a message would split it when carried again.
+        entries.push(crate::ui::truncate(text, 2_000).replace(CARRY_SEPARATOR, "\n- - -\n"));
     }
     let total = |e: &[String]| e.iter().map(|x| x.len() + CARRY_SEPARATOR.len()).sum::<usize>();
     let last = entries.len().saturating_sub(1);
@@ -321,10 +322,13 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
             entries[i] = format!("{short} …");
         }
     }
-    // Then drop newer middle entries; the carried block and the newest stay.
-    while total(&entries) > max_chars {
-        let Some(i) = (carried.max(1)..last.min(entries.len().saturating_sub(1))).next() else { break };
+    // Then drop middle entries: those since the last compaction first, then
+    // carried ones; the first and the newest stay.
+    while total(&entries) > max_chars && entries.len() > 2 {
+        let newest = entries.len() - 1;
+        let i = if carried.max(1) < newest { carried.max(1) } else { 1 };
         entries.remove(i);
+        carried = carried.saturating_sub(usize::from(i < carried));
     }
     entries.join(CARRY_SEPARATOR)
 }
@@ -463,6 +467,19 @@ mod tests {
         // A third compaction still carries the first message.
         let third = user_messages(&[summary(&again), json!({"role": "user", "content": "one more"})], 8_000);
         assert!(third.starts_with("fix the parser") && third.ends_with("one more"));
+
+        // A long session: a carried block of forty long entries plus one new message
+        // comes back under the cap, first message whole, carried entries dropped oldest first.
+        let many: Vec<String> = (0..40).map(|i| format!("request {i}: {}", "y".repeat(400))).collect();
+        let block = format!("fix the parser{CARRY_SEPARATOR}{}", many.join(CARRY_SEPARATOR));
+        let long = user_messages(&[summary(&block), json!({"role": "user", "content": "and finish"})], 8_000);
+        assert!(long.len() <= 8_000, "{}", long.len());
+        assert!(long.starts_with("fix the parser") && long.ends_with("and finish"), "{long}");
+        assert!(!long.contains("request 0:") && long.contains("request 39:"), "oldest carried entries go first");
+
+        // A message containing the separator stays one entry.
+        let hr = user_messages(&[json!({"role": "user", "content": "above\n---\nbelow"})], 8_000);
+        assert_eq!(hr.split(CARRY_SEPARATOR).count(), 1, "{hr}");
     }
 
     #[test]
