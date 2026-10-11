@@ -186,12 +186,17 @@ owner-approved design: the reply reserve (the mode's reply size, at most an
 eighth of the window, at least 4k; 16k at 128k as before), the tool results
 kept whole, the head a trimmed result keeps, the user messages a compaction
 carries, and smart mode's floor (never below 4k tokens). `--history-cap-tokens`
-caps the thresholds, and an unchosen mode follows the window (`aggressive`
-below 48k; a 128k cap above 200k). At a 128k window with `standard` chosen,
-only the carried messages change: a tenth of the history budget where the
-pin carried 8,000 characters. Harness runs on these builds should pin
-`--compaction` and, for windows over 200k, `--history-cap-tokens` or accept
-the 128k default.
+caps the thresholds; unchosen, the cap is 128k above a 200k window whatever
+the mode, and the mode follows the window (`aggressive` below 48k). A
+request's output cap (`max_tokens`, `max_completion_tokens`) is the mode's
+as before when the window has room for it beside the context, else the room
+left less a fiftieth of the window, never below the reserve. A request
+changes from the pin's only when its prompt and output cap came within a
+fiftieth of the window or past it. At a 128k window with
+`standard` chosen, only the carried messages change: a tenth of the history
+budget where the pin carried 8,000 characters. Harness runs on these builds
+should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
+or accept the 128k default.
 
 A compaction then started telling undone edits apart, again by the
 owner-approved design: at startup rusty records each tracked file's blob
@@ -634,10 +639,11 @@ no key, so a harness can refuse an unsupported setting before any model call.
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
     them, `calls_since_last`, `boundary`, the index in the trajectory's
     `messages` of the summary that replaced history, `resumes_at`, the
-    index of the first message after the compaction, and `model`, the
-    model that wrote the summary (`context` names the configured one as
-    `compaction_model`). The messages between
-    them are the summary and those kept verbatim, which ran before it. A
+    index of the first message after the compaction, `reverted`, how many
+    files it found with their edits undone, and `model`, the model that
+    wrote the summary (`context` names the configured one as
+    `compaction_model`). The messages from `boundary` up to `resumes_at`
+    are the summary and those kept verbatim, which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.
   - `memory` (null when off).

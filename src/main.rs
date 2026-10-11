@@ -314,8 +314,8 @@ fn run() -> Result<i32> {
             },
         },
     };
-    // Unchosen, compaction follows the window: aggressive below 48k, and a
-    // 128k cap on history above 200k.
+    // Unchosen, compaction follows the window (aggressive below 48k), and so
+    // does the history cap, whatever the mode (128k above a 200k window).
     let chosen_compaction = cli.compaction.clone().or_else(|| settings.compaction.clone());
     agent.compaction = match &chosen_compaction {
         Some(c) => context::Compaction::parse(c)
@@ -326,7 +326,7 @@ fn run() -> Result<i32> {
         .history_cap_tokens
         .map(|n| n as usize)
         .or(settings.history_cap_tokens)
-        .or_else(|| context::default_history_cap(agent.meter.window).filter(|_| chosen_compaction.is_none()));
+        .or_else(|| context::default_history_cap(agent.meter.window));
     agent.compaction_model = cli
         .compaction_model
         .clone()
