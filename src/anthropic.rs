@@ -307,6 +307,7 @@ fn parse_lines(
                 let u = &v["message"]["usage"];
                 if let Some(n) = input_usage(u) {
                     usage.prompt = n;
+                    (usage.cache_read, usage.cache_write) = cache_usage(u);
                     input_known = true;
                 }
                 usage.completion = u["output_tokens"].as_u64().unwrap_or(0);
@@ -376,6 +377,7 @@ fn parse_lines(
         }
         if let Some(n) = input_usage(&v["usage"]) {
             usage.prompt = n;
+            (usage.cache_read, usage.cache_write) = cache_usage(&v["usage"]);
             input_known = true;
         }
         let text: String = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
@@ -395,6 +397,12 @@ fn input_usage(u: &Value) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+/// Cache reads and writes, already counted in `input_usage`'s total.
+fn cache_usage(u: &Value) -> (u64, u64) {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    (n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
 }
 
 fn append(block: &mut Value, key: &str, s: &str) {
@@ -436,7 +444,8 @@ fn finish(
         }
         .to_string()
     };
-    let mut reply = Reply { usage, finish_reason: Some(finish_reason.clone()), ..Default::default() };
+    let window_full = stop.as_deref() == Some("model_context_window_exceeded");
+    let mut reply = Reply { usage, finish_reason: Some(finish_reason.clone()), window_full, ..Default::default() };
     reply.content =
         blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("");
     reply.tool_calls = blocks
@@ -552,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn a_full_window_is_told_apart_from_a_reply_limit() {
+        let (reply, _) = parse(&[
+            start(0, json!({"type": "text", "text": ""})),
+            delta(0, json!({"type": "text_delta", "text": "partial"})),
+            json!({"type": "message_delta", "delta": {"stop_reason": "model_context_window_exceeded"}}),
+        ]);
+        assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+        assert!(reply.window_full);
+    }
+
+    #[test]
     fn a_cut_off_turn_keeps_no_raw_blocks() {
         let (reply, _) = parse(&[
             start(0, json!({"type": "thinking", "thinking": ""})),
@@ -561,6 +581,7 @@ mod tests {
             json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
         ]);
         assert_eq!(reply.finish_reason.as_deref(), Some("length"));
+        assert!(!reply.window_full, "max_tokens is the reply's own limit");
         assert!(reply.raw.is_none());
         assert!(
             serde_json::from_str::<Value>(&reply.tool_calls[0].arguments).is_err(),

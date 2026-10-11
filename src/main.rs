@@ -64,6 +64,11 @@ struct Cli {
     #[arg(long, env = "RUSTY_MEMORY", default_value = "learn")]
     memory: String,
 
+    /// Context window in tokens; otherwise asked of the endpoint, then the saved
+    /// table, else 128000 is assumed
+    #[arg(long, env = "RUSTY_CONTEXT_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
+    context_tokens: Option<u64>,
+
     /// Compaction: aggressive, standard, passive or smart (overrides saved settings)
     #[arg(long, env = "RUSTY_COMPACTION")]
     compaction: Option<String>,
@@ -279,6 +284,25 @@ fn run() -> Result<i32> {
             }
         }
     }
+    agent.meter = match cli.context_tokens {
+        Some(n) => context::Meter::new(n as usize, "flag"),
+        None => match client.context_window(&agent.model) {
+            Some(n) => context::Meter::new(n, "endpoint"),
+            None => match settings.context_windows.get(&agent.model) {
+                Some(&n) => context::Meter::new(n, "table"),
+                None => {
+                    println!(
+                        "{}",
+                        ui::dim(&format!(
+                            "◇ context window assumed {} tokens; pass --context-tokens to set it",
+                            context::ASSUMED_WINDOW
+                        ))
+                    );
+                    context::Meter::default()
+                }
+            },
+        },
+    };
     let compaction = cli.compaction.clone().unwrap_or_else(|| settings.compaction.clone());
     agent.compaction = context::Compaction::parse(&compaction)
         .ok_or_else(|| anyhow!("unknown compaction `{compaction}` ({})", context::Compaction::NAMES))?;
@@ -389,6 +413,7 @@ fn capabilities() -> serde_json::Value {
         "contract": CONTRACT,
         "memory": accepted(&memory, &|v| rusty::advisor::Level::parse(v).is_some()),
         "compaction": accepted(&compaction, &|v| context::Compaction::parse(v).is_some()),
+        "context": {"tokens_flag": true, "window_sources": ["flag", "endpoint", "table", "assumed", "overflow"]},
         "mode": modes,
         "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
@@ -398,7 +423,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal"],
+        "stats": ["model_budget", "claims", "safety", "goal", "context"],
     })
 }
 
@@ -422,6 +447,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
             "compaction": agent.compaction.name(),
+            "context": agent.context_record(),
             "tools_location": agent.backend.summary(),
             "memory": agent.advisor.as_ref().map(|h| &h.metrics),
         })
@@ -944,7 +970,7 @@ fn print_settings(agent: &Agent) {
         ("swarm spread", format!("{:.1}", a.spread)),
         ("tips", if agent.tips { "on".into() } else { "off".into() }),
         ("target", if agent.infra.target.is_empty() { "-".into() } else { agent.infra.target.summary() }),
-        ("context window", context::window().to_string()),
+        ("context window", format!("{} ({})", agent.meter.window, agent.meter.window_source)),
     ];
     for (k, v) in rows {
         println!("  {} {}", ui::dim(&format!("{k:<15}")), v);
