@@ -201,6 +201,15 @@ compaction a "changed" path whose current blob equals that one moves to
 hash-object` per compaction. Untracked files and projects outside git are
 left as they were.
 
+`--compaction-model` (`RUSTY_COMPACTION_MODEL`, `compaction_model` in saved
+settings) then let a separate model write compaction summaries, again by the
+owner-approved design. Unset, the session's model writes them as before. A
+summariser that errors or returns an empty summary hands that compaction to
+the session's model once, and one no endpoint serves is refused at startup.
+Each compaction records the model that wrote its summary, so a comparison
+can tell a summariser's effect from a fallback. It is a separate
+configuration: pin it, or leave it unset, and don't pool runs across it.
+
 ## What careful mode changes
 
 An ablation of `--mode careful` measures the whole mode. Nothing here
@@ -624,8 +633,10 @@ no key, so a harness can refuse an unsupported setting before any model call.
     compaction with its `trigger` (`level`, `smart`, `manual` or
     `overflow`), `tokens_before` and `tokens_after` as the meter measures
     them, `calls_since_last`, `boundary`, the index in the trajectory's
-    `messages` of the summary that replaced history, and `resumes_at`, the
-    index of the first message after the compaction. The messages between
+    `messages` of the summary that replaced history, `resumes_at`, the
+    index of the first message after the compaction, and `model`, the
+    model that wrote the summary (`context` names the configured one as
+    `compaction_model`). The messages between
     them are the summary and those kept verbatim, which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.

@@ -78,6 +78,11 @@ struct Cli {
     #[arg(long, env = "RUSTY_COMPACTION")]
     compaction: Option<String>,
 
+    /// Model that writes compaction summaries; the session's model when unset,
+    /// and as the fallback if it fails (overrides saved settings)
+    #[arg(long, env = "RUSTY_COMPACTION_MODEL")]
+    compaction_model: Option<String>,
+
     /// Permission mode: read-only, ask, auto or yolo
     #[arg(short, long, env = "RUSTY_PERMISSIONS", default_value = "auto")]
     permissions: String,
@@ -322,6 +327,14 @@ fn run() -> Result<i32> {
         .map(|n| n as usize)
         .or(settings.history_cap_tokens)
         .or_else(|| context::default_history_cap(agent.meter.window).filter(|_| chosen_compaction.is_none()));
+    agent.compaction_model = cli
+        .compaction_model
+        .clone()
+        .or_else(|| settings.compaction_model.clone())
+        .filter(|m| !m.trim().is_empty() && *m != agent.model);
+    if let Some(m) = &agent.compaction_model {
+        client.endpoint_for(m)?;
+    }
     agent.shell_only = match cli.toolset.as_str() {
         "full" => false,
         "shell" => true,
@@ -432,6 +445,7 @@ fn capabilities() -> serde_json::Value {
         "context": {
             "tokens_flag": true,
             "history_cap_flag": true,
+            "compaction_model_flag": true,
             "window_sources": ["flag", "endpoint", "table", "assumed", "overflow"]
         },
         "mode": modes,

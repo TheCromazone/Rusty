@@ -3672,3 +3672,54 @@ fn a_compaction_reports_an_undone_edit_as_unchanged() {
     assert!(after.contains("- changed: b.txt"), "{after}");
     assert!(after.contains("- touched, now unchanged: a.txt"), "{after}");
 }
+
+#[test]
+fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
+    let run = |s: &Sandbox, summaries: Vec<serde_json::Value>| {
+        let mut replies =
+            vec![reported(bash_reply("echo first-step"), 30_000), reported(bash_reply("echo second-step"), 30_500)];
+        replies.extend(summaries);
+        replies.push(text_reply("done"));
+        let (url, server) = scripted_endpoint(replies);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "20000"])
+            .args(["--compaction-model", "summariser-small", "--stats", "go"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+        let models: Vec<String> =
+            server.join().unwrap().iter().map(|r| r["model"].as_str().unwrap_or_default().to_string()).collect();
+        (stats, models, String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let s = Sandbox::new("compaction-model");
+    let summary = || text_reply("1. Task: go. 2. Ran echo.");
+    let (stats, models, _) = run(&s, vec![summary()]);
+    assert_eq!(models[2], "summariser-small", "{models:?}");
+    assert_eq!(models.iter().filter(|m| *m == "summariser-small").count(), 1, "{models:?}");
+    assert_eq!(stats["compactions"][0]["model"], "summariser-small", "{stats}");
+    assert_eq!(stats["context"]["compaction_model"], "summariser-small", "{stats}");
+
+    // An empty summary is written again by the session's model.
+    let (stats, models, stdout) = run(&s, vec![text_reply(""), summary()]);
+    assert_eq!(models[2], "summariser-small", "{models:?}");
+    assert_ne!(models[3], "summariser-small", "{models:?}");
+    assert_eq!(stats["compactions"][0]["model"], models[3], "{stats}");
+    assert!(stdout.contains("could not summarise"), "{stdout}");
+
+    // A summariser no endpoint serves is refused before any work starts.
+    let out = s
+        .cmd()
+        .args(["--yolo", "--memory", "off", "--compaction-model", "claude-sonnet-4-5", "go"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
+}

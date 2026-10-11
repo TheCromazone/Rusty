@@ -230,6 +230,9 @@ pub struct Settings {
     /// Compaction thresholds never sit above this many context tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_cap_tokens: Option<usize>,
+    /// The model that writes compaction summaries; unset uses the session's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<String>,
     /// Context windows by model id, for endpoints that don't publish one.
     pub context_windows: std::collections::BTreeMap<String, usize>,
 }
@@ -247,6 +250,7 @@ impl Default for Settings {
             delegation_override: false,
             compaction: None,
             history_cap_tokens: None,
+            compaction_model: None,
             context_windows: Default::default(),
         }
     }
