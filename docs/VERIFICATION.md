@@ -585,6 +585,13 @@ no key, so a harness can refuse an unsupported setting before any model call.
     `window_source`, `calibration`, how many requests carried provider
     usage, and cache reads and writes. The trajectory also lists each
     request's `usage`.
+  - `compactions` (builds after the reporting pin): one entry per
+    compaction with its `trigger` (`level`, `smart`, `manual` or
+    `overflow`), `tokens_before` and `tokens_after` as the meter measures
+    them, `calls_since_last`, and `boundary`, the index in the
+    trajectory's `messages` of the summary that replaced history. A report
+    can read what followed each boundary (repeated calls, a first-step
+    error, files read again) from the messages after it.
   - `memory` (null when off).
 - **`--trajectory`** writes the conversation and the same `model_budget`,
   `claims` and `safety`, at the top level.
