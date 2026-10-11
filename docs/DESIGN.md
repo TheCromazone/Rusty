@@ -69,8 +69,17 @@ answering the question.
 
 The window is split into allowances: system and project instructions,
 memory (3k chars), pinned plan and goal, a 16k reply reserve, and history.
-When history passes 60% of its share, old tool output shrinks. Past 80%, older
-turns are summarised. `/compact settings` (or `--compaction`) moves that pair:
+How full the context is comes from the provider's own count: the prompt
+tokens it reports for a request are the context at that request, and what was
+added since is estimated, scaled by a running ratio of reported to estimated
+tokens. No tokenizer ships and no model name is consulted. The window comes
+from `--context-tokens`, else the endpoint's model list (`context_length`,
+`max_model_len`), else `context_windows` in saved settings, else 128k is
+assumed and the user told; an overflow error that names the real window
+corrects it, and the request is compacted and retried once.
+
+When the context passes 60% of the usable window (the window less the reply
+reserve), old tool output shrinks. Past 80%, older turns are summarised. `/compact settings` (or `--compaction`) moves that pair:
 `aggressive` trims at 40% and summarises at 60%, `standard` (the default) at
 60% and 80%, `passive` at 75% and 95%. `smart` keeps the standard pair as a
 backstop and adds a `compact` tool. The model is asked to use it when the next

@@ -67,8 +67,13 @@ pub struct ToolCall {
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Usage {
+    /// Every input token the request was charged for, cached ones included.
     pub prompt: u64,
     pub completion: u64,
+    /// Input tokens served from the provider's prompt cache (part of `prompt`).
+    pub cache_read: u64,
+    /// Input tokens written to the prompt cache (Anthropic; part of `prompt`).
+    pub cache_write: u64,
     /// What the provider says the request cost, when it says (OpenRouter's
     /// `usage.cost`, in US dollars).
     pub cost: Option<f64>,
@@ -83,6 +88,9 @@ pub struct Reply {
     /// Anthropic's content blocks for this turn, kept so thinking goes back
     /// to the API unchanged. None for other providers.
     pub raw: Option<Value>,
+    /// The output stopped because the context window was full (Anthropic's
+    /// `model_context_window_exceeded`); `finish_reason` still says "length".
+    pub window_full: bool,
 }
 
 /// One provider's endpoint and its keys.
@@ -327,6 +335,24 @@ impl Client {
         let mut ids: Vec<String> = data.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
         ids.sort();
         Ok(ids)
+    }
+
+    /// The context window an endpoint publishes for `model` in its model list
+    /// (`context_length` on OpenRouter, `max_model_len` on vLLM), asked once.
+    /// None when the provider publishes none (Anthropic) or can't be reached.
+    pub fn context_window(&self, model: &str) -> Option<usize> {
+        let ep = self.endpoint_for(model).ok()?;
+        if ep.provider == Provider::Anthropic {
+            return None;
+        }
+        let url = format!("{}/models", ep.base_url);
+        let v: Value = self.send_with(ep, &url, (None, "catalog"), None, Retry::Once).ok()?.response.json().ok()?;
+        let entry = v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?;
+        ["context_length", "max_model_len", "context_window", "max_context_length"]
+            .iter()
+            .find_map(|k| entry[*k].as_u64())
+            .map(|n| n as usize)
+            .filter(|n| *n > 0)
     }
 
     /// Sends a request, rotating keys and backing off on rate limits, server
@@ -600,6 +626,8 @@ fn usage_of(u: &Value) -> Option<Usage> {
     Some(Usage {
         prompt: u["prompt_tokens"].as_u64()?,
         completion: u["completion_tokens"].as_u64()?,
+        cache_read: u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+        cache_write: 0,
         cost: u["cost"].as_f64(),
     })
 }
