@@ -251,7 +251,12 @@ impl Meter {
     /// The reply reserve: the mode's reply size, at most an eighth of the
     /// window, at least 4,000 tokens.
     pub fn set_reply(&mut self, reply_tokens: usize) {
-        self.reserve = reply_tokens.min(self.window / 8).max(MIN_REPLY_RESERVE);
+        self.reserve = self.reserve_for(reply_tokens);
+    }
+
+    /// The reserve a reply of `reply_tokens` would get in this window.
+    pub fn reserve_for(&self, reply_tokens: usize) -> usize {
+        reply_tokens.min(self.window / 8).max(MIN_REPLY_RESERVE)
     }
 
     /// The calibration ratio, or None before the first reported request.

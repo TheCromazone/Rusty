@@ -1919,7 +1919,10 @@ impl Agent {
     /// The largest summary request a compaction can send: the summarise
     /// threshold plus the reply reserve.
     pub fn largest_summary_request(&self) -> usize {
-        self.thresholds().1 + self.meter.reserve
+        // Auto can switch to careful mid-run, and careful has the largest reply.
+        let mode = if self.mode_fixed { self.execution_mode } else { ExecutionMode::Careful };
+        let reserve = self.meter.reserve_for(mode.max_tokens() as usize);
+        self.thresholds_for(self.meter.window.saturating_sub(reserve).max(1)).1 + reserve
     }
 
     fn fixed_estimate(&self) -> usize {
@@ -1934,7 +1937,10 @@ impl Agent {
     /// older turns are summarised: the mode's shares of the usable window,
     /// lowered to the history cap, if one is set, in the same proportion.
     fn thresholds(&self) -> (usize, usize) {
-        let capacity = self.meter.capacity();
+        self.thresholds_for(self.meter.capacity())
+    }
+
+    fn thresholds_for(&self, capacity: usize) -> (usize, usize) {
         let (trim, summarize) = (self.compaction.trim_at(), self.compaction.summarize_at());
         let at = |pct: usize| capacity * pct / 100;
         match self.history_cap {
@@ -2286,7 +2292,7 @@ impl Agent {
             "  {bar} ~{used}% of what a request may fill\n  window        {win} ({})\n  system+tools  ~{fixed}\n  history       ~{hist} ({} messages, {tools_n} tool results)\n  reply reserve {}\n  calibration   {calibration}\n  last request  {} prompt tokens (reported by the API)",
             self.meter.window_source,
             self.history.len(),
-            context::REPLY_RESERVE,
+            self.meter.reserve,
             self.last_prompt_tokens,
         )
     }

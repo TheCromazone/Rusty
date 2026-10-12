@@ -213,7 +213,8 @@ summariser that errors or returns an empty summary hands that compaction to
 the session's model once. At startup a summariser no endpoint serves is
 refused, and so is one whose window (from its endpoint or the saved table)
 is smaller than the largest summary request, the summarise threshold plus
-the reply reserve; an unknown window is reported and left to the fallback.
+the reply reserve (careful's, unless `--mode` pins another, since auto can
+switch to careful); an unknown window is reported and left to the fallback.
 The summariser's reported usage feeds neither the context meter nor its
 calibration, so a different tokenizer cannot skew the session's fill, and
 its tokens are totalled under its own model.
