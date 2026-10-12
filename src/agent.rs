@@ -1517,6 +1517,8 @@ impl Agent {
                 (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), self.backend.clone());
             let (cfg, lead_model, execution_mode) = (cfg.clone(), self.model.clone(), self.execution_mode);
             let lead_window = (self.meter.window, self.meter.window_source);
+            // Workers compact as the lead does; smart's own tool is the lead's alone.
+            let (compaction, history_cap) = (self.compaction, self.history_cap);
             std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
@@ -1534,6 +1536,8 @@ impl Agent {
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
+                w.compaction = compaction;
+                w.history_cap = history_cap;
                 w.request_role = role;
                 w.backend = backend.clone();
                 w.execution_mode = execution_mode;
@@ -1919,7 +1923,10 @@ impl Agent {
     /// The largest summary request a compaction can send: the summarise
     /// threshold plus the reply reserve.
     pub fn largest_summary_request(&self) -> usize {
-        self.thresholds().1 + self.meter.reserve
+        // Auto can switch to careful mid-run, and careful has the largest reply.
+        let mode = if self.mode_fixed { self.execution_mode } else { ExecutionMode::Careful };
+        let reserve = self.meter.reserve_for(mode.max_tokens() as usize);
+        self.thresholds_for(self.meter.window.saturating_sub(reserve).max(1)).1 + reserve
     }
 
     fn fixed_estimate(&self) -> usize {
@@ -1934,7 +1941,10 @@ impl Agent {
     /// older turns are summarised: the mode's shares of the usable window,
     /// lowered to the history cap, if one is set, in the same proportion.
     fn thresholds(&self) -> (usize, usize) {
-        let capacity = self.meter.capacity();
+        self.thresholds_for(self.meter.capacity())
+    }
+
+    fn thresholds_for(&self, capacity: usize) -> (usize, usize) {
         let (trim, summarize) = (self.compaction.trim_at(), self.compaction.summarize_at());
         let at = |pct: usize| capacity * pct / 100;
         match self.history_cap {
@@ -1944,9 +1954,8 @@ impl Agent {
     }
 
     /// The working set with files back as they were at startup moved out of
-    /// `changed`. Without a start record (not a git work tree), unchanged.
-    /// The working set with undone edits moved to their own line, and how
-    /// many files moved.
+    /// `changed` to their own line, and how many moved. Without a start
+    /// record (not a git work tree), unchanged.
     fn collapse_reverts(&self, working_set: &str) -> (String, usize) {
         let Some(start) = &self.start_blobs else { return (working_set.to_string(), 0) };
         let changed: Vec<String> = working_set
@@ -1959,9 +1968,11 @@ impl Agent {
         }
         let now: std::collections::HashMap<String, Option<String>> =
             crate::snapshot::hash_now(&self.cwd, &changed).into_iter().collect();
+        // Only a file present both now and at startup, with the same blob: a
+        // file deleted since, or with no startup record (untracked), stays changed.
         let unchanged = |f: &str| {
             let f = f.trim_start_matches("./");
-            now.get(f).is_some_and(|blob| blob.as_ref() == start.get(f))
+            matches!((now.get(f), start.get(f)), (Some(Some(n)), Some(s)) if n == s)
         };
         let moved = changed.iter().filter(|f| unchanged(f)).count();
         (context::collapse_reverts(working_set, unchanged), moved)
@@ -1991,9 +2002,22 @@ impl Agent {
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if self.meter.fill(&self.history, fixed) > summarize {
-            if let Err(e) = self.compact_with(d, None, false, "level") {
-                d.line(&ui::err(&format!("  compaction failed: {e:#}")));
+        // A compaction that could not get under the threshold isn't repeated
+        // until the context has grown by a tenth of it, so a window or cap too
+        // small for the fixed part doesn't cost a summary on every step.
+        let since = self.compactions.last().map_or(0, |c| c.tokens_after + summarize / 10);
+        if self.meter.fill(&self.history, fixed) > summarize.max(since) {
+            let before = self.compactions.len();
+            match self.compact_with(d, None, false, "level") {
+                Err(e) => d.line(&ui::err(&format!("  compaction failed: {e:#}"))),
+                Ok(()) => {
+                    if self.compactions.len() > before && self.compactions[before].tokens_after > summarize {
+                        d.line(&ui::dim(&format!(
+                            "  ◇ context still over the {summarize}-token threshold after compacting; \
+                             the window or --history-cap-tokens is too small for the system prompt and tools"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -2297,7 +2321,7 @@ impl Agent {
             "  {bar} ~{used}% of what a request may fill\n  window        {win} ({})\n  system+tools  ~{fixed}\n  history       ~{hist} ({} messages, {tools_n} tool results)\n  reply reserve {}\n  calibration   {calibration}\n  last request  {} prompt tokens (reported by the API)",
             self.meter.window_source,
             self.history.len(),
-            context::REPLY_RESERVE,
+            self.meter.reserve,
             self.last_prompt_tokens,
         )
     }

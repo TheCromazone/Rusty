@@ -332,28 +332,6 @@ fn run() -> Result<i32> {
         .clone()
         .or_else(|| settings.compaction_model.clone())
         .filter(|m| !m.trim().is_empty() && *m != agent.model);
-    if let Some(m) = agent.compaction_model.clone() {
-        client.endpoint_for(&m)?;
-        agent.compaction_window = client.context_window(&m).or_else(|| settings.context_windows.get(&m).copied());
-        let need = agent.largest_summary_request();
-        match agent.compaction_window {
-            Some(w) if w < need => {
-                return Err(anyhow!(
-                    "`{m}` has a {w}-token context window, but a summary request here can reach {need} tokens \
-                     (the summarise threshold plus the reply reserve); pick a larger summariser or lower \
-                     --history-cap-tokens"
-                ));
-            }
-            Some(_) => {}
-            None => println!(
-                "{}",
-                ui::dim(&format!(
-                    "◇ {m}'s context window is unknown; a summary it can't fit is written by {}",
-                    agent.model
-                ))
-            ),
-        }
-    }
     agent.shell_only = match cli.toolset.as_str() {
         "full" => false,
         "shell" => true,
@@ -377,6 +355,30 @@ fn run() -> Result<i32> {
             ui::warn("◇ careful"),
             ui::dim(&format!("target looks like production: {}", agent.infra.target.summary()))
         );
+    }
+
+    // Checked once the mode is known, since the reply reserve depends on it.
+    if let Some(m) = agent.compaction_model.clone() {
+        client.endpoint_for(&m)?;
+        agent.compaction_window = client.context_window(&m).or_else(|| settings.context_windows.get(&m).copied());
+        let need = agent.largest_summary_request();
+        match agent.compaction_window {
+            Some(w) if w < need => {
+                return Err(anyhow!(
+                    "`{m}` has a {w}-token context window, but a summary request here can reach {need} tokens \
+                     (the summarise threshold plus the reply reserve); pick a larger summariser or lower \
+                     --history-cap-tokens"
+                ));
+            }
+            Some(_) => {}
+            None => println!(
+                "{}",
+                ui::dim(&format!(
+                    "◇ {m}'s context window is unknown; a summary it can't fit is written by {}",
+                    agent.model
+                ))
+            ),
+        }
     }
 
     let sessions = pdir.join("sessions");

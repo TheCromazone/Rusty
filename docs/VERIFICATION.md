@@ -198,6 +198,16 @@ budget where the pin carried 8,000 characters. Harness runs on these builds
 should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
 or accept the 128k default.
 
+A later fix gave subagents and swarm workers the lead's compaction mode and
+history cap. They had kept the defaults (`standard`, no cap), so under a 1M
+window a worker on the lead's model summarised only near 787k tokens.
+
+A later fix stopped a compaction from repeating on every step when it can't
+get the context under the summary threshold, as with a window or
+`--history-cap-tokens` too small for the system prompt and tools. The next
+threshold compaction then waits until the context has grown by a tenth of
+the threshold, and the user is told the window or cap is too small.
+
 A later fix measured smart mode's 20% floor, its 25% invitation and the
 "Context in use" note against the budget whose summary point is the history
 cap, rather than the whole window. At a 1M window with the default 128k cap
@@ -219,7 +229,8 @@ summariser that errors or returns an empty summary hands that compaction to
 the session's model once. At startup a summariser no endpoint serves is
 refused, and so is one whose window (from its endpoint or the saved table)
 is smaller than the largest summary request, the summarise threshold plus
-the reply reserve; an unknown window is reported and left to the fallback.
+the reply reserve (careful's, unless `--mode` pins another, since auto can
+switch to careful); an unknown window is reported and left to the fallback.
 The summariser's reported usage feeds neither the context meter nor its
 calibration, so a different tokenizer cannot skew the session's fill, and
 its tokens are totalled under its own model.
