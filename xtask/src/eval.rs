@@ -334,7 +334,7 @@ pub fn run(filter: &str) -> Result<bool> {
     }
     let memory = var("EVAL_MEMORY").map(|m| format!(" · memory {m}")).unwrap_or_default();
     let isolated = if cfg.isolate.is_some() { " · isolated" } else { "" };
-    println!("models {models}{memory} · {repeats}x · timeout {limit}s per session{isolated}");
+    println!("models {models}{memory} · {repeats}x · timeout {limit}s per session{isolated} · leak rule {LEAK_RULE}");
     let next = AtomicUsize::new(0);
     let broken = AtomicUsize::new(0);
     let jsonl = Mutex::new(());
@@ -966,6 +966,13 @@ fn trajectories(home: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The version of the leak rule, printed with each run. 2: a name that is
+/// a prefix of the run's own working copy (the `rusty-eval-` stem and at
+/// least one digit), and not the name of a directory beside it, is the
+/// working copy, not an outside read. Runs before it were scored under rule
+/// 1 and are not rescored.
+const LEAK_RULE: u32 = 2;
+
 /// The first path a tool call named outside the run's own working copy:
 /// another eval directory (this run's home among them) or `$RUSTY_HOME`.
 /// Only what the agent names is seen; a search of a parent directory that
@@ -984,7 +991,12 @@ fn outside_reads(home: &Path, work: &Path) -> Option<String> {
             }
             for (i, _) in args.match_indices("rusty-eval-") {
                 let name: String = args[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
-                if name != own && name.len() > "rusty-eval-".len() {
+                let stem = "rusty-eval-".len();
+                // Unless another run's directory has exactly that name.
+                let own_prefix = own.starts_with(&name)
+                    && name[stem..].starts_with(|c: char| c.is_ascii_digit())
+                    && !work.with_file_name(&name).exists();
+                if name != own && name.len() > stem && !own_prefix {
                     return Some(name);
                 }
             }
@@ -1428,6 +1440,18 @@ mod tests {
         let mine = serde_json::json!({ "command": format!("cat {own}") }).to_string();
         std::fs::write(home.join(trajectory(1)), call(&mine)).unwrap();
         assert_eq!(outside_reads(&home, &work), None, "its own working copy is fine");
+        // Part of its own working copy's name, typed as a guess, is still its own.
+        let name = work.file_name().unwrap().to_string_lossy().into_owned();
+        let part = &name[..name.rfind('-').unwrap()];
+        let guess = serde_json::json!({ "command": format!("echo -n {part} | sha256sum") }).to_string();
+        std::fs::write(home.join(trajectory(1)), call(&guess)).unwrap();
+        assert_eq!(outside_reads(&home, &work), None, "a prefix of its own name is not outside");
+        // Unless another run's directory has that very name.
+        let sibling = work.with_file_name(part);
+        std::fs::create_dir(&sibling).unwrap();
+        assert_eq!(outside_reads(&home, &work).as_deref(), Some(part), "a sibling with that name is outside");
+        std::fs::remove_dir(&sibling).unwrap();
+        std::fs::write(home.join(trajectory(1)), call(&mine)).unwrap();
         // A later session reads an earlier one's transcript from the home.
         // Session 2 wrote no trajectory; session 3 reads an earlier transcript.
         let theirs = home.join("stdout").display().to_string();
