@@ -16,6 +16,7 @@ mod mcp;
 mod permissions;
 mod signal;
 mod skills;
+mod slash;
 mod snapshot;
 mod swarm;
 mod tips;
@@ -519,7 +520,30 @@ fn expand_skill(cwd: &Path, input: &str) -> Option<String> {
 
 fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Settings) -> Result<()> {
     banner(agent, client, cwd);
-    let mut rl = rustyline::DefaultEditor::new()?;
+    // Typing / opens the command menu under the prompt (see slash.rs).
+    let menu = slash::Shared::default();
+    let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
+    // List completion fills in the one row Tab offers, cursor at the end.
+    let config = rustyline::Config::builder().completion_type(rustyline::CompletionType::List).build();
+    let mut rl: rustyline::Editor<slash::SlashHelper, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(config)?;
+    rl.set_helper(Some(slash::SlashHelper { menu: menu.clone(), skills: skill_list.clone() }));
+    {
+        use rustyline::{EventHandler, KeyCode, KeyEvent, Modifiers};
+        let on = |h: Box<dyn rustyline::ConditionalEventHandler>| EventHandler::Conditional(h);
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Up, Modifiers::NONE),
+            on(Box::new(slash::Move { menu: menu.clone(), down: false })),
+        );
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Down, Modifiers::NONE),
+            on(Box::new(slash::Move { menu: menu.clone(), down: true })),
+        );
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::NONE),
+            on(Box::new(slash::Submit { menu: menu.clone(), skills: skill_list.clone() })),
+        );
+    }
     let history_file = config::config_dir().map(|d| d.join("history"));
     if let Some(h) = &history_file {
         let _ = rl.load_history(h);
@@ -561,10 +585,30 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         while input.ends_with('\\') {
             input.pop();
             input.push('\n');
-            match rl.readline("  ") {
+            menu.lock().map(|mut m| m.paused = true).ok();
+            let more = rl.readline("  ");
+            menu.lock().map(|mut m| m.paused = false).ok();
+            match more {
                 Ok(l) => input.push_str(&l),
                 Err(_) => break,
             }
+        }
+        // A partly typed command runs what the menu had highlighted, matched
+        // against the line as typed (a trailing space opens a value menu).
+        if input.starts_with('/') {
+            let typed = input.trim_end().to_string();
+            let resolved = match menu.lock() {
+                Ok(mut m) => {
+                    let r = slash::resolve(&input, Some((&m.line, &m.rows, m.selected)), &skill_list);
+                    m.line.clear();
+                    r
+                }
+                Err(_) => slash::resolve(&input, None, &skill_list),
+            };
+            if resolved.trim_end() != typed {
+                println!("{}", ui::dim(&format!("  → {}", resolved.trim_end())));
+            }
+            input = resolved;
         }
         let input = input.trim().to_string();
         if input.is_empty() {
@@ -869,7 +913,13 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             Some(prompt) => {
                 agent.run_turn(&prompt)?;
             }
-            None => println!("  unknown command {other}. /help lists them"),
+            None => {
+                let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
+                match slash::suggest(other, &skill_list) {
+                    Some(near) => println!("  unknown command {other}. did you mean {near}? /help lists them"),
+                    None => println!("  unknown command {other}. /help lists them"),
+                }
+            }
         },
     }
     Ok(false)
@@ -1188,63 +1238,8 @@ fn parse_duration(s: &str) -> Option<u64> {
 }
 
 fn print_help(cwd: &Path) {
-    let sections: [(&str, &[(&str, &str)]); 4] = [
-        (
-            "work",
-            &[
-                ("/goal <objective>", "keep going until it's done and verified · status · resume · clear"),
-                ("/loop [5m] [x10] <prompt>", "repeat on an interval, or let rusty pick the pace"),
-                ("/agents off|sub|swarm|auto", "delegation · default follows /mode · model <id> for subagents"),
-                ("/swarm size|models|spread", "tune parallel workers"),
-                ("/mode auto|careful|standard|vibe", "how hard rusty thinks and checks; permissions stay separate"),
-                ("/tools [local|daytona]", "show placement or save the default for the next session"),
-                ("/plan", "the current plan"),
-            ],
-        ),
-        (
-            "memory & context",
-            &[
-                ("/memory", "list · search · forget · status · helpful · harmful"),
-                ("/remember <text>", "save one (prefix preference:, gotcha:, decision:)"),
-                ("/context", "where the window is going"),
-                ("/compact [focus]", "summarise now; say what matters most to keep it in detail"),
-                ("/compact settings [mode]", "when to compact: aggressive · standard · passive · smart"),
-                ("/tokens", "spend by model and by tool"),
-                ("/clear", "fresh conversation, memories kept"),
-            ],
-        ),
-        (
-            "setup",
-            &[
-                ("/permissions [mode]", "read-only · ask · auto · yolo · allow · deny · check"),
-                ("/target", "the kube context, cloud account, workspace and branch commands will hit"),
-                ("/changes · /audit [n]", "what this session changed in infrastructure · the audit log"),
-                ("/model [id] · /models", "switch or list models, any provider"),
-                ("/doctor", "which providers are set up and answering"),
-                ("/view default|verbose|adhd", "how much you see"),
-                ("/theme · /font", "themes rust neon matrix amber ice mono · fonts rust block thin classic"),
-                ("/tips · /settings · /exit", ""),
-            ],
-        ),
-        ("skills", &[]),
-    ];
-    for (title, rows) in sections {
-        println!("  {}", ui::accent(title));
-        if title == "skills" {
-            for s in skills::all(cwd) {
-                println!(
-                    "    {} {}",
-                    ui::info(&format!("{:<28}", format!("/{} [args]", s.name))),
-                    ui::dim(&s.description)
-                );
-            }
-            continue;
-        }
-        for (c, d) in rows.iter() {
-            println!("    {} {}", ui::info(&format!("{c:<28}")), ui::dim(d));
-        }
-    }
-    println!("  {}", ui::dim("end a line with \\ for more lines · ctrl-c stops a turn · ctrl-c twice quits"));
+    let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
+    print!("{}", slash::help(&skill_list));
 }
 
 /// `/Users/me/code/x` → `~/code/x`.
