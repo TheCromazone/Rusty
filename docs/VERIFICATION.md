@@ -453,6 +453,14 @@ Both variants must use the same frozen task source and grading runner. The
 runner now uses unique per-process/nanosecond receipt names, exclusive creation,
 and saved trajectories. Functional grading, goal reporting and false completion
 are separate fields; a correct patch can still have an unfinished goal.
+`EVAL_ISOLATE=1` (Linux, as root) runs each session in its own mount and pid
+namespace. The session then sees only its own working copy and home in the
+temp dir, sees what the home held before it started (memory store, logs,
+earlier trajectories and saved conversations) as empty, and cannot see the
+task sources, earlier results, the paths in `EVAL_HIDE` or other processes.
+Without it, concurrent runs share the temp dir: a session that searches the
+filesystem can read another run's working copy or its own memory store, and
+the leak verdict only reports that afterwards.
 A known HTTP 402 evaluation-budget stop is scored as `budget`, rather than
 excluded as infrastructure. Timed-out processes receive Ctrl-C and a three-second
 cleanup grace before a hard kill; this is cooperative cleanup, not crash isolation.
