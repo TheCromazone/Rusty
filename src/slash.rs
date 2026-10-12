@@ -163,6 +163,10 @@ pub const COMMANDS: &[Command] = &[
     cmd("/exit", "", "save and quit", "setup"),
 ];
 
+/// Commands that end the session or drop the conversation: a partial name
+/// never runs them. Enter fills the name in, and piped input must spell it out.
+const GUARDED: &[&str] = &["/exit", "/clear"];
+
 /// Other spellings the command handler accepts.
 const ALIASES: &[&str] = &[
     "/quit",
@@ -214,7 +218,8 @@ pub struct Item {
     pub line: String,
     pub label: String,
     pub about: String,
-    /// The command waits for an argument, so choosing it fills it in rather than running it.
+    /// Choosing it from a partial line fills it in rather than running it:
+    /// it waits for an argument, or it is one of the `GUARDED` commands.
     pub needs_args: bool,
     /// Only the letters match, in order; a typo or a guess.
     pub loose: bool,
@@ -237,7 +242,7 @@ pub fn items(line: &str, skills: &Skills) -> Vec<Item> {
                     line: c.name.to_string(),
                     label,
                     about: c.about.to_string(),
-                    needs_args: c.args.starts_with('<'),
+                    needs_args: c.args.starts_with('<') || GUARDED.contains(&c.name),
                     loose: r == 2,
                 };
                 ranked.push((r, i, item));
@@ -321,7 +326,8 @@ pub fn resolve(line: &str, shown: Option<(&str, &[Item], Option<usize>)>, skills
     if is_exact(line, skills) {
         return line.to_string();
     }
-    let close: Vec<Item> = items(line, skills).into_iter().filter(|i| !i.loose).collect();
+    let close: Vec<Item> =
+        items(line, skills).into_iter().filter(|i| !i.loose && !GUARDED.contains(&i.line.as_str())).collect();
     let prefixes: Vec<&Item> = close.iter().filter(|i| i.line.starts_with(line)).collect();
     match prefixes.as_slice() {
         [only] => only.line.clone(),
@@ -379,7 +385,10 @@ pub fn help(skills: &[(String, String)]) -> String {
     }
     out.push_str(&format!(
         "  {}\n",
-        ui::dim("type / for the menu: ↑↓ choose · tab completes · enter runs · end a line with \\ for more lines")
+        ui::dim(
+            "type / for the menu: ↑↓ choose · tab completes · enter runs · <…> is a required argument, and a \
+             command typed bare without it shows its status or usage · end a line with \\ for more lines"
+        )
     ));
     out
 }
@@ -634,6 +643,10 @@ mod tests {
             assert_eq!(resolve(line, None, &none), line);
         }
         assert_eq!(resolve("/mode ca", None, &none), "/mode careful");
+        // A partial name never quits or clears, even as the only prefix.
+        assert_eq!(resolve("/ex", None, &none), "/ex");
+        assert_eq!(resolve("/cl", None, &none), "/cl");
+        assert!(items("/cl", &none)[0].needs_args, "Enter fills /clear in instead of running it");
         // A row picked after a command and a space wins over the bare command.
         let values = items("/compact ", &none);
         assert_eq!(resolve("/compact ", Some(("/compact ", &values, Some(0))), &none), "/compact settings");
