@@ -296,11 +296,23 @@ pub fn run(filter: &str) -> Result<bool> {
             None | Some("0") => None,
             Some("1") => {
                 isolation_works()?;
+                std::fs::create_dir_all(root.join("target/evals"))?;
                 let mut hide = vec![root.join("evals"), root.join("target/evals")];
                 hide.extend(var("EVAL_HIDE").unwrap_or_default().split_whitespace().map(PathBuf::from));
-                let hide: Vec<PathBuf> = hide.into_iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+                // An entry that hides nothing would still report the run as
+                // isolated, so every one must resolve.
+                let hide: Vec<PathBuf> = hide
+                    .into_iter()
+                    .map(|p| std::fs::canonicalize(&p).with_context(|| format!("EVAL_HIDE: {}", p.display())))
+                    .collect::<Result<_>>()?;
                 if let Some(h) = hide.iter().find(|h| Path::new(STAGE).starts_with(h)) {
                     bail!("EVAL_HIDE must not contain {STAGE}: {}", h.display());
+                }
+                // The session's temp dir is replaced right after the stage
+                // is mounted, so the stage can't be inside it.
+                let base = std::env::temp_dir().canonicalize()?;
+                if Path::new(STAGE).starts_with(&base) {
+                    bail!("EVAL_ISOLATE=1 needs a temp dir outside {STAGE}; TMPDIR is {}", base.display());
                 }
                 Some(hide)
             }
