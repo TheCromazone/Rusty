@@ -198,6 +198,16 @@ budget where the pin carried 8,000 characters. Harness runs on these builds
 should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
 or accept the 128k default.
 
+A later fix gave subagents and swarm workers the lead's compaction mode and
+history cap. They had kept the defaults (`standard`, no cap), so under a 1M
+window a worker on the lead's model summarised only near 787k tokens.
+
+A later fix stopped a compaction from repeating on every step when it can't
+get the context under the summary threshold, as with a window or
+`--history-cap-tokens` too small for the system prompt and tools. The next
+threshold compaction then waits until the context has grown by a tenth of
+the threshold, and the user is told the window or cap is too small.
+
 A later fix measured smart mode's 20% floor, its 25% invitation and the
 "Context in use" note against the budget whose summary point is the history
 cap, rather than the whole window. At a 1M window with the default 128k cap

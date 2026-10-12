@@ -3780,6 +3780,52 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
 }
 
 #[test]
+fn a_file_missing_now_or_at_startup_is_never_reported_unchanged() {
+    // notes.txt is untracked at startup, so rusty has no blob for it; once
+    // rewritten and deleted it must stay "changed", not count as undone.
+    let s = Sandbox::new("revert-absent");
+    std::fs::write(s.project.join("a.txt"), "one\n").unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&s.project)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "start"]);
+    std::fs::write(s.project.join("notes.txt"), "draft\n").unwrap();
+    let call = |name: &str, args: serde_json::Value| reported(tool_reply(name, args), 50_000);
+    let (out, requests) = smart_run(
+        &s,
+        vec![
+            call("write_file", serde_json::json!({"path": "notes.txt", "content": "rewritten\n"})),
+            call("bash", serde_json::json!({"command": "rm notes.txt"})),
+            call("read_file", serde_json::json!({"path": "a.txt"})),
+            call("edit_file", serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "two"})),
+            call("edit_file", serde_json::json!({"path": "a.txt", "old_string": "two", "new_string": "one"})),
+            reported(bash_reply("echo x"), 55_000),
+            reported(bash_reply("echo y"), 58_000),
+            reported(tool_reply("compact", serde_json::json!({"reason": "the edits are done"})), 60_000),
+            text_reply("1. Task: go."),
+            text_reply("done"),
+        ],
+    );
+    let after = requests.last().unwrap()["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]"), "a compaction ran: {after}");
+    assert!(after.contains("- changed: notes.txt"), "{after}");
+    assert!(after.contains("- touched, now unchanged: a.txt"), "{after}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["reverted"], 1, "{stats}");
+}
+
+#[test]
 fn smart_compaction_measures_fullness_against_the_history_cap() {
     // A 1M window caps history at 128k, so 125k is near the summary point,
     // not 13% full: the model's own compaction must be possible.
@@ -3807,6 +3853,75 @@ fn smart_compaction_measures_fullness_against_the_history_cap() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
     assert_eq!(stats["compactions"][0]["trigger"], "smart", "{stats}");
+}
+
+#[test]
+fn a_compaction_that_cannot_get_under_the_threshold_is_not_repeated_every_step() {
+    // A 2,000-token history cap sits below the system prompt and tools alone,
+    // so no summary gets under it. Each reply works both as a summary and as
+    // a step, so the script holds whichever request comes.
+    let s = Sandbox::new("compaction-progress");
+    for n in 0..8 {
+        std::fs::write(s.project.join(format!("f{n}.txt")), format!("file {n}\n")).unwrap();
+    }
+    let both = |n: usize| {
+        let mut r = tool_reply("read_file", serde_json::json!({"path": format!("f{n}.txt")}));
+        r["choices"][0]["delta"]["content"] = serde_json::json!("1. Task: go. 2. Ran echo.");
+        unreported(r)
+    };
+    let mut replies: Vec<serde_json::Value> = (0..8).map(both).collect();
+    replies.push(text_reply("done"));
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "2000", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let summaries = requests.iter().filter(|r| r["tools"].as_array().is_none_or(|t| t.is_empty())).count();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    let compactions = stats["compactions"].as_array().unwrap();
+    assert!(!compactions.is_empty(), "the cap still triggers a compaction: {stats}");
+    assert!(
+        summaries <= 2 && compactions.len() <= 2,
+        "{summaries} summary requests for {} steps: {stats}",
+        requests.len() - summaries
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still over"), "the user is told the cap is too small");
+}
+
+#[test]
+fn a_subagent_compacts_under_the_leads_history_cap() {
+    // A 1M window caps history at 128k. The worker shares the lead's model,
+    // so 200k of its own context is past the cap and gets summarised.
+    let s = Sandbox::new("worker-cap");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("task", serde_json::json!({"description": "look", "prompt": "look around"})),
+        reported(bash_reply("echo a"), 10_000),
+        reported(bash_reply("echo b"), 20_000),
+        reported(bash_reply("echo c"), 200_000),
+        text_reply("1. Task: look around."),
+        text_reply("report: nothing found"),
+        text_reply("done"),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "1000000")
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--agents", "sub", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 7, "the worker asked for a summary");
+    assert!(requests[4]["messages"].to_string().contains("hand-off summaries"), "{}", requests[4]["messages"]);
 }
 
 #[test]

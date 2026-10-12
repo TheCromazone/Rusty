@@ -1517,6 +1517,8 @@ impl Agent {
                 (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), self.backend.clone());
             let (cfg, lead_model, execution_mode) = (cfg.clone(), self.model.clone(), self.execution_mode);
             let lead_window = (self.meter.window, self.meter.window_source);
+            // Workers compact as the lead does; smart's own tool is the lead's alone.
+            let (compaction, history_cap) = (self.compaction, self.history_cap);
             std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
@@ -1534,6 +1536,8 @@ impl Agent {
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
+                w.compaction = compaction;
+                w.history_cap = history_cap;
                 w.request_role = role;
                 w.backend = backend.clone();
                 w.execution_mode = execution_mode;
@@ -1950,9 +1954,8 @@ impl Agent {
     }
 
     /// The working set with files back as they were at startup moved out of
-    /// `changed`. Without a start record (not a git work tree), unchanged.
-    /// The working set with undone edits moved to their own line, and how
-    /// many files moved.
+    /// `changed` to their own line, and how many moved. Without a start
+    /// record (not a git work tree), unchanged.
     fn collapse_reverts(&self, working_set: &str) -> (String, usize) {
         let Some(start) = &self.start_blobs else { return (working_set.to_string(), 0) };
         let changed: Vec<String> = working_set
@@ -1965,9 +1968,11 @@ impl Agent {
         }
         let now: std::collections::HashMap<String, Option<String>> =
             crate::snapshot::hash_now(&self.cwd, &changed).into_iter().collect();
+        // Only a file present both now and at startup, with the same blob: a
+        // file deleted since, or with no startup record (untracked), stays changed.
         let unchanged = |f: &str| {
             let f = f.trim_start_matches("./");
-            now.get(f).is_some_and(|blob| blob.as_ref() == start.get(f))
+            matches!((now.get(f), start.get(f)), (Some(Some(n)), Some(s)) if n == s)
         };
         let moved = changed.iter().filter(|f| unchanged(f)).count();
         (context::collapse_reverts(working_set, unchanged), moved)
@@ -1997,9 +2002,22 @@ impl Agent {
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if self.meter.fill(&self.history, fixed) > summarize {
-            if let Err(e) = self.compact_with(d, None, false, "level") {
-                d.line(&ui::err(&format!("  compaction failed: {e:#}")));
+        // A compaction that could not get under the threshold isn't repeated
+        // until the context has grown by a tenth of it, so a window or cap too
+        // small for the fixed part doesn't cost a summary on every step.
+        let since = self.compactions.last().map_or(0, |c| c.tokens_after + summarize / 10);
+        if self.meter.fill(&self.history, fixed) > summarize.max(since) {
+            let before = self.compactions.len();
+            match self.compact_with(d, None, false, "level") {
+                Err(e) => d.line(&ui::err(&format!("  compaction failed: {e:#}"))),
+                Ok(()) => {
+                    if self.compactions.len() > before && self.compactions[before].tokens_after > summarize {
+                        d.line(&ui::dim(&format!(
+                            "  ◇ context still over the {summarize}-token threshold after compacting; \
+                             the window or --history-cap-tokens is too small for the system prompt and tools"
+                        )));
+                    }
+                }
             }
         }
     }
