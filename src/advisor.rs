@@ -358,8 +358,8 @@ impl Hooks {
         self.call("finish", json!({"complete":complete}), HOOK_MS);
     }
     /// The lessons for this request's prompt: any new one the service offers,
-    /// after every one offered earlier in the turn. `usage_index` is where this
-    /// request will sit in the trajectory's `usage`.
+    /// after those offered earlier in the turn (the latest `DELIVERED`).
+    /// `usage_index` is where this request will sit in the trajectory's `usage`.
     pub fn advice(&mut self, usage_index: usize) -> String {
         if let Some(r) = self.call("advice", Value::Null, HOOK_MS) {
             if !r.error && r.seq == self.seq && !r.text.is_empty() {
@@ -371,6 +371,9 @@ impl Hooks {
                         self.delivered.remove(0);
                     }
                     self.delivered.push((r.id.clone(), text));
+                }
+                if self.turn_advice.len() == DELIVERED {
+                    self.turn_advice.remove(0);
                 }
                 self.turn_advice.push(r.text);
             }

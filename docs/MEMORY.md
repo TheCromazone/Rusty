@@ -57,6 +57,7 @@ above the level's threshold is offered as one short line.
 
 A lesson is offered once per turn, and from then on it stays in the system
 prompt for the rest of that turn, so a step that needs it later still sees it.
+A turn carries at most the 16 latest lessons offered in it.
 
 Preferences are not ranked: they apply everywhere, so `begin` returns them
 (this project's and global ones, `rusty-memoryd remember --global`) for the
@@ -201,9 +202,9 @@ don't erase swap, snapshots, backups or exported files.
 
 `/memory` lists lessons with confidence, outcome counts, source and anchored
 files; `/memory status` shows counts for the project. `--stats` and
-`--trajectory` include hook counts, missed deadlines, injections and hook time,
-and `offered`: each lesson offered, with the index in `usage` of the first
-request that carried it.
+`--trajectory` include hook counts, missed deadlines, injections (lessons
+offered, once per lesson per turn) and hook time, and `offered`: each lesson
+offered, with the index in `usage` of the first request that carried it.
 
 ## Local operation and cloud transfer
 
