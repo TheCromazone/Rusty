@@ -181,17 +181,30 @@ the rest of the turn, and the trajectory records which request first carried
 each one, so the next runs can tell the two apart.
 
 **After the fix** (development evidence: nemotron-3-super, main ae99853, five
-repeats per level per task, a 1800-second cap, each session isolated with
-`EVAL_ISOLATE=1`, October 2026). `learn` passed all ten runs, in 11 to 21
-seconds each. In every one the lesson was offered with the first request and the
-seed was first used at request 5 to 7, where the earlier delivery had already
-dropped it. `off` passed none: eight scored runs failed or timed out after 7 to
-50 commands trying to recover the seed from the hash, and the seed never
-appeared in a command. Two `off` runs were scored `leak`. Neither saw the seed:
-one read its own home, and the other typed part of its own working copy's name.
-These tasks reach the seed only through a lesson seeded directly into memory, so
-this shows that a delivered lesson is used. It does not show that memory
-captures the lesson by itself, or that memory helps on other tasks.
+repeats per level per task, October 2026). Between 14fba44 and ae99853 three
+things changed together: an offered lesson stays in the prompt for the whole
+turn, each session is isolated (`EVAL_ISOLATE=1`), and the cap rose from 600 to
+1800 seconds. Per cell, as pass / fail / timeout / leak:
+
+| | memory-use-agent | memory-use-user |
+|---|---|---|
+| `off` | 0 / 4 / 0 / 1 | 0 / 3 / 1 / 1 |
+| `learn` | 5 / 0 / 0 / 0 | 5 / 0 / 0 / 0 |
+
+In every `learn` run the lesson was offered with the first request and the seed
+was first used at request 5 to 7, where the earlier delivery had already dropped
+it; each run took 11 to 21 seconds. The trajectories separate the delivery change
+from the other two: the cap cannot matter to a run that ends in 21 seconds, and
+isolation only removes places to find the seed. In no `off` run did the seed
+appear in a command; the scored runs spent 7 to 50 commands trying to recover it
+from the hash. Neither `leak` run saw the seed: one read its own home, the other
+typed part of its own working copy's name. Both runs, at 14fba44 and ae99853,
+were scored under the original leak rule and are not rescored.
+
+What this does not show: that memory captures the lesson by itself (these tasks
+seed it directly), that a delivered lesson helps on tasks other than these two,
+or that it holds beyond one model at five repeats. The lesson text was written
+with the task, not by the model under test.
 
 ## Bounded hot path and disk
 
