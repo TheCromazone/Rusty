@@ -234,6 +234,16 @@ pub struct Metrics {
     pub injections: u64,
     pub hook_us: u64,
     pub max_hook_us: u64,
+    /// Each lesson offered, with the index in the trajectory's `usage` of the
+    /// first request that carried it.
+    pub offered: Vec<Offered>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Offered {
+    pub usage_index: usize,
+    pub id: String,
+    pub text: String,
 }
 type Work = (Request, mpsc::Sender<Result<Response>>);
 /// The agent's side of the advisor.
@@ -250,6 +260,10 @@ pub struct Hooks {
     delivered: Vec<(String, String)>,
     /// The preferences block from the last `begin` that answered in time.
     preferences: String,
+    /// Lessons offered since `begin`. They stay in the prompt for the rest of
+    /// the turn: the service offers a lesson once, and a lesson seen on one
+    /// request only is gone by the step that needs it.
+    turn_advice: Vec<String>,
     pub metrics: Metrics,
 }
 impl Hooks {
@@ -293,6 +307,7 @@ impl Hooks {
             root: worktree(cwd).canonicalize().unwrap_or_else(|_| cwd.to_owned()),
             delivered: Vec::new(),
             preferences: String::new(),
+            turn_advice: Vec::new(),
             metrics: Metrics::default(),
         })
     }
@@ -324,6 +339,7 @@ impl Hooks {
     }
     pub fn begin(&mut self, request: &str) {
         self.seq += 1;
+        self.turn_advice.clear();
         let r = self.call("begin", json!({"text":clip(request,4096),"root":self.root.to_string_lossy()}), HOOK_MS);
         if let Some(r) = r.filter(|r| !r.error) {
             self.preferences = r.data["preferences"].as_str().unwrap_or("").to_string();
@@ -341,19 +357,31 @@ impl Hooks {
         self.seq += 1;
         self.call("finish", json!({"complete":complete}), HOOK_MS);
     }
-    pub fn advice(&mut self) -> String {
-        let Some(r) = self.call("advice", Value::Null, HOOK_MS) else { return String::new() };
-        if r.error || r.seq != self.seq || r.text.is_empty() {
+    /// The lessons for this request's prompt: any new one the service offers,
+    /// after every one offered earlier in the turn. `usage_index` is where this
+    /// request will sit in the trajectory's `usage`.
+    pub fn advice(&mut self, usage_index: usize) -> String {
+        if let Some(r) = self.call("advice", Value::Null, HOOK_MS) {
+            if !r.error && r.seq == self.seq && !r.text.is_empty() {
+                self.metrics.injections += 1;
+                let text = r.data["text"].as_str().unwrap_or("").to_string();
+                self.metrics.offered.push(Offered { usage_index, id: r.id.clone(), text: clip(&text, 300) });
+                if !self.delivered.iter().any(|(id, _)| id == &r.id) {
+                    if self.delivered.len() == DELIVERED {
+                        self.delivered.remove(0);
+                    }
+                    self.delivered.push((r.id.clone(), text));
+                }
+                self.turn_advice.push(r.text);
+            }
+        }
+        if self.turn_advice.is_empty() {
             return String::new();
         }
-        self.metrics.injections += 1;
-        if !self.delivered.iter().any(|(id, _)| id == &r.id) {
-            if self.delivered.len() == DELIVERED {
-                self.delivered.remove(0);
-            }
-            self.delivered.push((r.id.clone(), r.data["text"].as_str().unwrap_or("").to_string()));
-        }
-        format!("\nFrom memory (optional; current instructions and tool permissions come first):\n{}\n", r.text)
+        format!(
+            "\nFrom memory (optional; current instructions and tool permissions come first):\n{}\n",
+            self.turn_advice.join("\n")
+        )
     }
     /// Lessons offered since the last call, as (id, lesson text).
     pub fn take_delivered(&mut self) -> Vec<(String, String)> {
