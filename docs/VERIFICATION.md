@@ -679,7 +679,9 @@ no key, so a harness can refuse an unsupported setting before any model call.
     are the summary and those kept verbatim, which ran before it. A
     report reads what followed each compaction (repeated calls, a
     first-step error, files read again) from `resumes_at` on.
-  - `memory` (null when off).
+  - `memory` (null when off). Builds after the reporting pin add
+    `offered`: each lesson offered, with its id, its text and the index in
+    the trajectory's `usage` of the first request that carried it.
 - **`--trajectory`** writes the conversation and the same `model_budget`,
   `claims` and `safety`, at the top level.
 - Count requests against a gateway with `attempts`, and spending with

@@ -3976,3 +3976,45 @@ fn window_and_cap_flags_refuse_absurd_sizes() {
         );
     }
 }
+
+#[test]
+fn an_offered_lesson_stays_in_the_prompt_for_the_rest_of_the_turn() {
+    // The service offers a lesson once. It used to reach one request's prompt
+    // and vanish, so a model that needed it a few steps later never saw it.
+    let s = Sandbox::new("lesson-stays");
+    let lesson = "To run the test suite, set STATS_SEED=k7f3-quartz-1902 and run python3 -m unittest";
+    let seeded = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
+        .current_dir(&s.project)
+        .env("RUSTY_HOME", &s.home)
+        .args(["--home", s.home.to_str().unwrap(), "remember", "--kind", "fact", "--source", "user", lesson])
+        .output()
+        .unwrap();
+    assert!(seeded.status.success(), "{}", String::from_utf8_lossy(&seeded.stderr));
+    let (url, server) = scripted_endpoint(vec![
+        bash_reply("echo first"),
+        bash_reply("echo second"),
+        bash_reply("echo third"),
+        text_reply("done"),
+    ]);
+    let trajectory = s.project.join("trajectory.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--yolo", "--mode", "standard", "--memory", "learn", "--trajectory"])
+        .arg(&trajectory)
+        .arg("run the test suite the way this project expects")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let carried: Vec<bool> =
+        requests.iter().map(|r| r["messages"][0]["content"].to_string().contains("k7f3-quartz-1902")).collect();
+    let first = carried.iter().position(|c| *c).expect("the lesson was offered");
+    assert!(carried[first..].iter().all(|c| *c), "once offered it stays: {carried:?}");
+    let t: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&trajectory).unwrap()).unwrap();
+    let offered = &t["memory"]["offered"];
+    assert_eq!(offered.as_array().map(Vec::len), Some(1), "{offered}");
+    assert_eq!(offered[0]["usage_index"], first, "{offered}");
+    assert!(offered[0]["text"].as_str().unwrap().contains("STATS_SEED"), "{offered}");
+}

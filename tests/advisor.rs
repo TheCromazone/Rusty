@@ -128,7 +128,7 @@ fn stalled_service_does_not_hold_coding_hook() {
     let listener = UnixListener::bind(root.join("memory/advisor.sock")).unwrap();
     let mut hooks = Hooks::connect(&root, &root, Level::Learn).unwrap();
     let start = Instant::now();
-    assert!(hooks.advice().is_empty());
+    assert!(hooks.advice(0).is_empty());
     assert!(start.elapsed() < Duration::from_millis(150), "hook exceeded deadline tolerance");
     assert_eq!(hooks.metrics.timeouts, 1);
     drop(hooks);

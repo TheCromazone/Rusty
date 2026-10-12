@@ -55,6 +55,10 @@ above the level's threshold is offered as one short line.
   branch may still have the file. Blob ids are cached by size and mtime, so a
   hook only `stat`s files it has already hashed.
 
+A lesson is offered once per turn, and from then on it stays in the system
+prompt for the rest of that turn, so a step that needs it later still sees it.
+A turn carries at most the 16 latest lessons offered in it.
+
 Preferences are not ranked: they apply everywhere, so `begin` returns them
 (this project's and global ones, `rusty-memoryd remember --global`) for the
 system prompt every turn, and they never crowd lessons out of the advice slots.
@@ -161,6 +165,21 @@ helped nor hurt: `stale-anchor` and `compact-focus` passed at every level,
 and `poisoned-lesson` and `compaction-rule` missed with memory off and at
 most levels, with no consistent direction in three repeats.
 
+**What the memory-use runs showed** (development evidence: nemotron-3-super,
+main 14fba44, five repeats per level per task, October 2026). Every scored run
+failed at both levels, mostly on the 600-second timeout, and four runs were
+`leak` (they read another run's working copy while searching for the seed).
+In all ten `learn` runs the lesson was offered once, and in no run of either
+level did the seed string appear in a command. Every run named `STATS_SEED`
+and then tried to recover the seed from the test's hash. The runs also showed
+why the lesson went unused: the service offers a lesson once per turn, and the
+advice was added to that one request's system prompt only. The seed was in
+front of the model for a single request, while the model first looked for it
+four or five steps later. The "use" failure in the matrix above is therefore at
+least partly a delivery failure. An offered lesson now stays in the prompt for
+the rest of the turn, and the trajectory records which request first carried
+each one, so the next runs can tell the two apart.
+
 ## Bounded hot path and disk
 
 - Sessions: RAM only, at most 32, each with a 4 KiB request and the last four
@@ -183,7 +202,9 @@ don't erase swap, snapshots, backups or exported files.
 
 `/memory` lists lessons with confidence, outcome counts, source and anchored
 files; `/memory status` shows counts for the project. `--stats` and
-`--trajectory` include hook counts, missed deadlines, injections and hook time.
+`--trajectory` include hook counts, missed deadlines, injections (lessons
+offered, once per lesson per turn) and hook time, and `offered`: each lesson
+offered, with the index in `usage` of the first request that carried it.
 
 ## Local operation and cloud transfer
 

@@ -803,7 +803,7 @@ impl Agent {
             self.manage_context(&mut d);
             let mut system = self.system_prompt();
             if let Some(h) = &mut self.advisor {
-                system.push_str(&h.advice());
+                system.push_str(&h.advice(self.meter.requests.len()));
             }
             let mut messages = Vec::with_capacity(self.history.len() + 2);
             messages.push(json!({"role": "system", "content": system}));
