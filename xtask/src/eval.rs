@@ -37,6 +37,16 @@
 //!
 //! EVAL_BINARY selects an already qualified artifact instead of rebuilding it.
 //! Keep its source revision and hash in the experiment's artifact receipt.
+//!
+//! EVAL_ISOLATE=1 runs each rusty process in its own mount and pid namespace
+//! (Linux, `unshare`, as root). The temp dir then holds only this run's
+//! working copy and home. Whatever the home held before the session (the
+//! memory store but its socket, setup and output logs, earlier sessions'
+//! trajectories and saved conversations) reads as empty, except the budget
+//! ledger. The repository's `evals` and `target/evals` and each path in
+//! EVAL_HIDE (space-separated) are empty, and `/proc` shows only the
+//! session's own processes. The memory daemon runs outside, started by the
+//! harness. The leak verdict still applies.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -189,6 +199,54 @@ struct Config {
     out: PathBuf,
     logs: PathBuf,
     transcripts: bool,
+    /// Directories each session sees as empty, when sessions are isolated.
+    isolate: Option<Vec<PathBuf>>,
+}
+
+/// Where an isolated session mounts the real filesystem while it builds its
+/// own view; unmounted before rusty starts.
+const STAGE: &str = "/var/tmp/rusty-eval-stage";
+
+/// Builds an isolated session's view, then runs the command. Arguments:
+/// stage, temp dir, working copy, home, the binary's directory, the
+/// directories to hide, `--`, the files to blank, `--`, the command.
+const ISOLATE_SH: &str = r#"set -eu
+stage=$1 base=$2 work=$3 home=$4 bindir=$5; shift 5
+mount --rbind / "$stage"
+mount -t tmpfs -o mode=1777 eval-tmp "$base"
+for d in "$work" "$home"; do mkdir -p "$d"; mount --bind "$stage$d" "$d"; done
+while [ "$1" != "--" ]; do
+  if [ -d "$1" ]; then mount -t tmpfs -o mode=755 eval-hidden "$1"; fi; shift
+done; shift
+mkdir -p "$bindir"; mount --bind "$stage$bindir" "$bindir"
+if [ -d "$home/memory" ]; then
+  mount -t tmpfs -o mode=700 eval-memory "$home/memory"
+  if [ -S "$stage$home/memory/advisor.sock" ]; then
+    : > "$home/memory/advisor.sock"
+    mount --bind "$stage$home/memory/advisor.sock" "$home/memory/advisor.sock"
+  fi
+fi
+while [ "$1" != "--" ]; do
+  if [ -f "$1" ]; then mount --bind /dev/null "$1"; fi; shift
+done; shift
+umount -l "$stage"
+exec "$@"
+"#;
+
+/// The namespaces an isolated session needs, or why they are unavailable.
+fn isolation_works() -> Result<()> {
+    std::fs::create_dir_all(STAGE)?;
+    let status = Command::new("unshare")
+        .args(["--mount", "--pid", "--fork", "--kill-child", "--mount-proc", "--propagation", "private", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("EVAL_ISOLATE=1 needs util-linux unshare")?;
+    if !status.success() {
+        bail!("EVAL_ISOLATE=1 needs mount and pid namespaces (run as root on Linux): unshare {status}");
+    }
+    Ok(())
 }
 
 /// An environment variable, with empty counting as unset.
@@ -234,6 +292,32 @@ pub fn run(filter: &str) -> Result<bool> {
         out: root.join(format!("target/evals/{stamp}.jsonl")),
         logs: root.join(format!("target/evals/{stamp}")),
         transcripts: var("EVAL_TRANSCRIPTS").is_none_or(|v| v == "1"),
+        isolate: match var("EVAL_ISOLATE").as_deref() {
+            None | Some("0") => None,
+            Some("1") => {
+                isolation_works()?;
+                std::fs::create_dir_all(root.join("target/evals"))?;
+                let mut hide = vec![root.join("evals"), root.join("target/evals")];
+                hide.extend(var("EVAL_HIDE").unwrap_or_default().split_whitespace().map(PathBuf::from));
+                // An entry that hides nothing would still report the run as
+                // isolated, so every one must resolve.
+                let hide: Vec<PathBuf> = hide
+                    .into_iter()
+                    .map(|p| std::fs::canonicalize(&p).with_context(|| format!("EVAL_HIDE: {}", p.display())))
+                    .collect::<Result<_>>()?;
+                if let Some(h) = hide.iter().find(|h| Path::new(STAGE).starts_with(h)) {
+                    bail!("EVAL_HIDE must not contain {STAGE}: {}", h.display());
+                }
+                // The session's temp dir is replaced right after the stage
+                // is mounted, so the stage can't be inside it.
+                let base = std::env::temp_dir().canonicalize()?;
+                if Path::new(STAGE).starts_with(&base) {
+                    bail!("EVAL_ISOLATE=1 needs a temp dir outside {STAGE}; TMPDIR is {}", base.display());
+                }
+                Some(hide)
+            }
+            Some(v) => bail!("EVAL_ISOLATE={v}: use 1 or 0"),
+        },
         root,
     };
     std::fs::create_dir_all(&cfg.logs)?;
@@ -249,7 +333,8 @@ pub fn run(filter: &str) -> Result<bool> {
         }
     }
     let memory = var("EVAL_MEMORY").map(|m| format!(" · memory {m}")).unwrap_or_default();
-    println!("models {models}{memory} · {repeats}x · timeout {limit}s per session");
+    let isolated = if cfg.isolate.is_some() { " · isolated" } else { "" };
+    println!("models {models}{memory} · {repeats}x · timeout {limit}s per session{isolated}");
     let next = AtomicUsize::new(0);
     let broken = AtomicUsize::new(0);
     let jsonl = Mutex::new(());
@@ -330,7 +415,16 @@ fn agent(
 ) -> Result<Exit> {
     let append = |name: &str| OpenOptions::new().create(true).append(true).open(home.join(name));
     let (stdout, stderr) = (append("stdout")?, append("stderr")?);
-    let mut cmd = Command::new(&cfg.bin);
+    let mut cmd = match &cfg.isolate {
+        None => Command::new(&cfg.bin),
+        Some(hide) => {
+            let memory = env.iter().rev().find_map(|kv| kv.strip_prefix("RUSTY_MEMORY=")).unwrap_or(run.memory);
+            if memory != "off" {
+                start_memory(cfg, home)?;
+            }
+            isolated(cfg, hide, work, home)?
+        }
+    };
     cmd.args(["--yolo", "--stats"])
         .arg("--trajectory")
         .arg(home.join(trajectory(n)))
@@ -364,9 +458,12 @@ fn agent(
         if start.elapsed() >= cfg.limit {
             // Let the coordinator cancel owned activity groups before a hard
             // kill. A timeout stays a timeout even if shutdown is graceful.
+            // An isolated session leads its own process group, and rusty
+            // inside it is not the child the harness started.
+            let target = if cfg.isolate.is_some() { -(child.id() as i32) } else { child.id() as i32 };
             #[cfg(unix)]
             unsafe {
-                libc::kill(child.id() as i32, libc::SIGINT);
+                libc::kill(target, libc::SIGINT);
             }
             let grace = Instant::now();
             while grace.elapsed() < Duration::from_secs(3) && child.try_wait()?.is_none() {
@@ -455,6 +552,59 @@ fn setup(cfg: &Config, task: &Task, work: &Path, home: &Path, run: &Run, env: &[
     let status = c.status()?;
     if !status.success() {
         bail!("## run {cmd}: {status}");
+    }
+    Ok(())
+}
+
+/// `unshare` set up to build a session's isolated view and then run rusty;
+/// the caller adds rusty's arguments. What the home already holds is hidden,
+/// but for the ledger rusty rewrites and the memory socket.
+fn isolated(cfg: &Config, hide: &[PathBuf], work: &Path, home: &Path) -> Result<Command> {
+    let base = std::env::temp_dir().canonicalize()?;
+    let bindir = cfg.bin.parent().context("EVAL_BINARY has no directory")?;
+    let (mut dirs, mut blank) = (hide.to_vec(), Vec::new());
+    for entry in std::fs::read_dir(home)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "memory" || name.starts_with("budget.") {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            dirs.push(entry.path());
+        } else {
+            blank.push(entry.path());
+        }
+    }
+    let mut cmd = Command::new("unshare");
+    cmd.args(["--mount", "--pid", "--fork", "--kill-child", "--mount-proc", "--propagation", "private"])
+        .args(["sh", "-c", ISOLATE_SH, "sh", STAGE])
+        .args([base.as_path(), work, home, bindir])
+        .args(dirs)
+        .arg("--")
+        .args(blank)
+        .arg("--")
+        .arg(&cfg.bin);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    Ok(cmd)
+}
+
+/// Starts the run's memory daemon outside an isolated session, where the
+/// session's own view of the memory store is empty but for its socket.
+fn start_memory(cfg: &Config, home: &Path) -> Result<()> {
+    let socket = home.join("memory/advisor.sock");
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Ok(());
+    }
+    let mut cmd = Command::new(cfg.bin.with_file_name("rusty-memoryd"));
+    cmd.arg("--home").arg(home).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().context("starting rusty-memoryd")?;
+    let start = Instant::now();
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        if child.try_wait()?.is_some() || start.elapsed() > Duration::from_secs(2) {
+            bail!("memory daemon did not start");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
@@ -997,6 +1147,7 @@ mod tests {
             out: root.join("results.jsonl"),
             logs: root.join("logs"),
             transcripts: false,
+            isolate: None,
         };
         let task = Task { name: "passing-patch-fatal".into(), dir: taskdir };
         let work = root.join("work");
@@ -1034,6 +1185,7 @@ mod tests {
                 out: root.join("results.jsonl"),
                 logs: root.join("logs"),
                 transcripts: false,
+                isolate: None,
             };
             let task = Task { name: "throttled".into(), dir: taskdir };
             let (work, home) = (root.join("work"), root.join("home"));
@@ -1170,6 +1322,7 @@ mod tests {
             out: root.join("out.jsonl"),
             logs: root.join("logs"),
             transcripts: false,
+            isolate: None,
         };
         let task = Task { name: "t".into(), dir: root.clone() };
         let run = Run { model: "m", memory: "v2", rep: 1 };
@@ -1213,6 +1366,54 @@ mod tests {
         assert_eq!(stamp(UNIX_EPOCH), "19700101-000000");
         assert_eq!(stamp(UNIX_EPOCH + Duration::from_secs(1_791_313_200)), "20261006-190000");
         assert_eq!(stamp(UNIX_EPOCH + Duration::from_secs(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn an_isolated_session_sees_only_its_own_run() {
+        if let Err(e) = isolation_works() {
+            eprintln!("skipped, no namespaces here: {e:#}");
+            return;
+        }
+        let [work, home, other, bindir] = [(); 4].map(|()| temp_dir().unwrap());
+        std::fs::create_dir_all(home.join("memory")).unwrap();
+        std::fs::create_dir_all(home.join("projects/p")).unwrap();
+        let earlier = ["memory/memory.sqlite", "projects/p/s.json", "run", "stdout", "trajectory.json"];
+        for f in earlier.iter().chain(&["budget.json"]) {
+            std::fs::write(home.join(f), "seed").unwrap();
+        }
+        std::fs::write(other.join("notes"), "seed").unwrap();
+        let bin = bindir.join("rusty");
+        let script = "#!/bin/sh\nfor p in \"$@\"; do echo \"$p=$(cat \"$p\" 2>/dev/null)\"; done > report\n\
+                      echo \"procs=$(ls /proc | grep -c '^[0-9]')\" >> report\n";
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let cfg = Config {
+            root: work.clone(),
+            bin,
+            limit: Duration::from_secs(10),
+            out: work.join("out"),
+            logs: work.join("logs"),
+            transcripts: false,
+            isolate: Some(Vec::new()),
+        };
+        let mut cmd = isolated(&cfg, &[], &work, &home).unwrap();
+        let read: Vec<PathBuf> = earlier.iter().chain(&["budget.json"]).map(|f| home.join(f)).collect();
+        let status = cmd.args(&read).arg(other.join("notes")).current_dir(&work).status().unwrap();
+        assert!(status.success());
+        let report = std::fs::read_to_string(work.join("report")).unwrap();
+        let seen =
+            |p: &Path| report.lines().find_map(|l| l.strip_prefix(&format!("{}=", p.display()))).unwrap().to_string();
+        for f in earlier {
+            assert_eq!(seen(&home.join(f)), "", "{f} from before the session is hidden");
+        }
+        assert_eq!(seen(&home.join("budget.json")), "seed", "the ledger stays");
+        assert_eq!(seen(&other.join("notes")), "", "another run's directory is hidden");
+        let procs: usize = report.lines().find_map(|l| l.strip_prefix("procs=")).unwrap().parse().unwrap();
+        assert!(procs < 5, "the session sees only its own processes, saw {procs}");
+        assert_eq!(std::fs::read_to_string(home.join("run")).unwrap(), "seed", "outside, nothing changed");
+        for d in [work, home, other, bindir] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
     }
 
     #[test]
