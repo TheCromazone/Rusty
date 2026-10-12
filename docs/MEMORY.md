@@ -180,6 +180,19 @@ least partly a delivery failure. An offered lesson now stays in the prompt for
 the rest of the turn, and the trajectory records which request first carried
 each one, so the next runs can tell the two apart.
 
+**After the fix** (development evidence: nemotron-3-super, main ae99853, five
+repeats per level per task, a 1800-second cap, each session isolated with
+`EVAL_ISOLATE=1`, October 2026). `learn` passed all ten runs, in 11 to 21
+seconds each. In every one the lesson was offered with the first request and the
+seed was first used at request 5 to 7, where the earlier delivery had already
+dropped it. `off` passed none: eight scored runs failed or timed out after 7 to
+50 commands trying to recover the seed from the hash, and the seed never
+appeared in a command. Two `off` runs were scored `leak`. Neither saw the seed:
+one read its own home, and the other typed part of its own working copy's name.
+These tasks reach the seed only through a lesson seeded directly into memory, so
+this shows that a delivered lesson is used. It does not show that memory
+captures the lesson by itself, or that memory helps on other tasks.
+
 ## Bounded hot path and disk
 
 - Sessions: RAM only, at most 32, each with a 4 KiB request and the last four
