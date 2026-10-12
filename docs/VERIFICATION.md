@@ -202,6 +202,13 @@ A later fix gave subagents and swarm workers the lead's compaction mode and
 history cap. They had kept the defaults (`standard`, no cap), so under a 1M
 window a worker on the lead's model summarised only near 787k tokens.
 
+Two limits remain. An unchosen mode and the default history cap are picked
+from the window at startup and kept when an overflow error later corrects
+the window (an assumed 128k found to be 32k keeps `standard`), and `/model`
+keeps the previous model's window and calibration. Both stay until reporting
+runs show whether either matters; `--context-tokens` and `--compaction`
+avoid them.
+
 A later fix stopped a compaction from repeating on every step when it can't
 get the context under the summary threshold, as with a window or
 `--history-cap-tokens` too small for the system prompt and tools. The next
@@ -220,7 +227,10 @@ owner-approved design: at startup rusty records each tracked file's blob
 compaction a "changed" path whose current blob equals that one moves to
 "touched, now unchanged". It is deterministic and costs one `git
 hash-object` per compaction. Untracked files and projects outside git are
-left as they were.
+left as they were. A file edited by absolute path is never moved, because
+the startup record is keyed by paths relative to the project, so it stays
+"changed": a missed collapse, never a false one. A path containing ", " is
+re-read as two names by a later compaction's working set.
 
 `--compaction-model` (`RUSTY_COMPACTION_MODEL`, `compaction_model` in saved
 settings) then let a separate model write compaction summaries, again by the
