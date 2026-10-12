@@ -968,8 +968,9 @@ fn trajectories(home: &Path) -> Vec<String> {
 
 /// The version of the leak rule, printed with each run. 2: a name that is
 /// a prefix of the run's own working copy (the `rusty-eval-` stem and at
-/// least one digit) is the working copy, not an outside read. Runs before it
-/// were scored under rule 1 and are not rescored.
+/// least one digit), and not the name of a directory beside it, is the
+/// working copy, not an outside read. Runs before it were scored under rule
+/// 1 and are not rescored.
 const LEAK_RULE: u32 = 2;
 
 /// The first path a tool call named outside the run's own working copy:
@@ -991,7 +992,10 @@ fn outside_reads(home: &Path, work: &Path) -> Option<String> {
             for (i, _) in args.match_indices("rusty-eval-") {
                 let name: String = args[i..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
                 let stem = "rusty-eval-".len();
-                let own_prefix = own.starts_with(&name) && name[stem..].starts_with(|c: char| c.is_ascii_digit());
+                // Unless another run's directory has exactly that name.
+                let own_prefix = own.starts_with(&name)
+                    && name[stem..].starts_with(|c: char| c.is_ascii_digit())
+                    && !work.with_file_name(&name).exists();
                 if name != own && name.len() > stem && !own_prefix {
                     return Some(name);
                 }
@@ -1442,6 +1446,11 @@ mod tests {
         let guess = serde_json::json!({ "command": format!("echo -n {part} | sha256sum") }).to_string();
         std::fs::write(home.join(trajectory(1)), call(&guess)).unwrap();
         assert_eq!(outside_reads(&home, &work), None, "a prefix of its own name is not outside");
+        // Unless another run's directory has that very name.
+        let sibling = work.with_file_name(part);
+        std::fs::create_dir(&sibling).unwrap();
+        assert_eq!(outside_reads(&home, &work).as_deref(), Some(part), "a sibling with that name is outside");
+        std::fs::remove_dir(&sibling).unwrap();
         std::fs::write(home.join(trajectory(1)), call(&mine)).unwrap();
         // A later session reads an earlier one's transcript from the home.
         // Session 2 wrote no trajectory; session 3 reads an earlier transcript.

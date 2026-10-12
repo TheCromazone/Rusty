@@ -572,7 +572,7 @@ are seen, so a search of a parent directory that never names one is missed.
 The rule is versioned, and each run prints its version. Rule 2 treats part of
 the run's own working-copy name (the `rusty-eval-` stem and at least one
 digit), such as a session typing it as a guess, as its own, not as an outside
-read. Runs scored under rule 1, among them the memory-use runs at 14fba44 and
+read, unless a directory of exactly that name sits beside the working copy. Runs scored under rule 1, among them the memory-use runs at 14fba44 and
 ae99853, keep their verdicts.
 A task can also list, in `leak.txt`, strings a session should get only from
 memory. Each session that starts without one in its working copy is checked.
