@@ -3949,3 +3949,18 @@ fn the_reply_reserve_is_the_one_requests_use() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success() && stderr.contains("165000 tokens"), "{stderr}");
 }
+
+#[test]
+fn window_and_cap_flags_refuse_absurd_sizes() {
+    // Past 100M tokens the thresholds' arithmetic would wrap, so refuse them.
+    let s = Sandbox::new("flag-bounds");
+    for flag in ["--context-tokens", "--history-cap-tokens"] {
+        let out = s.cmd().args([flag, "1000000000000000000", "--memory", "off", "hi"]).output().unwrap();
+        assert!(!out.status.success(), "{flag} accepted 1e18");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("100000000"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

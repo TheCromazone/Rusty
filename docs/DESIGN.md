@@ -78,8 +78,10 @@ trimmed result keeps its first 400 characters (200 to 800), and a compaction
 carries a tenth of the history budget of the user's own messages (2k to 16k
 tokens). Unchosen, the mode follows the window: `aggressive` below 48k,
 `standard` otherwise. Whatever the mode, history is capped at 128k tokens above
-a 200k window unless `--history-cap-tokens` sets the cap: each threshold then
-fires at the lower of its share and the cap.
+a 200k window unless `--history-cap-tokens` sets the cap: summaries then start
+at the lower of their share and the cap, and trimming at the same proportion
+of the cap (96k for a 128k cap in `standard`). Windows and caps above 100M
+tokens are refused or clamped.
 How full the context is comes from the provider's own count: the prompt
 tokens it reports for a request are the context at that request, and what was
 added since is estimated, scaled by a running ratio of reported to estimated
