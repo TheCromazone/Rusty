@@ -101,7 +101,9 @@ converging on a long finish, once the context is more than 25% full. The
 harness refuses it below 20%, while the last error is unresolved, while
 another call in the same step or a background command is pending, and within
 ten tool calls of the previous compaction. An accepted one keeps the model's
-last two steps verbatim and summarises what came before. A compaction
+last two steps verbatim and summarises what came before. Under a history cap,
+those shares are of the budget whose summary point is the cap (160k for a
+128k cap in `smart`), not of the whole window. A compaction
 also compares each changed tracked file with its blob at startup, and one
 whose edits were undone is listed as touched, now unchanged rather than
 changed. `--compaction-model` hands the summary to another model, with the
