@@ -3778,3 +3778,43 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
 }
+
+#[test]
+fn a_compaction_that_cannot_get_under_the_threshold_is_not_repeated_every_step() {
+    // A 2,000-token history cap sits below the system prompt and tools alone,
+    // so no summary gets under it. Each reply works both as a summary and as
+    // a step, so the script holds whichever request comes.
+    let s = Sandbox::new("compaction-progress");
+    for n in 0..8 {
+        std::fs::write(s.project.join(format!("f{n}.txt")), format!("file {n}\n")).unwrap();
+    }
+    let both = |n: usize| {
+        let mut r = tool_reply("read_file", serde_json::json!({"path": format!("f{n}.txt")}));
+        r["choices"][0]["delta"]["content"] = serde_json::json!("1. Task: go. 2. Ran echo.");
+        unreported(r)
+    };
+    let mut replies: Vec<serde_json::Value> = (0..8).map(both).collect();
+    replies.push(text_reply("done"));
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "2000", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let summaries = requests.iter().filter(|r| r["tools"].as_array().is_none_or(|t| t.is_empty())).count();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    let compactions = stats["compactions"].as_array().unwrap();
+    assert!(!compactions.is_empty(), "the cap still triggers a compaction: {stats}");
+    assert!(
+        summaries <= 2 && compactions.len() <= 2,
+        "{summaries} summary requests for {} steps: {stats}",
+        requests.len() - summaries
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still over"), "the user is told the cap is too small");
+}

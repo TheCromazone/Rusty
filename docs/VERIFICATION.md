@@ -198,6 +198,12 @@ budget where the pin carried 8,000 characters. Harness runs on these builds
 should pin `--compaction` and, for windows over 200k, `--history-cap-tokens`
 or accept the 128k default.
 
+A later fix stopped a compaction from repeating on every step when it can't
+get the context under the summary threshold, as with a window or
+`--history-cap-tokens` too small for the system prompt and tools. The next
+threshold compaction then waits until the context has grown by a tenth of
+the threshold, and the user is told the window or cap is too small.
+
 A compaction then started telling undone edits apart, again by the
 owner-approved design: at startup rusty records each tracked file's blob
 (`git ls-files -s`, with uncommitted files hashed as they stand), and at
