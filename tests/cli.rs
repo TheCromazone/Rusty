@@ -3337,7 +3337,7 @@ fn smart_compaction_is_refused_below_the_floor_and_announced_above_it() {
     assert!(offered.contains("\"compact\"") && offered.contains("not while stuck on an error"), "{offered}");
     let first = requests[0]["messages"].to_string();
     assert!(first.contains("call compact when the next step is substantially different work"), "{first}");
-    assert!(first.contains("Context in use: 1% of the usable window"), "{first}");
+    assert!(first.contains("Context in use: 1% of the context budget"), "{first}");
     assert!(requests[1]["messages"].to_string().contains("compaction is refused below 20%"));
     assert!(!String::from_utf8_lossy(&out.stdout).contains("auto-compacting"));
 
@@ -3777,4 +3777,34 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
+}
+
+#[test]
+fn smart_compaction_measures_fullness_against_the_history_cap() {
+    // A 1M window caps history at 128k, so 125k is near the summary point,
+    // not 13% full: the model's own compaction must be possible.
+    let s = Sandbox::new("smart-cap");
+    let (url, server) = scripted_endpoint(vec![
+        reported(bash_reply("echo a"), 100_000),
+        reported(bash_reply("echo b"), 110_000),
+        reported(bash_reply("echo c"), 120_000),
+        reported(tool_reply("compact", serde_json::json!({"reason": "the next step is different work"})), 125_000),
+        text_reply("1. Task: go."),
+        text_reply("done"),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "1000000")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--compaction", "smart", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let notes = requests[3]["messages"].to_string();
+    assert!(notes.contains("Context in use: 7"), "120k of a 160k budget: {notes}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["trigger"], "smart", "{stats}");
 }

@@ -811,7 +811,7 @@ impl Agent {
             // Last, so the cached prefix stays the same; never stored in history.
             let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
             if self.smart_compaction() {
-                notes.push(format!("Context in use: {}% of the usable window.", self.context_used()));
+                notes.push(format!("Context in use: {}% of the context budget.", self.context_used()));
             }
             if !notes.is_empty() {
                 messages.push(json!({"role": "user", "content": format!("{}{}", context::NOTE, notes.join("\n"))}));
@@ -2023,9 +2023,20 @@ impl Agent {
         self.compaction == context::Compaction::Smart && !self.is_worker && !self.shell_only
     }
 
-    /// The context's share of what a request may fill, in percent.
+    /// What the context may fill before compaction is due in full: the
+    /// usable window, or under a history cap the budget at which the mode's
+    /// summary share lands on the cap.
+    fn context_budget(&self) -> usize {
+        let capacity = self.meter.capacity();
+        match self.history_cap {
+            Some(cap) => capacity.min(cap * 100 / self.compaction.summarize_at()).max(1),
+            None => capacity,
+        }
+    }
+
+    /// The context's share of its budget, in percent.
     fn context_used(&self) -> usize {
-        context::percent(self.meter.fill(&self.history, self.fixed_estimate()), self.meter.capacity())
+        context::percent(self.meter.fill(&self.history, self.fixed_estimate()), self.context_budget())
     }
 
     /// What the harness can see that makes this a bad moment to compact.
@@ -2062,7 +2073,7 @@ impl Agent {
         }
         let used = self.context_used();
         let filled = self.meter.fill(&self.history, self.fixed_estimate());
-        let floor = (self.meter.capacity() * context::SMART_FLOOR / 100).max(context::SMART_FLOOR_TOKENS);
+        let floor = (self.context_budget() * context::SMART_FLOOR / 100).max(context::SMART_FLOOR_TOKENS);
         if filled < floor {
             return format!(
                 "error: context is only {used}% full; compaction is refused below {}% (and below {} tokens). \
@@ -2081,7 +2092,7 @@ impl Agent {
             "  Rusty is auto-compacting because {reason}. Use /compact settings to turn it off."
         )));
         self.pending_compaction = Some((reason, focus));
-        format!("compaction scheduled at {used}% of the usable window; it runs before your next step")
+        format!("compaction scheduled at {used}% of the context budget; it runs before your next step")
     }
 
     /// `/compact [focus]`: summarise now, steered by what the user wants kept.
