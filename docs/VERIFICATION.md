@@ -204,6 +204,12 @@ get the context under the summary threshold, as with a window or
 threshold compaction then waits until the context has grown by a tenth of
 the threshold, and the user is told the window or cap is too small.
 
+A later fix measured smart mode's 20% floor, its 25% invitation and the
+"Context in use" note against the budget whose summary point is the history
+cap, rather than the whole window. At a 1M window with the default 128k cap
+the floor had sat above the summary point, so the model's own compaction was
+always refused.
+
 A compaction then started telling undone edits apart, again by the
 owner-approved design: at startup rusty records each tracked file's blob
 (`git ls-files -s`, with uncommitted files hashed as they stand), and at
