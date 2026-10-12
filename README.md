@@ -163,6 +163,13 @@ resuming reruns verification rather than trusting saved receipts. See
 [docs/VERIFICATION.md](docs/VERIFICATION.md) for input exclusions, scope, and
 the staged repair/search roadmap.
 
+Type `/` and a menu of commands opens under the prompt, narrowing as you type
+(`/cmpct` still finds `/compact`). ↑↓ choose, Tab or → completes, and Enter
+runs the highlighted command, or fills it in when it needs an argument. After a
+command and a space the menu offers its values, such as `/mode ` → `careful`.
+Piped input runs a partial command only when one command matches, and an
+unknown one gets a "did you mean".
+
 | | |
 |---|---|
 | `/goal <objective>` | autonomous until done and verified · `status` · `resume` · `clear` |
