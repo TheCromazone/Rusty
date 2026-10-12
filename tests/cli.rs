@@ -3923,3 +3923,29 @@ fn a_subagent_compacts_under_the_leads_history_cap() {
     assert_eq!(requests.len(), 7, "the worker asked for a summary");
     assert!(requests[4]["messages"].to_string().contains("hand-off summaries"), "{}", requests[4]["messages"]);
 }
+
+#[test]
+fn the_reply_reserve_is_the_one_requests_use() {
+    // /context shows the meter's reserve: an eighth of a 32k window, not 16k.
+    let s = Sandbox::new("reserve-shown");
+    let mut c = s.cmd();
+    c.env("RUSTY_CONTEXT_TOKENS", "32000").args(["--memory", "off"]);
+    let out = s.repl_with(c, &["/context"]);
+    assert!(out.contains("reply reserve 4000"), "{out}");
+
+    // The startup check sizes a summary request with careful's reserve (an
+    // eighth of 200k, 25,000), so a 164k summariser can't hold its 165,000.
+    let (url, server) =
+        scripted_http(vec![(200, r#"{"data": [{"id": "summariser-small", "context_length": 164000}]}"#.into())]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "200000")
+        .args(["--yolo", "--mode", "careful", "--memory", "off", "--compaction-model", "summariser-small", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && stderr.contains("165000 tokens"), "{stderr}");
+}
