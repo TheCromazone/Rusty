@@ -66,12 +66,12 @@ struct Cli {
 
     /// Context window in tokens; otherwise asked of the endpoint, then the saved
     /// table, else 128000 is assumed
-    #[arg(long, env = "RUSTY_CONTEXT_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
+    #[arg(long, env = "RUSTY_CONTEXT_TOKENS", value_parser = clap::value_parser!(u64).range(1000..=context::MAX_WINDOW as u64))]
     context_tokens: Option<u64>,
 
     /// Compaction never waits past this many context tokens, whatever the
     /// window (overrides saved settings)
-    #[arg(long, env = "RUSTY_HISTORY_CAP_TOKENS", value_parser = clap::value_parser!(u64).range(1000..))]
+    #[arg(long, env = "RUSTY_HISTORY_CAP_TOKENS", value_parser = clap::value_parser!(u64).range(1000..=context::MAX_WINDOW as u64))]
     history_cap_tokens: Option<u64>,
 
     /// Compaction: aggressive, standard, passive or smart (overrides saved settings)
@@ -325,7 +325,7 @@ fn run() -> Result<i32> {
     agent.history_cap = cli
         .history_cap_tokens
         .map(|n| n as usize)
-        .or(settings.history_cap_tokens)
+        .or(settings.history_cap_tokens.map(|n| n.min(context::MAX_WINDOW)))
         .or_else(|| context::default_history_cap(agent.meter.window));
     agent.compaction_model = cli
         .compaction_model

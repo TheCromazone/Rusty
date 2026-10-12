@@ -20,6 +20,9 @@ pub const MEMORY_CHARS: usize = 3_000;
 pub const REPLY_RESERVE: usize = 16_000;
 const MIN_REPLY_RESERVE: usize = 4_000;
 const ELIDE_OVER_CHARS: usize = 1_500;
+/// The largest window or history cap rusty accepts from any source, well
+/// past any model's and far below where the threshold arithmetic overflows.
+pub const MAX_WINDOW: usize = 100_000_000;
 /// The window the fixed sizes below were tuned for.
 const REFERENCE_WINDOW: usize = 128_000;
 
@@ -237,13 +240,13 @@ impl Default for Meter {
 impl Meter {
     pub fn new(window: usize, window_source: &'static str) -> Self {
         Self {
-            window: window.max(1),
+            window: window.clamp(1, MAX_WINDOW),
             window_source,
             ratio: 1.0,
             calibrated: false,
             last: None,
             largest_accepted: 0,
-            reserve: REPLY_RESERVE.min(window.max(1) / 8).max(MIN_REPLY_RESERVE),
+            reserve: REPLY_RESERVE.min(window.clamp(1, MAX_WINDOW) / 8).max(MIN_REPLY_RESERVE),
             requests: Vec::new(),
         }
     }

@@ -3778,3 +3778,18 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
 }
+
+#[test]
+fn window_and_cap_flags_refuse_absurd_sizes() {
+    // Past 100M tokens the thresholds' arithmetic would wrap, so refuse them.
+    let s = Sandbox::new("flag-bounds");
+    for flag in ["--context-tokens", "--history-cap-tokens"] {
+        let out = s.cmd().args([flag, "1000000000000000000", "--memory", "off", "hi"]).output().unwrap();
+        assert!(!out.status.success(), "{flag} accepted 1e18");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("100000000"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
