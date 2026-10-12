@@ -1517,6 +1517,8 @@ impl Agent {
                 (self.client.clone(), self.cwd.clone(), self.policy.deny.clone(), self.backend.clone());
             let (cfg, lead_model, execution_mode) = (cfg.clone(), self.model.clone(), self.execution_mode);
             let lead_window = (self.meter.window, self.meter.window_source);
+            // Workers compact as the lead does; smart's own tool is the lead's alone.
+            let (compaction, history_cap) = (self.compaction, self.history_cap);
             std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
@@ -1534,6 +1536,8 @@ impl Agent {
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
+                w.compaction = compaction;
+                w.history_cap = history_cap;
                 w.request_role = role;
                 w.backend = backend.clone();
                 w.execution_mode = execution_mode;

@@ -3778,3 +3778,32 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
 }
+
+#[test]
+fn a_subagent_compacts_under_the_leads_history_cap() {
+    // A 1M window caps history at 128k. The worker shares the lead's model,
+    // so 200k of its own context is past the cap and gets summarised.
+    let s = Sandbox::new("worker-cap");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("task", serde_json::json!({"description": "look", "prompt": "look around"})),
+        reported(bash_reply("echo a"), 10_000),
+        reported(bash_reply("echo b"), 20_000),
+        reported(bash_reply("echo c"), 200_000),
+        text_reply("1. Task: look around."),
+        text_reply("report: nothing found"),
+        text_reply("done"),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_CONTEXT_TOKENS", "1000000")
+        .env("RUSTY_RETRY_SECS", "1")
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--agents", "sub", "--stats", "go"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 7, "the worker asked for a summary");
+    assert!(requests[4]["messages"].to_string().contains("hand-off summaries"), "{}", requests[4]["messages"]);
+}
