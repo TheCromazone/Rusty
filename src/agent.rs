@@ -1992,9 +1992,22 @@ impl Agent {
                 d.line(&ui::dim(&format!("  ✂ trimmed old tool output, ~{saved} tokens freed")));
             }
         }
-        if self.meter.fill(&self.history, fixed) > summarize {
-            if let Err(e) = self.compact_with(d, None, false, "level") {
-                d.line(&ui::err(&format!("  compaction failed: {e:#}")));
+        // A compaction that could not get under the threshold isn't repeated
+        // until the context has grown by a tenth of it, so a window or cap too
+        // small for the fixed part doesn't cost a summary on every step.
+        let since = self.compactions.last().map_or(0, |c| c.tokens_after + summarize / 10);
+        if self.meter.fill(&self.history, fixed) > summarize.max(since) {
+            let before = self.compactions.len();
+            match self.compact_with(d, None, false, "level") {
+                Err(e) => d.line(&ui::err(&format!("  compaction failed: {e:#}"))),
+                Ok(()) => {
+                    if self.compactions.len() > before && self.compactions[before].tokens_after > summarize {
+                        d.line(&ui::dim(&format!(
+                            "  ◇ context still over the {summarize}-token threshold after compacting; \
+                             the window or --history-cap-tokens is too small for the system prompt and tools"
+                        )));
+                    }
+                }
             }
         }
     }
