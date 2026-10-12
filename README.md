@@ -105,7 +105,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 
 | | |
 |---|---|
-| **High-recall context** | Fixed token budgets. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction. |
+| **High-recall context** | Budgets scale with the model's real context window, and fullness comes from the provider's own token counts. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction, and a file whose edits were undone is listed as unchanged rather than changed. |
 | **Real memory** | Typed lessons (`preference`, `fact`, `decision`, `gotcha`) offered one at a time when BM25 relevance × confidence × file freshness clears a bar, not a file pasted into every prompt. Lessons are tied to the files they describe and gain or lose confidence only when a goal's fixed check passes or fails. `--memory off · recall · learn · reflect · deep` sets how aggressively memory captures, applies and prunes ([docs/MEMORY.md](docs/MEMORY.md)). Benchmark runs should pass `--memory off`. |
 | **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
 | **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
@@ -170,7 +170,7 @@ the staged repair/search roadmap.
 | `/agents off\|sub\|swarm\|auto` | delegation · `/agents model <id>` sets the subagent model |
 | `/swarm size\|models\|spread` | workers at once (up to 16; a swarm call takes up to 32 tasks and workers share findings), model rotation, temperature spread |
 | `/compact [focus]` | summarise now, keeping what you name in detail |
-| `/compact settings [mode]` | when to compact: `aggressive` (summarise at 60% of the usable window), `standard` (80%, the default), `passive` (95%) or `smart` (the model compacts when the work changes) |
+| `/compact settings [mode]` | when to compact: `aggressive` (summarise at 60% of the usable window), `standard` (80%, the default), `passive` (95%) or `smart` (the model compacts when a sub-task is done; rusty refuses at a bad moment and keeps its last two steps verbatim) |
 | `/target` · `/audit [n]` · `/changes` | where infra commands will land · the infra audit log · what this session changed |
 | `/triage` `/change` `/postmortem` | infra skills: incident triage, a change plan with rollback, a blameless write-up |
 | `/context` · `/tokens` | where the window is going · spend by model and by tool |
@@ -183,6 +183,15 @@ the staged repair/search roadmap.
 | `/review` `/explore` `/feature` `/debug` `/test` `/commit` | built-in skills · `/skills` lists yours too |
 | `/doctor` | each provider's keys (names only), endpoint, model count and latency, and where the current model goes |
 | `/model` · `/models` · `/plan` · `/tips` · `/settings` · `/clear` · `/exit` | |
+
+rusty reads the context window from the endpoint's model list. When the
+endpoint doesn't publish one, pass `--context-tokens`, or rusty assumes 128k
+and says so. `--history-cap-tokens` makes compaction start by that many tokens
+however large the window; above a 200k window the cap is 128k unless you set
+one. `--compaction` sets the mode for one run, and `--compaction-model` hands
+summaries to another model, with the session's model as the fallback.
+`--stats` and `--trajectory` record each compaction: why it ran, the tokens
+before and after, and where the work resumed.
 
 ## Execution modes
 
