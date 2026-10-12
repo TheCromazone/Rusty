@@ -3778,3 +3778,49 @@ fn a_compaction_model_writes_the_summary_and_the_session_model_covers_for_it() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("`claude-sonnet-4-5` is served by"), "{stderr}");
 }
+
+#[test]
+fn a_file_missing_now_or_at_startup_is_never_reported_unchanged() {
+    // notes.txt is untracked at startup, so rusty has no blob for it; once
+    // rewritten and deleted it must stay "changed", not count as undone.
+    let s = Sandbox::new("revert-absent");
+    std::fs::write(s.project.join("a.txt"), "one\n").unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&s.project)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "start"]);
+    std::fs::write(s.project.join("notes.txt"), "draft\n").unwrap();
+    let call = |name: &str, args: serde_json::Value| reported(tool_reply(name, args), 50_000);
+    let (out, requests) = smart_run(
+        &s,
+        vec![
+            call("write_file", serde_json::json!({"path": "notes.txt", "content": "rewritten\n"})),
+            call("bash", serde_json::json!({"command": "rm notes.txt"})),
+            call("read_file", serde_json::json!({"path": "a.txt"})),
+            call("edit_file", serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "two"})),
+            call("edit_file", serde_json::json!({"path": "a.txt", "old_string": "two", "new_string": "one"})),
+            reported(bash_reply("echo x"), 55_000),
+            reported(bash_reply("echo y"), 58_000),
+            reported(tool_reply("compact", serde_json::json!({"reason": "the edits are done"})), 60_000),
+            text_reply("1. Task: go."),
+            text_reply("done"),
+        ],
+    );
+    let after = requests.last().unwrap()["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]"), "a compaction ran: {after}");
+    assert!(after.contains("- changed: notes.txt"), "{after}");
+    assert!(after.contains("- touched, now unchanged: a.txt"), "{after}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stats: serde_json::Value = stderr.lines().rev().find_map(|l| serde_json::from_str(l).ok()).unwrap();
+    assert_eq!(stats["compactions"][0]["reverted"], 1, "{stats}");
+}

@@ -1944,9 +1944,8 @@ impl Agent {
     }
 
     /// The working set with files back as they were at startup moved out of
-    /// `changed`. Without a start record (not a git work tree), unchanged.
-    /// The working set with undone edits moved to their own line, and how
-    /// many files moved.
+    /// `changed` to their own line, and how many moved. Without a start
+    /// record (not a git work tree), unchanged.
     fn collapse_reverts(&self, working_set: &str) -> (String, usize) {
         let Some(start) = &self.start_blobs else { return (working_set.to_string(), 0) };
         let changed: Vec<String> = working_set
@@ -1959,9 +1958,11 @@ impl Agent {
         }
         let now: std::collections::HashMap<String, Option<String>> =
             crate::snapshot::hash_now(&self.cwd, &changed).into_iter().collect();
+        // Only a file present both now and at startup, with the same blob: a
+        // file deleted since, or with no startup record (untracked), stays changed.
         let unchanged = |f: &str| {
             let f = f.trim_start_matches("./");
-            now.get(f).is_some_and(|blob| blob.as_ref() == start.get(f))
+            matches!((now.get(f), start.get(f)), (Some(Some(n)), Some(s)) if n == s)
         };
         let moved = changed.iter().filter(|f| unchanged(f)).count();
         (context::collapse_reverts(working_set, unchanged), moved)
