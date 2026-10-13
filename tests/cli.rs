@@ -3290,6 +3290,28 @@ fn capabilities_list_only_values_the_flags_accept() {
 }
 
 #[test]
+fn memory_tools_are_offered_only_when_memory_is_on() {
+    for (level, offered) in [("off", false), ("learn", true)] {
+        let s = Sandbox::new(&format!("memory-tools-{level}"));
+        let (url, server) = scripted_endpoint(vec![
+            serde_json::json!({"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}),
+        ]);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--yolo", "--mode", "standard", "--memory", level, "hello"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let tools = server.join().unwrap()[0]["tools"].to_string();
+        for name in ["remember", "recall", "forget"] {
+            assert_eq!(tools.contains(&format!("\"{name}\"")), offered, "{level}: {name}");
+        }
+    }
+}
+
+#[test]
 fn a_shell_toolset_offers_and_runs_only_bash() {
     let s = Sandbox::new("toolset-shell");
     std::fs::write(s.project.join("notes.txt"), "kept").unwrap();
@@ -3869,7 +3891,7 @@ fn smart_compaction_measures_fullness_against_the_history_cap() {
 
 #[test]
 fn a_compaction_that_cannot_get_under_the_threshold_is_not_repeated_every_step() {
-    // A 2,000-token history cap sits below the system prompt and tools alone,
+    // A 1,000-token history cap sits below the system prompt and tools alone,
     // so no summary gets under it. Each reply works both as a summary and as
     // a step, so the script holds whichever request comes.
     let s = Sandbox::new("compaction-progress");
@@ -3888,7 +3910,7 @@ fn a_compaction_that_cannot_get_under_the_threshold_is_not_repeated_every_step()
         .cmd()
         .env("RUSTY_BASE_URL", url)
         .env("RUSTY_RETRY_SECS", "1")
-        .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "2000", "--stats", "go"])
+        .args(["--yolo", "--mode", "standard", "--memory", "off", "--history-cap-tokens", "1000", "--stats", "go"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
