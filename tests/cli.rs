@@ -1631,9 +1631,11 @@ fn unchanged_call_loop_stalls_the_turn_and_three_stalls_end_the_goal() {
             .spawn()
             .map(|c| wait(c, Duration::from_secs(20)))
             .unwrap();
-        assert!(!out.status.success(), "{mode} marked a stalled task successful");
+        // An unfinished goal: neither success nor an error.
+        assert_eq!(out.status.code(), Some(2), "{mode} must exit 2 for a stalled goal");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("stalled three turns in a row") && stderr.contains("\"goal\":\"open\""), "{stderr}");
+        assert!(stderr.contains("\"goal_end\":\"stalled\""), "{stderr}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
         assert_eq!(s.calls().lines().count(), 12, "each stall should stop later tools in its batch");
         assert!(!s.project.join("must-not-write.txt").exists());
@@ -2132,10 +2134,42 @@ fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
         .spawn()
         .map(|c| wait(c, Duration::from_secs(10)))
         .unwrap();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("stalled three turns in a row"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
+#[test]
+fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error() {
+    // The M4 cohort's case: the work may be done, but the model never
+    // proposes completion and three turns stall. That is exit 2 with a
+    // trajectory, like any goal that did not close on a passing check.
+    let s = Sandbox::new("stall-under-verify");
+    let fake = bash_reply("printf same");
+    let batch = tool_batch(vec![fake.clone(), fake.clone(), fake.clone(), fake]);
+    let (url, server) = scripted_endpoint(vec![batch.clone(), batch.clone(), batch]);
+    let traj = s.project.join("trajectory.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--yolo", "--memory", "off", "--goal", "inspect", "--verify", "true", "--stats"])
+        .arg("--trajectory")
+        .arg(&traj)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|c| wait(c, Duration::from_secs(10)))
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("error:"), "a stall is not an error: {stderr}");
+    assert!(stderr.contains("\"goal_end\":\"stalled\""), "{stderr}");
+    let t: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&traj).unwrap()).unwrap();
+    assert_eq!(t["goal_end"], "stalled");
+    assert_eq!(t["claims"]["proposed"], 0, "nothing was proposed, so nothing was checked");
     assert_eq!(server.join().unwrap().len(), 3);
 }
 
