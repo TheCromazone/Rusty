@@ -449,6 +449,27 @@ Reading, decided now:
   without a recall, the anchor change is parked, the result recorded, and main
   left as it is.
 
+**Outcome: V1 parked; main unchanged.** Baseline 0b3e64c against V1 655bad4,
+as predeclared. Each cell is pass / fail / timeout / leak:
+
+| | baseline | V1 |
+|---|---|---|
+| `memory-anchored-fact` | 0 / 3 / 0 / 2 (lesson offered 0/5) | 5 / 0 / 0 / 0 (offered 5/5, at the first request) |
+| `memory-obsolete-fact` | 5 / 0 / 0 / 0, stale 0/5 | 5 / 0 / 0 / 0, stale 4/5 |
+
+V1 delivers the lesson, and `memory-anchored-fact` improves from none of three
+scored runs to five of five. It fails the harm bar: in four of five
+`memory-obsolete-fact` runs the first suite run used the remembered seed after
+the warning, before the model re-hashed, found the rotated seed in
+`CONTRIBUTING.md` and passed. Those four count as stale, as decided in advance,
+though all four recovered. No `learn` session called `recall` in either build
+(the only recalls in these experiments were memory-off sessions offered the
+tools before #92), so the fallback cannot help, and the change is parked. On
+V1, `stale-anchor` passed 3/3 and `poisoned-lesson` 2/3, in line with its
+earlier rate at every level. A later variant, such as advice that says to
+verify the value against the working copy first, would be a new predeclared
+test, not a reading of this one.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
