@@ -59,7 +59,7 @@ above the level's threshold is offered as one short line.
   threshold. An agent lesson whose anchored file changed is therefore hidden,
   not offered with the warning the text implies; only user lessons get the
   warning. `freshness_by_source_unchanged_changed_and_missing_anchors` pins
-  the current behaviour. It needs its own predeclared test before any change.
+  the current behaviour. Its predeclared test is in VERIFICATION.md.
 
 A lesson is offered once per turn, and from then on it stays in the system
 prompt for the rest of that turn, so a step that needs it later still sees it.
