@@ -350,6 +350,10 @@ EVAL_MODELS=nvidia/nemotron-3-super-120b-a12b EVAL_REPEATS=1 EVAL_JOBS=1 \
   EVAL_TIMEOUT=120 cargo xtask eval verified-repair
 ```
 
+Run `cargo xtask qa` before a push on an otherwise idle host. The memory
+service's control calls keep a 1000 ms budget, and under load from concurrent
+eval runs a large export can overrun it; a QA failure on an idle host is real.
+
 The second command starts a live provider run and needs its configured key.
 Results go to `target/evals/`. A public one-function development task validates
 the completion path; it does not establish repository-repair performance.
@@ -370,8 +374,10 @@ A run shows a loss after compaction only when all three hold:
 
 1. a compaction boundary (the `compactions` record) falls between the turn
    that states the rule or fact and the turn that needs it;
-2. the summary that replaced history omits it (a string check on the summary
-   message at `boundary`);
+2. the summary that replaced history omits it: the summary message at
+   `boundary` lacks the token itself, `RUSTY:` for `compaction-rule` and each
+   of `37`, `905` and `TimeoutError` for `compact-focus`, so a summary that
+   paraphrases the item still counts as carrying it;
 3. the check fails on that item (the `RUSTY:` docstring, or a wrong value in
    `ANSWER.txt`), not on unrelated work.
 
