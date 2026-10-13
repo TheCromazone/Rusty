@@ -666,8 +666,10 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   `.env` being read, and a fresh `RUSTY_HOME` keeps saved settings, sessions
   and memory out of the run.
 - **Memory and delegation.** `--memory off` starts no memory daemon and reads
-  no lessons. `--agents off` runs one agent. Any other value is a different
-  experiment.
+  no lessons; builds after the reporting pin also offer no memory tools
+  (`remember`, `recall`, `forget`) with it, where the pin offered them and
+  each call answered "memory is off". `--agents off` runs one agent. Any
+  other value is a different experiment.
 - **Compaction.** Builds after the reporting pin accept `--compaction`
   (`aggressive`, `standard`, `passive` or `smart`; listed by
   `--capabilities`). It falls back to the saved setting, so a run on such a

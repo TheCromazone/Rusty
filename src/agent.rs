@@ -652,7 +652,10 @@ impl Agent {
             }), &["id"]));
             defs.push(t("bash_cancel", "Cancel your owned command and reap its ordinary process group. Cannot cancel a foreign process. Completed handles keep their actual result.", json!({"id":{"type":"string"}}), &["id"]));
         }
-        defs.push(t(
+        // With memory off they could only answer "memory is off", so they
+        // aren't offered.
+        if self.advisor.is_some() {
+            defs.push(t(
             "remember",
             "Save a durable memory for future sessions.",
             json!({
@@ -663,8 +666,14 @@ impl Agent {
             }),
             &["kind", "text"],
         ));
-        defs.push(t("recall", "Search long-term memory.", json!({"query": {"type": "string"}}), &["query"]));
-        defs.push(t("forget", "Delete a memory that is wrong or stale.", json!({"id": {"type": "string"}}), &["id"]));
+            defs.push(t("recall", "Search long-term memory.", json!({"query": {"type": "string"}}), &["query"]));
+            defs.push(t(
+                "forget",
+                "Delete a memory that is wrong or stale.",
+                json!({"id": {"type": "string"}}),
+                &["id"],
+            ));
+        }
         if self.smart_compaction() {
             defs.push(t(
                 "compact",
