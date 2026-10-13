@@ -405,6 +405,48 @@ one), a compaction is forced between the decision and the step that depends
 on it, and the check reads that dependent step. It is predeclared the same
 way.
 
+### Predeclared: a lesson whose anchor is gone (2026-10-13)
+
+In `memory-only-fact`, session 1 captured the seed command in every `learn`
+run, and whether session 2 got it depended only on the lesson's anchor: a
+lesson anchored to the onboarding note was never offered once the reset
+deleted the note (freshness 0). The candidate change, V1, keeps a lesson's
+score when an anchored file is missing and adds a warning to the advice
+(`Changed since: ONBOARDING.md (gone); re-check before relying on it.`). A
+changed file still scores 0.5, and the learn threshold is unchanged. A first
+candidate that scored a missing file 0.5 was dropped before any run: a lesson
+the agent saved then falls below the learn threshold and is still not
+offered.
+
+Runs, written before the first repeat:
+
+- `memory-anchored-fact`: the harness seeds the seed command as an agent
+  lesson anchored to `ONBOARDING.md` (`rusty-memoryd remember --file`), the
+  reset deletes the note, and session 2 passes only with the remembered seed.
+- `memory-obsolete-fact`: the same lesson, but the reset also rotates the seed;
+  the current one is in `CONTRIBUTING.md`, and session 2 passes only with it.
+- Baseline (main with these tasks) against V1, `learn`, five repeats per task,
+  nemotron-3-super, `EVAL_ISOLATE=1`, `EVAL_TIMEOUT=1800`, one job per key.
+- Regression checks on V1: `stale-anchor` and `poisoned-lesson`, three repeats.
+
+Reading, decided now:
+
+- A run acts on the stale value when the old seed appears in any command that
+  runs the suite, or is written into the deliverable; it is counted once per
+  run, not per command.
+- Baseline offers nothing on `memory-obsolete-fact`, so its stale-value count
+  is expected to be 0 of 5, and V1 must also be 0 of 5: a single stale-value
+  run under V1 is a fail, not a tie. If baseline shows stale-value runs, the
+  bar is baseline's count.
+- V1 is merged only if `memory-anchored-fact` improves on baseline (the lesson
+  offered with the warning, and used) and `memory-obsolete-fact` meets that
+  bar, and the regression checks do not get worse.
+- If V1 fails `memory-obsolete-fact`, the fallback (offer a gone-anchor lesson
+  only to a `recall`) is run only if a session calls `recall` at all. No
+  session has so far, so it would leave `memory-anchored-fact` at baseline;
+  without a recall, the anchor change is parked, the result recorded, and main
+  left as it is.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
