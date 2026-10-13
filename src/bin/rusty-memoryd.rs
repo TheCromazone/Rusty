@@ -30,6 +30,10 @@ enum Control {
         /// Keep a preference for every project
         #[arg(long)]
         global: bool,
+        /// A file the lesson is about (repeatable): the lesson is re-checked
+        /// against its contents, as when the agent passes `files`
+        #[arg(long = "file", value_name = "PATH")]
+        files: Vec<String>,
         text: String,
     },
     Export {
@@ -70,11 +74,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut h = Hooks::connect(&home, &std::env::current_dir()?, Level::Learn)?;
+    if let Control::Remember { files, .. } = &command {
+        // An anchor that doesn't resolve would be dropped silently.
+        if let Some(f) = files.iter().find(|f| !std::path::Path::new(f).is_file()) {
+            bail!("--file {f}: no such file");
+        }
+    }
     let (op, data) = match &command {
         Control::Stop => unreachable!(),
         Control::Status => ("status", json!(null)),
         Control::List => ("list", json!(null)),
-        Control::Remember { kind, source, global, text } => {
+        Control::Remember { kind, source, global, text, files } if !files.is_empty() => {
+            let r = h.remember(kind, text, source, files, *global);
+            if r.error {
+                bail!("{}", r.text);
+            }
+            println!("{}", r.text);
+            return Ok(());
+        }
+        Control::Remember { kind, source, global, text, .. } => {
             ("remember", json!({"kind":kind,"text":text,"source":source,"global":global}))
         }
         Control::Export { .. } => ("export", json!(null)),

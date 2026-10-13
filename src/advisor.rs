@@ -1504,6 +1504,32 @@ mod tests {
     }
 
     #[test]
+    fn freshness_by_source_unchanged_changed_and_missing_anchors() {
+        // A lesson the agent saved starts below one the user vouched for, so
+        // the 0.5 freshness of a changed file hides it at learn: an open item
+        // (docs/MEMORY.md). A missing file hides either. Both sources are
+        // covered so a change to freshness has to say what it does to each.
+        for (source, offered_when_changed) in [("user", true), ("agent", false)] {
+            let (mut e, p) = engine();
+            let root = p.join("work");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/tax.rs"), "hello\n").unwrap();
+            let root_s = root.to_string_lossy().to_string();
+            let data = json!({"kind":"fact","text":"tax rounding is half-even","source":source,
+                "files":["src/tax.rs"],"root":root_s});
+            e.handle(req("remember", "a", 0, data)).unwrap();
+            let unchanged = ask(&mut e, "s1", Level::Learn, "fix tax rounding", &root_s).text;
+            assert!(unchanged.contains("half-even") && !unchanged.contains("Changed since"), "{source}: {unchanged}");
+            std::fs::write(root.join("src/tax.rs"), "changed\n").unwrap();
+            let changed = ask(&mut e, "s2", Level::Learn, "fix tax rounding", &root_s).text;
+            assert_eq!(changed.contains("Changed since: src/tax.rs"), offered_when_changed, "{source}: {changed}");
+            std::fs::remove_file(root.join("src/tax.rs")).unwrap();
+            assert!(ask(&mut e, "s3", Level::Learn, "fix tax rounding", &root_s).text.is_empty(), "{source}");
+            std::fs::remove_dir_all(p).unwrap();
+        }
+    }
+
+    #[test]
     fn the_store_runs_in_wal_with_normal_sync() {
         // NORMAL is only crash-safe in WAL mode; both must hold together.
         let (e, p) = engine();
