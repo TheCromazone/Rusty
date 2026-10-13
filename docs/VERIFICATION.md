@@ -15,7 +15,8 @@ user-selected command through the ordinary permission policy. A passing shell
 exit plus unchanged source-input fingerprints can close the goal. Failed,
 timed-out, interrupted, denied, or changing-input verification leaves it open.
 Blocked goals do not run checks or spend a reviewer call. A headless goal with
-`--verify` returns 2 when unfinished and 130 when interrupted.
+`--verify` returns 2 when unfinished and 130 when interrupted. A goal that
+stalls three turns in a row returns 2 with or without `--verify`.
 
 The model cannot replace the pinned command with an evidence string or a
 different command argument in `goal_done`. Checks from earlier tools and
@@ -137,6 +138,7 @@ here, from its commit message.
 | #51 | 32445a9 | When bash can't find an `mcp__` name, point back to the tool | Same trial: `mcp__simcloud__db_credentials` run as a shell command five times |
 | #51 | 5608f55 | A secret tool's `value` field is treated as a secret | Same trial: a live payments key reached the model unredacted |
 | #52 | 630dd62 | Don't send an identical read result twice in a row | ship-checkout-v2: the same `get_resource` call eight times in a row |
+| #91 | 4a8e364 | A goal that stalls three turns ends unfinished (exit 2, `goal_end: stalled`), not with an error (exit 1) | M4 cohort at 32cac02: 9 of 63 attempts ended on the stall guard with exit 1; in rusty-combined / stop-report-connection-leak / seed 2 the verifier graded the work solved, and the error exit made it the cohort's invalid attempt |
 
 These changes predate the frozen reporting configuration. The trials above,
 and their task families, are development evidence for every later Rusty
@@ -661,8 +663,8 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   else saved settings, else 128k. Pin `--context-tokens` to keep that GET
   off the gateway and the window fixed. The reporting pin assumes 128k and
   estimates fill from characters.
-- **`--verify`** is optional. Without it, the goal closes on the model's word
-  and exit status 2 can't happen.
+- **`--verify`** is optional. Without it, the goal closes on the model's word,
+  and exit status 2 means only that the goal stalled.
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
   key and exits 1 if a server marked `required`, or one of its
@@ -687,7 +689,7 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
 | Code | Meaning |
 |---|---|
 | 0 | finished; with `--verify`, the check passed |
-| 2 | `--verify` was given and the goal did not close on a passing check |
+| 2 | the goal did not close: with `--verify`, not on a passing check; with or without it, after stalling three turns in a row (contract 2 and later; contract 1 exited 1 on a stall) |
 | 130 | interrupted |
 | 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
 
@@ -705,6 +707,8 @@ no key, so a harness can refuse an unsupported setting before any model call.
   - `model_budget` (the table above);
   - `secs`, `interrupted`;
   - `goal` (`done`, `blocked`, `open` or null);
+  - `goal_end` (contract 2 and later): how the goal run ended, `done`,
+    `blocked`, `turn_limit`, `stalled`, `interrupted` or `paused`, or null;
   - `claims`: what happened to the model's completion claims (see above);
   - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;
