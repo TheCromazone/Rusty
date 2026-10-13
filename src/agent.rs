@@ -279,7 +279,7 @@ pub struct Agent {
     /// The last turn ended on a repetition or talk-only stall.
     last_turn_stalled: bool,
     /// How the last goal run ended: done, blocked, turn_limit, stalled,
-    /// interrupted or paused. None when no goal ran.
+    /// interrupted, paused or error. None when no goal ran.
     pub goal_end: Option<&'static str>,
     project_notes: String,
     /// The workspace at startup (local lead only), see snapshot.rs.

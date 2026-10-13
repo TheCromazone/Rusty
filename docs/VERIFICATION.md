@@ -707,8 +707,10 @@ no key, so a harness can refuse an unsupported setting before any model call.
   - `model_budget` (the table above);
   - `secs`, `interrupted`;
   - `goal` (`done`, `blocked`, `open` or null);
-  - `goal_end` (contract 2 and later): how the goal run ended, `done`,
-    `blocked`, `turn_limit`, `stalled`, `interrupted` or `paused`, or null;
+  - `goal_end` (contract 2 and later, top-level here and in the
+    trajectory): how the goal run ended, `done`, `blocked`, `turn_limit`,
+    `stalled`, `interrupted`, `paused` or `error`. It is null when no goal
+    ran, and absent on builds before contract 2;
   - `claims`: what happened to the model's completion claims (see above);
   - `safety`: consequential calls proposed, executed and blocked (see above);
   - `execution_mode`, `memory_mode`, `tools_location`;

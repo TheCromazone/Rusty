@@ -2473,6 +2473,7 @@ fn root_budget_settles_known_usage_and_verification_uses_no_model_request() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(requests.len(), 1);
     assert!(trace["goal"]["status"].get("Done").is_some());
+    assert_eq!(trace["goal_end"], "done");
     assert_eq!(trace["model_budget"]["charged_tokens"], 15);
     assert_eq!(trace["model_budget"]["known_tokens"], 15);
     assert_eq!(trace["model_budget"]["unknown_usage_requests"], 0);
@@ -2508,6 +2509,14 @@ fn root_budget_reviewer_and_swarm_cannot_get_independent_allowances() {
             assert_eq!(trace["model_budget"]["by_role"]["worker"], 1);
         }
         assert!(trace["goal"]["status"].get("Done").is_none());
+        if review {
+            // The budget ran out inside the goal: an error, and it says so.
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(trace["goal_end"], "error");
+        } else {
+            // Present and null: a missing key would mean an older build.
+            assert!(trace.get("goal_end").is_some_and(serde_json::Value::is_null), "no goal ran");
+        }
     }
 }
 
