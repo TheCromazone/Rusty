@@ -491,7 +491,9 @@ their diffs; the run logs record the ids:
 Checked before any run, with the tasks' lesson and request against the
 advisor: the baseline offers nothing after either reset; C1 and C2 offer the
 lesson with their warning after both; all three offer it unchanged when the
-note is untouched, and none when it is gone.
+note is untouched, and none when it is gone. Saved by the user, the same
+lesson is offered after both resets by all three builds, with the old warning
+from the baseline and C1 and the new one from C2.
 
 Runs, written before the first repeat:
 
@@ -502,6 +504,9 @@ Runs, written before the first repeat:
 - `memory-changed-obsolete`: the same lesson; the reset rotates the seed and
   writes the current one into the rewritten note, so session 2 passes only
   with the note's seed.
+- `memory-changed-obsolete-user`: `memory-changed-obsolete` with the lesson
+  saved by the user, which every build offers with its warning. It tests C2's
+  wording on user lessons; for those, C1 behaves as the baseline.
 - Baseline (main with these tasks), C1 and C2, `learn`, five repeats per
   task, nemotron-3-super, `EVAL_ISOLATE=1`, `EVAL_TIMEOUT=1800`, one job per
   key.
@@ -517,19 +522,30 @@ Reading, decided now:
   match it: one stale run under a candidate is a fail, not a tie. If the
   baseline shows stale runs, the bar is the baseline's count.
 - A candidate passes `memory-changed-fact` only if it scores more passes
-  than the baseline with the lesson offered (with its warning) and the seed
-  used.
+  than the baseline and at least three of its scored runs, and at least
+  three in five of them, pass with the lesson offered (with its warning) and
+  the remembered seed used.
+- On `memory-changed-obsolete-user`, C2 must not have more stale runs than
+  the baseline; if it does, C2 fails, and its wording is not adopted for
+  agent lessons alone. C1 does not change this path, so its runs there are
+  recorded as a second baseline measurement, not as a bar.
 - The regression checks pass unless a candidate scores fewer passes than
   the baseline on a task and a failing run was offered a lesson with the
   changed-file warning; a miss without that warning is read as the task's own
   rate.
-- A candidate is merged only if it passes all three. If both do, C1 is
-  merged, as the smaller change. If neither does, both are parked, the result
+- A candidate is merged only if it passes every bar that applies to it. If
+  both do, the one with fewer stale runs on `memory-changed-obsolete` is
+  merged (which matters only if the baseline shows stale runs and the bar
+  rises above zero), and on a tie C1, as the smaller change. If neither does, both are parked, the result
   recorded, and main left as it is; any other wording or rule is a new
   predeclared test.
-- Leak and infrastructure runs are reported and not scored. A cell with fewer
-  than three scored runs gets further repeats under the same settings until
-  it has three, at most ten runs in all, before it is read.
+- Leak and infrastructure runs are reported and not scored. Any cell, of
+  any build and task alike, with fewer than three scored runs gets further
+  repeats under the same settings until it has three, at most ten runs per
+  cell. There are no sampling seeds to fix: further repeats are new runs
+  with the same model and settings, run as their own job after the first
+  five, and every run is recorded and reported, including the ones not
+  scored.
 
 ## Combined architecture and next increments
 
