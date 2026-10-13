@@ -217,7 +217,8 @@ fn saved_tool_default_only_changes_future_sessions() {
         let mut c = h.rusty();
         let mut child =
             c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        // rusty may exit before reading (the second run is meant to fail); that is fine.
+        let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
         wait(child, Duration::from_secs(10))
     };
     let out = repl(&["--tools", "local"], "/tools daytona\n/settings\n/exit\n");
