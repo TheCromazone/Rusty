@@ -278,6 +278,9 @@ pub struct Agent {
     pub meter: context::Meter,
     /// The last turn ended on a repetition or talk-only stall.
     last_turn_stalled: bool,
+    /// How the last goal run ended: done, blocked, turn_limit, stalled,
+    /// interrupted, paused or error. None when no goal ran.
+    pub goal_end: Option<&'static str>,
     project_notes: String,
     /// The workspace at startup (local lead only), see snapshot.rs.
     pub snapshot: String,
@@ -366,6 +369,7 @@ impl Agent {
             compactions: Vec::new(),
             tool_calls_run: 0,
             last_turn_stalled: false,
+            goal_end: None,
             project_notes,
             snapshot: String::new(),
             start_blobs: None,
@@ -1724,7 +1728,12 @@ impl Agent {
         if let Some(h) = &mut self.advisor {
             h.take_delivered();
         }
+        // How this run ends, not how an earlier goal in the process did.
+        self.goal_end = None;
         let result = self.drive_goal(objective);
+        if result.is_err() && self.goal.is_some() && self.goal_end.is_none() {
+            self.goal_end = Some("error");
+        }
         self.learn_from_goal(first);
         result
     }
@@ -1775,27 +1784,35 @@ impl Agent {
             self.save_session();
             stalls_in_a_row = if self.last_turn_stalled { stalls_in_a_row + 1 } else { 0 };
             if stalls_in_a_row == 3 {
-                anyhow::bail!("the goal stalled three turns in a row; task completion is unconfirmed");
+                // An unfinished goal, not an error: the harness contract
+                // gives it exit status 2, and the goal stays open.
+                eprintln!("{}", ui::warn("the goal stalled three turns in a row; task completion is unconfirmed"));
+                self.goal_end = Some("stalled");
+                return Ok(());
             }
             let Some(g) = &mut self.goal else { return Ok(()) };
             g.turns += 1;
             if !finished || signal::interrupted() {
+                self.goal_end = Some(if signal::interrupted() { "interrupted" } else { "paused" });
                 println!("{}", ui::warn("  goal paused. /goal resume to continue"));
                 return Ok(());
             }
             match &g.status {
                 GoalStatus::Done(ev) => {
                     println!("{} {}\n", ui::ok("◉ goal done"), ev);
+                    self.goal_end = Some("done");
                     return Ok(());
                 }
                 GoalStatus::Blocked(why) => {
                     println!("{} {}\n", ui::warn("◌ goal blocked"), why);
+                    self.goal_end = Some("blocked");
                     return Ok(());
                 }
                 GoalStatus::Active => {}
             }
             if g.turns >= max_turns {
                 println!("{}", ui::warn(&format!("  goal paused after {max_turns} turns. /goal resume to continue")));
+                self.goal_end = Some("turn_limit");
                 return Ok(());
             }
             let open = self.plan.iter().filter(|p| p.status != "done").count();
@@ -2282,6 +2299,7 @@ impl Agent {
             "messages": messages,
             "archived_messages": self.archived.len(),
             "goal": self.goal,
+            "goal_end": self.goal_end,
             "verification": self.verification_records,
             "claims": self.completion,
             "safety": self.safety,

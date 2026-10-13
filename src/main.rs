@@ -428,7 +428,8 @@ fn run() -> Result<i32> {
         result?;
         return Ok(if signal::interrupted() {
             130
-        } else if cli.verify.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
+        } else if agent.goal_end == Some("stalled")
+            || cli.verify.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
         {
             2
         } else {
@@ -446,7 +447,7 @@ fn run() -> Result<i32> {
 
 /// Bumped when a harness-facing flag, exit code or `--stats` key changes
 /// meaning (docs/VERIFICATION.md, "Harness contract").
-const CONTRACT: u32 = 1;
+const CONTRACT: u32 = 2;
 
 /// What this build accepts, so a harness can refuse an unsupported setting
 /// before any model call. Each list is filtered through the parser that
@@ -479,7 +480,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal", "context", "compactions"],
+        "stats": ["model_budget", "claims", "safety", "goal", "goal_end", "context", "compactions"],
     })
 }
 
@@ -499,6 +500,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "requests": t.requests, "prompt": t.prompt, "completion": t.completion,
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
+            "goal_end": agent.goal_end,
             "claims": agent.completion,
             "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
