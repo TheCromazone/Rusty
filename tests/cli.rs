@@ -1631,9 +1631,11 @@ fn unchanged_call_loop_stalls_the_turn_and_three_stalls_end_the_goal() {
             .spawn()
             .map(|c| wait(c, Duration::from_secs(20)))
             .unwrap();
-        assert!(!out.status.success(), "{mode} marked a stalled task successful");
+        // An unfinished goal: neither success nor an error.
+        assert_eq!(out.status.code(), Some(2), "{mode} must exit 2 for a stalled goal");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("stalled three turns in a row") && stderr.contains("\"goal\":\"open\""), "{stderr}");
+        assert!(stderr.contains("\"goal_end\":\"stalled\""), "{stderr}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
         assert_eq!(s.calls().lines().count(), 12, "each stall should stop later tools in its batch");
         assert!(!s.project.join("must-not-write.txt").exists());
@@ -2132,10 +2134,42 @@ fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
         .spawn()
         .map(|c| wait(c, Duration::from_secs(10)))
         .unwrap();
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stdout).contains("four consecutive identical"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("stalled three turns in a row"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
+#[test]
+fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error() {
+    // The M4 cohort's case: the work may be done, but the model never
+    // proposes completion and three turns stall. That is exit 2 with a
+    // trajectory, like any goal that did not close on a passing check.
+    let s = Sandbox::new("stall-under-verify");
+    let fake = bash_reply("printf same");
+    let batch = tool_batch(vec![fake.clone(), fake.clone(), fake.clone(), fake]);
+    let (url, server) = scripted_endpoint(vec![batch.clone(), batch.clone(), batch]);
+    let traj = s.project.join("trajectory.json");
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--yolo", "--memory", "off", "--goal", "inspect", "--verify", "true", "--stats"])
+        .arg("--trajectory")
+        .arg(&traj)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|c| wait(c, Duration::from_secs(10)))
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(!stderr.contains("error:"), "a stall is not an error: {stderr}");
+    assert!(stderr.contains("\"goal_end\":\"stalled\""), "{stderr}");
+    let t: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&traj).unwrap()).unwrap();
+    assert_eq!(t["goal_end"], "stalled");
+    assert_eq!(t["claims"]["proposed"], 0, "nothing was proposed, so nothing was checked");
     assert_eq!(server.join().unwrap().len(), 3);
 }
 
@@ -2439,6 +2473,7 @@ fn root_budget_settles_known_usage_and_verification_uses_no_model_request() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(requests.len(), 1);
     assert!(trace["goal"]["status"].get("Done").is_some());
+    assert_eq!(trace["goal_end"], "done");
     assert_eq!(trace["model_budget"]["charged_tokens"], 15);
     assert_eq!(trace["model_budget"]["known_tokens"], 15);
     assert_eq!(trace["model_budget"]["unknown_usage_requests"], 0);
@@ -2474,6 +2509,14 @@ fn root_budget_reviewer_and_swarm_cannot_get_independent_allowances() {
             assert_eq!(trace["model_budget"]["by_role"]["worker"], 1);
         }
         assert!(trace["goal"]["status"].get("Done").is_none());
+        if review {
+            // The budget ran out inside the goal: an error, and it says so.
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(trace["goal_end"], "error");
+        } else {
+            // Present and null: a missing key would mean an older build.
+            assert!(trace.get("goal_end").is_some_and(serde_json::Value::is_null), "no goal ran");
+        }
     }
 }
 
@@ -2694,6 +2737,30 @@ fn root_budget_failed_expensive_review_cannot_be_skipped_on_resume() {
     assert_eq!(trace["model_budget"]["halted"], true);
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert!(trace["goal"]["status"].get("Done").is_none());
+}
+
+#[test]
+fn goal_end_describes_the_last_goal_run_not_an_earlier_one() {
+    // One process, two goals: the first closes, the second hits the budget.
+    let s = Sandbox::new("goal-end-two-goals");
+    let (url, server) = scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"evidence":"checked"}))]);
+    let tracepath = s.project.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--memory", "off", "--max-requests", "1", "--trajectory"])
+        .arg(&tracepath)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"/goal first\n/goal second\n/exit\n").unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 1);
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tracepath).unwrap()).unwrap();
+    assert_eq!(trace["goal_end"], "error", "the second goal's end, not the first goal's done");
 }
 
 #[test]

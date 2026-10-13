@@ -603,6 +603,13 @@ impl Store {
              PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000; PRAGMA journal_size_limit=65536;
              PRAGMA wal_autocheckpoint=16; PRAGMA max_page_count=4096;",
         )?;
+        // In WAL mode, NORMAL syncs at checkpoints rather than on every
+        // commit: a power loss can drop the last committed lessons but never
+        // corrupts the store. Outside WAL it could, so it stays FULL there.
+        let journal: String = db.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if journal.eq_ignore_ascii_case("wal") {
+            db.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        }
         // Stores from before this schema are dropped, not migrated.
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != SCHEMA {
@@ -1520,6 +1527,16 @@ mod tests {
             assert!(ask(&mut e, "s3", Level::Learn, "fix tax rounding", &root_s).text.is_empty(), "{source}");
             std::fs::remove_dir_all(p).unwrap();
         }
+    }
+
+    #[test]
+    fn the_store_runs_in_wal_with_normal_sync() {
+        // NORMAL is only crash-safe in WAL mode; both must hold together.
+        let (e, p) = engine();
+        let journal: String = e.store.db.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let sync: i64 = e.store.db.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!((journal.as_str(), sync), ("wal", 1), "WAL with synchronous=NORMAL");
+        std::fs::remove_dir_all(p).unwrap();
     }
 
     #[test]
