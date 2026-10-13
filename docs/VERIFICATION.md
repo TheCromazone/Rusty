@@ -390,6 +390,23 @@ user) argues for keeping user instructions verbatim and says nothing about
 agent decisions; only a dropped decision the agent itself stated argues for
 `DECISION:` lines.
 
+**Outcome: parked, unbuilt.** In the predeclared runs at 1bffef1, 5 compactions
+in 2 of 10 runs all fell between the rule and its use and all kept it;
+`compact-focus` never compacted (5/5 refused as too small). The
+`compaction-rule` task also shows the rule in its working copy, so a drop
+could have been masked. No run tested an agent-stated decision. The question
+is open, not answered no: no loss was observed, which is not evidence
+against. Two `compaction-rule` runs failed when the model read `util.py` four
+times in a row and the repeat guard ended the turn; that is model behaviour,
+recorded with no change.
+
+If item 8 is reopened, the task to build is one where the agent states a
+decision mid-run that nothing in the working copy or the user's turns
+restates (for example, choosing between two equal designs and committing to
+one), a compaction is forced between the decision and the step that depends
+on it, and the check reads that dependent step. It is predeclared the same
+way.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
@@ -651,8 +668,10 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   `.env` being read, and a fresh `RUSTY_HOME` keeps saved settings, sessions
   and memory out of the run.
 - **Memory and delegation.** `--memory off` starts no memory daemon and reads
-  no lessons. `--agents off` runs one agent. Any other value is a different
-  experiment.
+  no lessons; builds after the reporting pin also offer no memory tools
+  (`remember`, `recall`, `forget`) with it, where the pin offered them and
+  each call answered "memory is off". `--agents off` runs one agent. Any
+  other value is a different experiment.
 - **Compaction.** Builds after the reporting pin accept `--compaction`
   (`aggressive`, `standard`, `passive` or `smart`; listed by
   `--capabilities`). It falls back to the saved setting, so a run on such a
