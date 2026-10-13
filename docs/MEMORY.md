@@ -212,6 +212,29 @@ seed it directly), that a delivered lesson helps on tasks other than these two,
 or that it holds beyond one model at five repeats. The lesson text was written
 with the task, not by the model under test.
 
+**Capture and delivery** (development evidence: nemotron-3-super, main
+1bffef1, isolated, 1800-second cap, October 2026). In `memory-only-fact`,
+session 1 reads the onboarding note and is asked to save how to run the
+suite; the reset deletes the note. At `learn`, session 1 saved the seed
+command in all ten runs. Whether session 2 got it depended only on the
+lesson's anchor. Each cell is pass / fail / timeout / leak:
+
+| | runs | lesson offered in session 2 | result |
+|---|---|---|---|
+| `learn`, lesson not anchored | 6 | 6, at the first request | 6 / 0 / 0 / 0 |
+| `learn`, lesson anchored to the note | 4 | 0 | 0 / 2 / 0 / 2 |
+| `off` | 5 | – | 0 / 3 / 1 / 1 |
+
+The memory-off runs predate the change that stopped offering memory tools
+with memory off, so each spent 5 to 16 calls on `remember` and `recall`
+that answered "memory is off". `memory-handoff` passed 5/5 at `learn`. So
+capture works, and a delivered lesson is used; what is lost is a lesson
+anchored to a file the next checkout no longer has. Keeping such a lesson
+with a "(gone)" warning delivered it, but the model then acted on the
+remembered value before checking it when the value had changed, which
+failed the predeclared harm bar; the change is parked (VERIFICATION,
+"Predeclared: a lesson whose anchor is gone").
+
 ## Bounded hot path and disk
 
 - Sessions: RAM only, at most 32, each with a 4 KiB request and the last four
