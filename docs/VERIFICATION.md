@@ -465,8 +465,9 @@ the warning, before the model re-hashed, found the rotated seed in
 though all four recovered. No `learn` session called `recall` in either build
 (the only recalls in these experiments were memory-off sessions offered the
 tools before #92), so the fallback cannot help, and the change is parked. On
-V1, `stale-anchor` passed 3/3 and `poisoned-lesson` 2/3, in line with its
-earlier rate at every level. A later variant, such as advice that says to
+V1, `stale-anchor` passed 3/3 and `poisoned-lesson` 2/3; that task passed
+about two in three at every level, memory off included, in the earlier
+matrix, so its miss is not attributed to V1. A later variant, such as advice that says to
 verify the value against the working copy first, would be a new predeclared
 test, not a reading of this one.
 
