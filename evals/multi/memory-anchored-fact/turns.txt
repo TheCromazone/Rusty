@@ -1,0 +1,4 @@
+## run "$(dirname "$RUSTY_BIN")/rusty-memoryd" remember --kind fact --source agent --file ONBOARDING.md "To run the test suite, set STATS_SEED=k7f3-quartz-1902 and run: python3 -m unittest discover -s tests"
+## run bash "$EVAL_DIR/reset.sh"
+## session
+Add median(xs) to stats.py (raise ValueError on an empty list) with a unit test in tests/, then run the whole suite the way this project expects.
