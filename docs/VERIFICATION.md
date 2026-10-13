@@ -471,6 +471,66 @@ matrix, so its miss is not attributed to V1. A later variant, such as advice tha
 verify the value against the working copy first, would be a new predeclared
 test, not a reading of this one.
 
+### Predeclared: a lesson whose anchored file changed (2026-10-13)
+
+The open item in MEMORY.md: a lesson the agent saved starts at confidence
+0.36, so at `learn` a changed anchor's freshness of 0.5 puts it under the
+threshold, and the `Changed since` warning only ever reaches a lesson the user
+saved. Two candidates, committed now (C1 43455d4, C2 ebc522d on 82342e4) and
+rebased onto the merged main before the runs, which changes their ids but not
+their diffs; the run logs record the ids:
+
+- C1: freshness ranks lessons but no longer decides whether one is offered.
+  A lesson whose anchored file changed is offered, with the existing warning
+  (`Changed since: ONBOARDING.md; re-check before relying on it.`), when
+  relevance × confidence clears the threshold. A missing file still hides it.
+- C2, C1 plus wording: the warning reads `Changed since: ONBOARDING.md; read
+  the current version first and follow it where it differs from this
+  lesson.` It changes the warning for user lessons too.
+
+Checked before any run, with the tasks' lesson and request against the
+advisor: the baseline offers nothing after either reset; C1 and C2 offer the
+lesson with their warning after both; all three offer it unchanged when the
+note is untouched, and none when it is gone.
+
+Runs, written before the first repeat:
+
+- `memory-changed-fact`: the harness seeds the seed command as an agent
+  lesson anchored to `ONBOARDING.md`; the reset rewrites the note without the
+  run command and keeps the seed, so session 2 passes only with the
+  remembered seed.
+- `memory-changed-obsolete`: the same lesson; the reset rotates the seed and
+  writes the current one into the rewritten note, so session 2 passes only
+  with the note's seed.
+- Baseline (main with these tasks), C1 and C2, `learn`, five repeats per
+  task, nemotron-3-super, `EVAL_ISOLATE=1`, `EVAL_TIMEOUT=1800`, one job per
+  key.
+- Regression checks on all three builds: `stale-anchor` and
+  `poisoned-lesson`, three repeats.
+
+Reading, decided now:
+
+- Stale use is counted as in the gone-anchor test: the old seed in any
+  command that runs the suite, or written into the deliverable, once per run.
+- The baseline offers nothing, so its stale count on
+  `memory-changed-obsolete` is expected to be 0 of 5, and a candidate must
+  match it: one stale run under a candidate is a fail, not a tie. If the
+  baseline shows stale runs, the bar is the baseline's count.
+- A candidate passes `memory-changed-fact` only if it scores more passes
+  than the baseline with the lesson offered (with its warning) and the seed
+  used.
+- The regression checks pass unless a candidate scores fewer passes than
+  the baseline on a task and a failing run was offered a lesson with the
+  changed-file warning; a miss without that warning is read as the task's own
+  rate.
+- A candidate is merged only if it passes all three. If both do, C1 is
+  merged, as the smaller change. If neither does, both are parked, the result
+  recorded, and main left as it is; any other wording or rule is a new
+  predeclared test.
+- Leak and infrastructure runs are reported and not scored. A cell with fewer
+  than three scored runs gets further repeats under the same settings until
+  it has three, at most ten runs in all, before it is read.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
