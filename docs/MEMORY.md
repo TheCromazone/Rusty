@@ -217,6 +217,12 @@ with the task, not by the model under test.
   SQLite has a 16 MiB page quota, a 512 KiB page cache, in-memory temporary
   tables and frequent WAL checkpoints. A store from an older schema is dropped
   and recreated, not migrated.
+- Durability: in WAL mode the store syncs to disk at checkpoints, not on every
+  commit (`synchronous=NORMAL`). A power loss or OS crash can drop the last
+  lessons saved before it, but never corrupts the store; a rusty or daemon
+  crash loses nothing. If WAL is unavailable the store syncs every commit.
+  Syncing every commit made an explicit save wait on the disk, and one slow
+  sync could overrun a management call's one-second budget.
 
 Socket, files and directories use 0600/0600/0700, and persistence refuses
 symlinks. One redactor covers hooks, saves, imports, session and trajectory
