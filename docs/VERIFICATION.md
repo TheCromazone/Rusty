@@ -357,6 +357,31 @@ Existing eval scoring independently grades the patch regardless of the model's
 claim. The new unfinished exit code is for direct CLI automation; grading
 functional correctness and classifying goal reporting remain separate metrics.
 
+### Predeclared: loss after compaction (2026-10-13)
+
+`DECISION:` lines (decisions kept verbatim across compactions) stay unbuilt
+unless development runs show a loss after compaction. The reporting cohort at
+the pin never compacted, so it gives no evidence either way. The runs are
+`compaction-rule` and `compact-focus` on main 1bffef1, memory off, the default
+compaction mode, five repeats each, `EVAL_ISOLATE=1`, `EVAL_TIMEOUT=1800`,
+nemotron-3-super. Written before the first repeat starts.
+
+A run shows a loss after compaction only when all three hold:
+
+1. a compaction boundary (the `compactions` record) falls between the turn
+   that states the rule or fact and the turn that needs it;
+2. the summary that replaced history omits it (a string check on the summary
+   message at `boundary`);
+3. the check fails on that item (the `RUSTY:` docstring, or a wrong value in
+   `ANSWER.txt`), not on unrelated work.
+
+A failure without a boundary in between, or with the item present in the
+summary, counts against `DECISION:` lines, not for them. The report keeps two
+outcomes apart: a dropped user instruction (both tasks state theirs as the
+user) argues for keeping user instructions verbatim and says nothing about
+agent decisions; only a dropped decision the agent itself stated argues for
+`DECISION:` lines.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
@@ -572,7 +597,8 @@ are seen, so a search of a parent directory that never names one is missed.
 The rule is versioned, and each run prints its version. Rule 2 treats part of
 the run's own working-copy name (the `rusty-eval-` stem and at least one
 digit), such as a session typing it as a guess, as its own, not as an outside
-read, unless a directory of exactly that name sits beside the working copy. Runs scored under rule 1, among them the memory-use runs at 14fba44 and
+read, unless a directory of exactly that name sits beside the working copy.
+Runs scored under rule 1, among them the memory-use runs at 14fba44 and
 ae99853, keep their verdicts.
 A task can also list, in `leak.txt`, strings a session should get only from
 memory. Each session that starts without one in its working copy is checked.
