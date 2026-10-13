@@ -1506,7 +1506,8 @@ mod tests {
     #[test]
     fn freshness_by_source_unchanged_changed_and_missing_anchors() {
         // A lesson the agent saved starts below one the user vouched for, so
-        // the 0.5 freshness of a changed file hides it at learn: an open item
+        // the 0.5 freshness of a changed file hides it from the request alone
+        // at learn; the session's errors can still raise it later
         // (docs/MEMORY.md). A missing file hides either. Both sources are
         // covered so a change to freshness has to say what it does to each.
         for (source, offered_when_changed) in [("user", true), ("agent", false)] {

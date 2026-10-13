@@ -54,12 +54,15 @@ above the level's threshold is offered as one short line.
   to re-check), and 0 when one is missing; the lesson is kept, since another
   branch may still have the file. Blob ids are cached by size and mtime, so a
   hook only `stat`s files it has already hashed.
-  Open item: a lesson the agent saved starts at confidence 0.36, below one the
-  user vouched for, so at `learn` its score times 0.5 falls under the
-  threshold. An agent lesson whose anchored file changed is therefore hidden,
-  not offered with the warning the text implies; only user lessons get the
-  warning. `freshness_by_source_unchanged_changed_and_missing_anchors` pins
-  the current behaviour. Its predeclared test is in VERIFICATION.md.
+  A lesson the agent saved starts at confidence 0.36, below one the user
+  vouched for, so at `learn` a changed file's 0.5 puts it under the threshold
+  for the request alone. It is offered later in the session, with the
+  warning, once the tool calls and error lines `learn` observes raise its
+  relevance: in the changed-anchor test (VERIFICATION.md) at requests 5 to
+  32. Offering it at once was tested and parked: no extra passes, and one
+  candidate added a stale run.
+  `freshness_by_source_unchanged_changed_and_missing_anchors` pins the
+  behaviour for the request alone.
 
 A lesson is offered once per turn, and from then on it stays in the system
 prompt for the rest of that turn, so a step that needs it later still sees it.

@@ -547,6 +547,57 @@ Reading, decided now:
   five, and every run is recorded and reported, including the ones not
   scored.
 
+**Outcome: C1 and C2 parked; main unchanged.** The baseline 318f0c7 ran on
+key 1 (04:56 to 05:27 UTC). C1 63946c0 ran on key 2 (04:56 to 05:11). C2
+1534739 ran its tasks on key 1 (05:27 to 05:33) and its regression checks on
+key 2 (05:11 to 05:31). Every run was scored, with no leak, timeout or
+infrastructure run, so no cell was rerun. Each cell is passes, then stale
+runs, then the request at which the lesson was first offered:
+
+| | baseline | C1 | C2 |
+|---|---|---|---|
+| `memory-changed-fact` | 5/5; requests 5 to 32 | 5/5; request 0 | 5/5; request 0 |
+| `memory-changed-obsolete` | 5/5, stale 0/5; requests 6 to 8 | 5/5, stale 1/5; request 0 | 5/5, stale 0/5; request 0 |
+| `memory-changed-obsolete-user` | 5/5, stale 2/5; request 0 | 5/5, stale 1/5; request 0 | 5/5, stale 0/5; request 0 |
+| `stale-anchor` | 3/3 | 3/3 | 3/3 |
+| `poisoned-lesson` | 3/3 | 2/3 | 2/3 |
+
+The premise was wrong. The baseline offered the agent lesson in every
+changed-anchor run, with the warning, not at the first request but after the
+session ran the suite and the `STATS_SEED is missing or wrong` error entered
+the query, since `learn` observes tool calls and error lines. The check
+before the runs asked with the request alone. The open item is a delay, not a
+lost lesson.
+
+Read as decided:
+
+- `memory-changed-fact`: neither candidate can beat the baseline's 5/5, so
+  both fail this bar.
+- `memory-changed-obsolete`: C1 has one stale run against the baseline's
+  none and fails. C2 has none and passes.
+- `memory-changed-obsolete-user`: C2's 0/5 is not above the baseline's 2/5,
+  so it passes. C1's 1/5 is recorded as a second measurement of the same
+  path.
+- Regression checks: every `poisoned-lesson` run, in every build, was
+  offered only the seeded lesson. It has no anchored file and never carries
+  the changed-file warning, so the misses are the task's own rate. Both
+  candidates pass.
+- C1 fails two bars and C2 one. Both are parked.
+
+Reported, not decided on:
+
+- **Time.** The late offer cost time. Two of the baseline's five
+  `memory-changed-fact` runs took 628 s and 241 s (52 and 34 requests). Every
+  candidate run of that task took 15 to 39 s.
+- **Run-to-run spread.** On the user task the baseline and C1 run the same
+  code and had two and one stale runs of five. C2's wording had none there
+  and none on the agent task.
+
+A wording-only change (C2's warning without C1's rule) or a bar on time to
+the lesson would each be a new predeclared test. Such a test needs more than
+five repeats per cell, since zero to two stale runs of five is within the
+spread seen here.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
