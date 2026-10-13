@@ -1728,7 +1728,12 @@ impl Agent {
         if let Some(h) = &mut self.advisor {
             h.take_delivered();
         }
+        // How this run ends, not how an earlier goal in the process did.
+        self.goal_end = None;
         let result = self.drive_goal(objective);
+        if result.is_err() && self.goal.is_some() && self.goal_end.is_none() {
+            self.goal_end = Some("error");
+        }
         self.learn_from_goal(first);
         result
     }

@@ -2740,6 +2740,30 @@ fn root_budget_failed_expensive_review_cannot_be_skipped_on_resume() {
 }
 
 #[test]
+fn goal_end_describes_the_last_goal_run_not_an_earlier_one() {
+    // One process, two goals: the first closes, the second hits the budget.
+    let s = Sandbox::new("goal-end-two-goals");
+    let (url, server) = scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"evidence":"checked"}))]);
+    let tracepath = s.project.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--memory", "off", "--max-requests", "1", "--trajectory"])
+        .arg(&tracepath)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"/goal first\n/goal second\n/exit\n").unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 1);
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(tracepath).unwrap()).unwrap();
+    assert_eq!(trace["goal_end"], "error", "the second goal's end, not the first goal's done");
+}
+
+#[test]
 fn a_rate_limited_attempt_does_not_spend_the_request_budget() {
     let s = Sandbox::new("budget-rate-limited");
     let (out, requests, trace) = budget_run(

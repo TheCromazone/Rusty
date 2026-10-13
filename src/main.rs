@@ -419,11 +419,6 @@ fn run() -> Result<i32> {
                 agent.run_turn(&input).map(|_| ())
             }
         };
-        // A goal that ended on an error (budget, provider, ...) says so, so
-        // `goal_end` is set whenever a goal ran.
-        if result.is_err() && agent.goal.is_some() && agent.goal_end.is_none() {
-            agent.goal_end = Some("error");
-        }
         agent.save_session();
         print_changes(&agent);
         if cli.stats {
