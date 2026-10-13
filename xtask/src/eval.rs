@@ -445,7 +445,7 @@ fn agent(
         }
     }
     // A binary that cannot start is a broken harness, not a failed agent run.
-    let mut child = cmd.spawn().with_context(|| format!("starting {}", cfg.bin.display()))?;
+    let mut child = spawn(&mut cmd).with_context(|| format!("starting {}", cfg.bin.display()))?;
     if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
         // A thread, so a child that stops reading can't stall the time limit.
         std::thread::spawn(move || pipe.write_all(text.as_bytes()));
@@ -1096,9 +1096,45 @@ pub fn stamp(t: SystemTime) -> String {
     format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// Starts `cmd`, waiting out a brief "text file busy": a binary just written
+/// can't be executed while any process holds it open for writing, and a fork
+/// on another thread inherits the writer's descriptor until it execs.
+fn spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            r => return r,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_binary_still_open_for_writing_starts_once_it_is_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir().unwrap();
+        let bin = root.join("agent");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A writer still holding the file is what a fork on another thread leaves behind.
+        let writer = OpenOptions::new().write(true).open(&bin).unwrap();
+        let busy = Command::new(&bin).spawn().unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::ExecutableFileBusy, "{busy}");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(writer);
+        });
+        assert!(spawn(&mut Command::new(&bin)).unwrap().wait().unwrap().success());
+        closer.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fixed_acceptance_uses_goal_mode_without_exposing_the_hidden_check() {
