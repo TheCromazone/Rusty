@@ -644,9 +644,10 @@ Reading, decided now:
   significance test: three of ten against one of ten is within chance, given
   the spread on identical code. A pass is recorded as a direction worth
   taking for a low-risk wording change, not as a measured effect.
-- Reported for every run of the three tasks, not decided on: the time and the
-  number of requests to the first suite run with the correct seed, so the
-  cost of reading the file first shows where the lesson was right.
+- Reported for every run of the three tasks, not decided on: the number of
+  requests to the first suite run with the correct seed, and the run's wall
+  time (the trajectory has no clock per step), so the cost of reading the
+  file first shows where the lesson was right.
 - Leak and infrastructure runs are reported and not scored. Any cell, of
   either build, with fewer than seven scored runs gets further repeats, run as
   their own job after the first ten, until it has seven, at most fifteen runs
