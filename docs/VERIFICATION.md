@@ -653,6 +653,53 @@ Reading, decided now:
   their own job after the first ten, until it has seven, at most fifteen runs
   per cell. Every run is recorded and reported.
 
+**Outcome: W parked; main unchanged.** The baseline 4bc026f (key 1, 06:29
+to 07:24 UTC) and W 63ac28d (key 2, 06:29 to 07:42) ran at the same time.
+One W run was a leak: `memory-changed-fact` rep 7 read its own session's
+`trajectory.json`, a harness record. It is reported and not scored. Every
+other run was scored, and no cell fell below seven scored runs. Each cell is
+passes of scored runs, stale runs, the median requests to the first suite
+run with the correct seed, and the median wall time:
+
+| | baseline | W |
+|---|---|---|
+| `memory-changed-obsolete-user` | 10/10, stale 5/10; 7; 29 s | 10/10, stale 1/10; 7; 25 s |
+| `memory-changed-obsolete` | 10/10, stale 0/10; 6; 26 s | 10/10, stale 0/10; 6.5; 23 s |
+| `memory-changed-fact` | 9/10; 7.5; 74 s | 7/9; 8; 101 s |
+| `stale-anchor` | 3/3 | 3/3 |
+| `poisoned-lesson` | 1/3 | 1/3 |
+
+Read as decided:
+
+- `memory-changed-obsolete-user`: the baseline has five stale runs, so
+  there is harm to remove, and W has one, four fewer. It passes, recorded as
+  a direction, not a measured effect.
+- `memory-changed-obsolete`: none in either build. W passes.
+- `memory-changed-fact`: W has seven passes against the baseline's nine,
+  so it fails.
+- Regression checks: equal passes on both tasks. W passes.
+- W fails one bar and is parked.
+
+Reported, not decided on:
+
+- **The `memory-changed-fact` misses did not come from the wording.** W's
+  two failed runs (reps 6 and 9) were never offered the lesson, so they never
+  saw the warning. On runs where the lesson was offered, both builds passed
+  every scored run (baseline 8/8, W 7/7). The gap is in whether the agent
+  lesson is offered late at all, which is the same code in both builds. The
+  bar counted passes, as decided, so it stands.
+- **Seed guard.** One baseline pass on `memory-changed-fact` (rep 1) came
+  from editing the seed guard (#101). It counts as recorded; without it W is
+  still below the baseline, seven to eight. No run of
+  `memory-changed-obsolete-user`, in either build, touched the guard.
+- **Cost.** Requests to the first correct suite run were within one of
+  each other on every task. Wall time on `memory-changed-fact` ranged from 23
+  to 908 s, driven by how late the lesson was offered, not by the build.
+
+Any later test of this wording would need a `memory-changed-fact` bar that
+counts only runs shown the warning, as the regression rule does. That would
+be a new predeclared test.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
