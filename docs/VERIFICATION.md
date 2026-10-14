@@ -598,6 +598,54 @@ the lesson would each be a new predeclared test. Such a test needs more than
 five repeats per cell, since zero to two stale runs of five is within the
 spread seen here.
 
+### Predeclared: the changed-file warning's wording (2026-10-14)
+
+The changed-anchor test above left one signal it did not decide on. With the
+current warning (`Changed since: ONBOARDING.md; re-check before relying on
+it.`), a lesson the user saved led to a stale suite run in three of ten
+runs of `memory-changed-obsolete-user`: two on the baseline, one on C1, which
+runs the same code there. With C2's wording there were none in ten across that
+task and `memory-changed-obsolete`. W (63ac28d on 4bc026f) is C2's wording
+alone: `Changed since: ONBOARDING.md; read the current version first and
+follow it where it differs from this lesson.` Which lessons are offered, and
+when, is unchanged.
+
+Checked before any run, against the advisor with the tasks' lesson and
+request: W and the baseline offer the same lessons for the request alone (the
+user lesson after either reset; the agent lesson after neither), and only the
+warning text differs.
+
+Runs, written before the first repeat:
+
+- Baseline (4bc026f) and W, `learn`, nemotron-3-super, `EVAL_ISOLATE=1`,
+  `EVAL_TIMEOUT=1800`, one job per key, the two builds at the same time.
+- Ten repeats each of `memory-changed-obsolete-user`,
+  `memory-changed-obsolete` and `memory-changed-fact`; three each of
+  `stale-anchor` and `poisoned-lesson`.
+
+Reading, decided now:
+
+- Stale use is counted as before: the old seed in any command that runs the
+  suite, or written into the deliverable, once per run.
+- `memory-changed-obsolete-user` decides. W must have at least two fewer
+  stale runs than the baseline, out of ten each, since zero to two of five
+  was the spread on identical code. If the baseline has fewer than two stale
+  runs, there is no harm here for a wording to remove, and W is parked.
+- `memory-changed-obsolete`: W must not have more stale runs than the
+  baseline.
+- `memory-changed-fact`: W must not have fewer passes than the baseline. The
+  file there no longer gives the seed, and a stronger warning must not talk
+  the model out of a lesson that still holds.
+- Regression checks: W fails only if it scores fewer passes than the
+  baseline on a task and a failing run was offered a lesson whose anchored
+  file had changed, the only lessons the wording reaches.
+- W is merged only if it passes all four; otherwise it is parked and main is
+  left as it is.
+- Leak and infrastructure runs are reported and not scored. Any cell, of
+  either build, with fewer than seven scored runs gets further repeats, run as
+  their own job after the first ten, until it has seven, at most fifteen runs
+  per cell. Every run is recorded and reported.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
