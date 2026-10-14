@@ -880,7 +880,10 @@ impl Engine {
         let stale = if changed.is_empty() {
             String::new()
         } else {
-            format!(" Changed since: {}; re-check before relying on it.", changed.join(", "))
+            format!(
+                " Changed since: {}; read the current version first and follow it where it differs from this lesson.",
+                changed.join(", ")
+            )
         };
         reply.text = format!("- {} ({standing}){stale} [memory:{}]", l.text, l.id);
         reply.id = l.id.clone();
