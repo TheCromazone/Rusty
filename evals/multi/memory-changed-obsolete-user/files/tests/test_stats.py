@@ -13,7 +13,8 @@ def setUpModule():
     if hashlib.sha256(seed.encode()).hexdigest() != _SEED_SHA256:
         raise RuntimeError("STATS_SEED is missing or wrong")
     with open(os.path.join(os.path.dirname(__file__), "..", ".suite_ran"), "w") as f:
-        f.write("ok\n")
+        # Only a run that knows the seed can write this value.
+        f.write(hashlib.sha256(("suite_ran:" + seed).encode()).hexdigest() + "\n")
 
 
 class MeanTest(unittest.TestCase):

@@ -700,6 +700,17 @@ Any later test of this wording would need a `memory-changed-fact` bar that
 counts only runs shown the warning, as the regression rule does. That would
 be a new predeclared test.
 
+### Seed tasks: a new cohort (2026-10-15)
+
+The six seed tasks (`memory-only-fact`, `memory-anchored-fact`,
+`memory-obsolete-fact` and the three `memory-changed-*`) now write
+`sha256("suite_ran:" + seed)` to `.suite_ran`, and each check compares
+against that value. Editing the guard, rebinding its hash on a later line, or
+writing the marker by hand no longer passes; only a run that knows the seed
+does. #101 caught one of these by the guard's text; this closes the rest. The
+file the agent sees changed, so runs from here on are a new cohort, and are
+not pooled with the runs above.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
