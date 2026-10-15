@@ -711,6 +711,55 @@ does. #101 caught one of these by the guard's text; this closes the rest. The
 file the agent sees changed, so runs from here on are a new cohort, and are
 not pooled with the runs above.
 
+### Predeclared: the changed-file wording, retested (2026-10-15)
+
+The wording test above parked W on its `memory-changed-fact` bar, which
+counted all passes. Both of W's misses there were runs never offered the
+lesson, so they never saw the wording; the bar could not tell a wording harm
+from late delivery, which is the same code in both builds: all-run passes
+were 9/10 against 7/9, while runs offered the lesson passed 8/8 and 7/7. This
+retest changes that bar, after seeing #102's data, which is a forking path, and it
+is stated as one. The deciding bar is unchanged, the runs are new, and
+#102's runs are not pooled with them.
+
+- Baseline e7f0a8f (main, with the seed-derived marker of the new cohort)
+  and W 27fe97b (the same wording change rebased on it), `learn`,
+  nemotron-3-super, `EVAL_ISOLATE=1`, `EVAL_TIMEOUT=1800`, one job per key,
+  the two builds at the same time.
+- Ten repeats each of `memory-changed-obsolete-user`,
+  `memory-changed-obsolete` and `memory-changed-fact`; three each of
+  `stale-anchor` and `poisoned-lesson`.
+
+Reading, decided now:
+
+- Stale use is counted as before.
+- `memory-changed-obsolete-user` decides, unchanged: W needs at least two
+  fewer stale runs of ten than the baseline, and is parked if the baseline
+  has fewer than two. A pass is a direction for a low-risk wording change,
+  not a measured effect.
+- `memory-changed-obsolete`: W has no more stale runs than the baseline.
+- `memory-changed-fact`: W's failures as a share of its offered, scored
+  runs are no higher than the baseline's. A share, not a count, since the two
+  builds can be offered the lesson a different number of times; at these
+  sizes it is still a threshold, not a test. All-run passes are reported, not
+  decided on.
+  A run was offered the lesson when, before its first suite run with the
+  correct seed (or at any point, if it has none), the lesson's id is in its
+  trajectory's `memory.offered` at that request or an earlier one, or a
+  `recall` result before it holds the lesson's text. This rule is applied to the trajectory as it
+  stands; no run is classed by hand.
+- That bar needs at least five offered, scored runs per build. A build with
+  fewer gets further repeats of that task, up to fifteen runs in the cell; if
+  either build still has fewer than five, the bar is undecided and W stays
+  parked.
+- Regression checks as in the wording test above.
+- W is merged only if it passes all four; otherwise it is parked and main is
+  left as it is.
+- Leak and infrastructure runs are reported and not scored. Any cell with
+  fewer than seven scored runs gets further repeats, for both builds alike,
+  up to fifteen per cell. Every run is reported, with requests to the first
+  correct suite run and wall time.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
