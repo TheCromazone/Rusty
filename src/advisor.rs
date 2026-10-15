@@ -880,7 +880,10 @@ impl Engine {
         let stale = if changed.is_empty() {
             String::new()
         } else {
-            format!(" Changed since: {}; re-check before relying on it.", changed.join(", "))
+            format!(
+                " Changed since: {}; read the current version first and follow it where it differs from this lesson.",
+                changed.join(", ")
+            )
         };
         reply.text = format!("- {} ({standing}){stale} [memory:{}]", l.text, l.id);
         reply.id = l.id.clone();
@@ -1494,7 +1497,10 @@ mod tests {
         assert!(!ask(&mut e, "s1", Level::Learn, "fix tax rounding", &root_s).text.contains("Changed since"));
         std::fs::write(root.join("src/tax.rs"), "changed\n").unwrap();
         let text = ask(&mut e, "s2", Level::Learn, "fix tax rounding", &root_s).text;
-        assert!(text.contains("Changed since: src/tax.rs"), "{text}");
+        // The wording was adopted under a predeclared test (docs/VERIFICATION.md);
+        // changing it is a new test, not an edit.
+        let warning = "Changed since: src/tax.rs; read the current version first and follow it where it differs from this lesson.";
+        assert!(text.contains(warning), "{text}");
         // Recall doesn't check files.
         assert!(!ask(&mut e, "s3", Level::Recall, "fix tax rounding", &root_s).text.contains("Changed since"));
         std::fs::remove_file(root.join("src/tax.rs")).unwrap();

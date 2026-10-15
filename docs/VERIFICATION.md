@@ -760,6 +760,41 @@ Reading, decided now:
   up to fifteen per cell. Every run is reported, with requests to the first
   correct suite run and wall time.
 
+**Outcome: W adopted.** The baseline e7f0a8f (key 1, 02:15 to 03:33 UTC)
+and W 27fe97b (key 2, 02:15 to 03:13) ran at the same time on the
+seed-marker cohort. One baseline run was a leak: `memory-changed-fact` rep 3
+read its own session home. It is reported and not scored. Every other run
+was scored, and no cell fell below seven scored runs. Each cell is passes of
+scored runs, stale runs, the median requests to the first correct suite run,
+and the median wall time:
+
+| | baseline | W |
+|---|---|---|
+| `memory-changed-obsolete-user` | 10/10, stale 5/10; 8.5; 28 s | 10/10, stale 1/10; 6; 24 s |
+| `memory-changed-obsolete` | 10/10, stale 0/10; 6; 22 s | 10/10, stale 0/10; 6; 22 s |
+| `memory-changed-fact` | 9/9, offered 9, failing 0; 24; 158 s | 10/10, offered 10, failing 0; 10.5; 104 s |
+| `stale-anchor` | 3/3 | 3/3 |
+| `poisoned-lesson` | 2/3 | 3/3 |
+
+Read as decided:
+
+- `memory-changed-obsolete-user`: the baseline has five stale runs, so there
+  is harm to remove, and W has one, four fewer. It passes, recorded as a
+  direction for a low-risk wording change, not a measured effect.
+- `memory-changed-obsolete`: none in either build. W passes.
+- `memory-changed-fact`: both builds clear the floor (nine and ten offered,
+  scored runs), and neither failed one, so W's failure share, nought, is no
+  higher than the baseline's. W passes.
+- Regression checks: W has no fewer passes on either task. W passes.
+- W passes all four and is merged.
+
+The six stale runs, five on the baseline and one on W, each ran the suite with
+the remembered seed before the rotated one. The deciding task's result
+matches #102's (five of ten against one of ten), though those runs are not
+pooled. The requests and wall time for `memory-changed-fact` vary widely with
+how late the lesson is offered, as before, and are not read as an effect of
+the wording.
+
 ## Combined architecture and next increments
 
 [Agentless](https://arxiv.org/abs/2407.01489) motivates explicit localization,
