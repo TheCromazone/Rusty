@@ -716,8 +716,9 @@ not pooled with the runs above.
 The wording test above parked W on its `memory-changed-fact` bar, which
 counted all passes. Both of W's misses there were runs never offered the
 lesson, so they never saw the wording; the bar could not tell a wording harm
-from late delivery, which is the same code in both builds. This retest
-changes that bar, after seeing #102's data, which is a forking path, and it
+from late delivery, which is the same code in both builds: all-run passes
+were 9/10 against 7/9, while runs offered the lesson passed 8/8 and 7/7. This
+retest changes that bar, after seeing #102's data, which is a forking path, and it
 is stated as one. The deciding bar is unchanged, the runs are new, and
 #102's runs are not pooled with them.
 
@@ -737,9 +738,17 @@ Reading, decided now:
   has fewer than two. A pass is a direction for a low-risk wording change,
   not a measured effect.
 - `memory-changed-obsolete`: W has no more stale runs than the baseline.
-- `memory-changed-fact`: among scored runs offered the lesson (its id in the
-  trajectory's `memory.offered`, so shown the warning), W has no more
+- `memory-changed-fact`: among scored runs offered the lesson, W has no more
   failures than the baseline. All-run passes are reported, not decided on.
+  A run was offered the lesson when, before its first suite run with the
+  correct seed (or at any point, if it has none), the lesson's id is in its
+  trajectory's `memory.offered` at an earlier request, or a `recall` result
+  holds the lesson's text. This rule is applied to the trajectory as it
+  stands; no run is classed by hand.
+- That bar needs at least five offered, scored runs per build. A build with
+  fewer gets further repeats of that task, up to fifteen runs in the cell; if
+  either build still has fewer than five, the bar is undecided and W stays
+  parked.
 - Regression checks as in the wording test above.
 - W is merged only if it passes all four; otherwise it is parked and main is
   left as it is.
