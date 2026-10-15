@@ -742,8 +742,8 @@ Reading, decided now:
   failures than the baseline. All-run passes are reported, not decided on.
   A run was offered the lesson when, before its first suite run with the
   correct seed (or at any point, if it has none), the lesson's id is in its
-  trajectory's `memory.offered` at an earlier request, or a `recall` result
-  holds the lesson's text. This rule is applied to the trajectory as it
+  trajectory's `memory.offered` at that request or an earlier one, or a
+  `recall` result before it holds the lesson's text. This rule is applied to the trajectory as it
   stands; no run is classed by hand.
 - That bar needs at least five offered, scored runs per build. A build with
   fewer gets further repeats of that task, up to fifteen runs in the cell; if
