@@ -738,8 +738,11 @@ Reading, decided now:
   has fewer than two. A pass is a direction for a low-risk wording change,
   not a measured effect.
 - `memory-changed-obsolete`: W has no more stale runs than the baseline.
-- `memory-changed-fact`: among scored runs offered the lesson, W has no more
-  failures than the baseline. All-run passes are reported, not decided on.
+- `memory-changed-fact`: W's failures as a share of its offered, scored
+  runs are no higher than the baseline's. A share, not a count, since the two
+  builds can be offered the lesson a different number of times; at these
+  sizes it is still a threshold, not a test. All-run passes are reported, not
+  decided on.
   A run was offered the lesson when, before its first suite run with the
   correct seed (or at any point, if it has none), the lesson's id is in its
   trajectory's `memory.offered` at that request or an earlier one, or a
