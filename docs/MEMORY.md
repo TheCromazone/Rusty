@@ -50,8 +50,9 @@ above the level's threshold is offered as one short line.
   shown never changes it. A lesson the agent saved starts at 0.36, reaches
   0.55 after one verified success and drops to 0.21 after one failure.
 - **Freshness** is 1 when every anchored file still has the git blob id it had
-  when the lesson was saved, 0.5 when one changed (the advice then says which
-  to re-check), and 0 when one is missing; the lesson is kept, since another
+  when the lesson was saved, 0.5 when one changed (the advice then names it
+  and says to read its current version first and follow it where it
+  differs), and 0 when one is missing; the lesson is kept, since another
   branch may still have the file. Blob ids are cached by size and mtime, so a
   hook only `stat`s files it has already hashed.
   A lesson the agent saved starts at confidence 0.36, below one the user
