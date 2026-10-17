@@ -656,14 +656,22 @@ pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
 /// The memory part of the "compacted" line: `offered` lessons the summary
 /// proposed, `saved` the ones the service confirmed, `kept` whether the memory
 /// level keeps compaction lessons at all.
-pub fn memory_note(offered: usize, saved: usize, kept: bool) -> String {
+pub fn memory_note(offered: usize, saved: usize, known: usize, kept: bool) -> String {
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
+    let mut note = String::new();
     if saved > 0 {
-        format!(", {saved} memories saved")
-    } else if offered > 0 && !kept {
-        format!(", {offered} lessons offered, memory level keeps none")
-    } else {
-        String::new()
+        note.push_str(&format!(", {saved} {} saved", plural(saved, "memory", "memories")));
     }
+    if known > 0 {
+        note.push_str(&format!(", {known} already known"));
+    }
+    if note.is_empty() && offered > 0 && !kept {
+        note.push_str(&format!(
+            ", {offered} {} offered, memory level keeps none",
+            plural(offered, "lesson", "lessons")
+        ));
+    }
+    note
 }
 
 #[cfg(test)]
@@ -672,13 +680,18 @@ mod tests {
 
     #[test]
     fn the_compacted_line_counts_only_memories_the_service_kept() {
-        assert_eq!(memory_note(0, 0, true), "");
-        assert_eq!(memory_note(3, 3, true), ", 3 memories saved");
-        // One of three refused (duplicate, forgotten, bad kind): report two.
-        assert_eq!(memory_note(3, 2, true), ", 2 memories saved");
+        assert_eq!(memory_note(0, 0, 0, true), "");
+        assert_eq!(memory_note(3, 3, 0, true), ", 3 memories saved");
+        assert_eq!(memory_note(1, 1, 0, true), ", 1 memory saved");
+        // One of three refused (forgotten, bad kind): report two.
+        assert_eq!(memory_note(3, 2, 0, true), ", 2 memories saved");
+        // A near-duplicate only refreshed an existing lesson: not a new row.
+        assert_eq!(memory_note(2, 1, 1, true), ", 1 memory saved, 1 already known");
+        assert_eq!(memory_note(1, 0, 1, true), ", 1 already known");
         // Proposed at a level that keeps none: say so instead of claiming a save.
-        assert_eq!(memory_note(3, 0, false), ", 3 lessons offered, memory level keeps none");
-        assert_eq!(memory_note(3, 0, true), "");
+        assert_eq!(memory_note(3, 0, 0, false), ", 3 lessons offered, memory level keeps none");
+        assert_eq!(memory_note(1, 0, 0, false), ", 1 lesson offered, memory level keeps none");
+        assert_eq!(memory_note(3, 0, 0, true), "");
     }
 
     fn usage(prompt: u64) -> crate::llm::Usage {

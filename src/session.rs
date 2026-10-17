@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INDEX: &str = "index.sqlite";
 const INDEX_LOCK: &str = "index.lock";
@@ -241,7 +242,6 @@ fn fresh_connection(dir: &Path) -> Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_ns DESC, id DESC);
          CREATE VIRTUAL TABLE IF NOT EXISTS session_terms USING fts5(id UNINDEXED, terms, tokenize='unicode61');
-         CREATE TABLE IF NOT EXISTS session_index_meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
          PRAGMA user_version=2;",
     )?;
     db.prepare("SELECT id,title,started,updated,updated_ns,messages,text,terms FROM sessions LIMIT 0")?;
@@ -249,17 +249,21 @@ fn fresh_connection(dir: &Path) -> Result<Connection> {
     Ok(db)
 }
 
-fn index_ready(dir: &Path) -> Result<SessionIndex> {
+fn index_ready(dir: &Path, discover_unindexed: bool) -> Result<SessionIndex> {
     rusty::privacy::private_dir(dir)?;
     let lease = IndexLease::acquire(dir)?;
+    let mut backfill_needed = discover_unindexed || !dir.join(INDEX).exists();
     let mut db = match fresh_connection(dir) {
         Ok(db) => db,
         Err(first) => {
             remove_index_files(dir);
+            backfill_needed = true;
             fresh_connection(dir).with_context(|| format!("rebuilding session index after: {first}"))?
         }
     };
-    backfill(&mut db, dir)?;
+    if backfill_needed {
+        backfill(&mut db, dir)?;
+    }
     recover_pending(&mut db, dir)?;
     Ok(SessionIndex { _lease: lease, db })
 }
@@ -276,7 +280,7 @@ fn corruption(error: &anyhow::Error) -> bool {
 }
 
 fn with_index<T>(dir: &Path, mut operation: impl FnMut(&mut Connection) -> Result<T>) -> Result<T> {
-    let mut index = index_ready(dir)?;
+    let mut index = index_ready(dir, true)?;
     match operation(&mut index.db) {
         Ok(value) => Ok(value),
         Err(first) if corruption(&first) => {
@@ -346,20 +350,21 @@ fn recover_pending(db: &mut Connection, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Indexes the session files the catalog has no row for: written before it
+/// existed, by an older rusty, or copied in. Files it knows are not read, so
+/// on most opens this costs one directory listing.
 fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
-    let done: bool = db
-        .query_row("SELECT value FROM session_index_meta WHERE key='backfill'", [], |row| row.get::<_, i64>(0))
-        .optional()?
-        .is_some_and(|value| value == 1);
-    if done {
-        return Ok(());
-    }
-    db.execute_batch("CREATE TABLE IF NOT EXISTS session_index_meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);")?;
+    let known: std::collections::HashSet<String> =
+        db.prepare("SELECT id FROM sessions")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
     let mut rows = Vec::new();
     if let Ok(files) = std::fs::read_dir(dir) {
         for path in files.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !name.ends_with(".json") || name.ends_with(".trace.json") || name.ends_with(".changes.json") {
+                continue;
+            }
+            let id = id_of(&path);
+            if id.is_empty() || id == "index" || known.contains(&id) {
                 continue;
             }
             let Ok(value) = std::fs::read_to_string(&path)
@@ -373,11 +378,8 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
             if !value["side"].is_null() {
                 continue;
             }
-            let Some(history) = value["history"].as_array() else { continue };
-            let id = id_of(&path);
-            if id.is_empty() || id == "index" {
-                continue;
-            }
+            // A session nothing was said in yet (one just reserved) has no row.
+            let Some(history) = value["history"].as_array().filter(|history| !history.is_empty()) else { continue };
             let updated_ns = path
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -394,11 +396,13 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
             ));
         }
     }
+    if rows.is_empty() {
+        return Ok(());
+    }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (entry, updated_ns, text) in rows {
         upsert(&tx, &entry, updated_ns, &text)?;
     }
-    tx.execute("INSERT OR REPLACE INTO session_index_meta(key,value) VALUES('backfill',1)", [])?;
     tx.commit()?;
     Ok(())
 }
@@ -431,7 +435,10 @@ pub fn record(
         .unwrap_or_default()
         .as_nanos()
         .min(u64::MAX as u128) as u64;
-    let mut index = index_ready(dir)?;
+    // A normal save already has a durable pending marker, so this transaction
+    // can update its row directly. Discover copied-in legacy files lazily when
+    // the user browses or resumes the catalog, not on every incremental save.
+    let mut index = index_ready(dir, false)?;
     let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let last_updated_ns: i64 = tx
         .query_row("SELECT updated_ns FROM sessions ORDER BY updated_ns DESC LIMIT 1", [], |row| row.get(0))
@@ -446,10 +453,14 @@ pub fn record(
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .optional()?;
+    // The title is the session's first ask. A compacted or resumed history
+    // no longer starts with it, so the first title recorded stays.
     let (started, title, text) = match previous {
-        Some((started, old_title, old_text)) => {
-            (started, if title.is_empty() { old_title } else { title }, if text.is_empty() { old_text } else { text })
-        }
+        Some((started, old_title, old_text)) => (
+            started,
+            if old_title.is_empty() { title } else { old_title },
+            if text.is_empty() { old_text } else { text },
+        ),
         None => (now, title, text),
     };
     let entry = Entry { id, title, started, updated: now, messages: archived.len() + history.len() };
@@ -465,7 +476,8 @@ fn row_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
 pub fn list(dir: &Path) -> Result<Vec<Entry>> {
     with_index(dir, |db| {
         let mut query = db.prepare(
-            "SELECT id,title,started,updated,messages FROM sessions ORDER BY updated_ns DESC,id DESC LIMIT ?1",
+            "SELECT id,title,started,updated,messages FROM sessions WHERE messages>0
+             ORDER BY updated_ns DESC,id DESC LIMIT ?1",
         )?;
         let rows = query.query_map([MAX_LIST], row_entry)?;
         let entries = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -476,7 +488,8 @@ pub fn list(dir: &Path) -> Result<Vec<Entry>> {
 pub fn latest(dir: &Path) -> Result<Option<Entry>> {
     with_index(dir, |db| {
         let mut query = db.prepare(
-            "SELECT id,title,started,updated,messages FROM sessions ORDER BY updated_ns DESC,id DESC LIMIT ?1",
+            "SELECT id,title,started,updated,messages FROM sessions WHERE messages>0
+             ORDER BY updated_ns DESC,id DESC LIMIT ?1",
         )?;
         let rows = query.query_map([MAX_LIST], row_entry)?;
         Ok(rows
@@ -486,23 +499,26 @@ pub fn latest(dir: &Path) -> Result<Option<Entry>> {
     })
 }
 
-pub fn find(dir: &Path, key: &str) -> Result<Option<Entry>> {
+/// The session with this id, else the sessions whose id starts with it:
+/// one is a match, more is ambiguous, none is not found.
+pub fn find(dir: &Path, key: &str) -> Result<Vec<Entry>> {
     if key.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     with_index(dir, |db| {
         let exact: Option<Entry> = db
             .query_row("SELECT id,title,started,updated,messages FROM sessions WHERE id=?1", [key], row_entry)
             .optional()?;
-        if exact.is_some() {
-            return Ok(exact);
+        if let Some(entry) = exact {
+            return Ok(vec![entry]);
         }
         let upper = format!("{key}\u{10ffff}");
         let mut stmt = db.prepare(
-            "SELECT id,title,started,updated,messages FROM sessions WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2",
+            "SELECT id,title,started,updated,messages FROM sessions WHERE id>=?1 AND id<?2 ORDER BY id LIMIT ?3",
         )?;
-        let hits = stmt.query_map(params![key, upper], row_entry)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((hits.len() == 1).then(|| hits[0].clone()).filter(|entry| dir.join(format!("{}.json", entry.id)).is_file()))
+        let hits = stmt.query_map(params![key, upper, MAX_MATCHES], row_entry)?;
+        let hits = hits.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(hits.into_iter().filter(|entry| dir.join(format!("{}.json", entry.id)).is_file()).collect())
     })
 }
 
@@ -526,19 +542,47 @@ pub fn search(dir: &Path, query: &str) -> Result<Vec<Entry>> {
 }
 
 pub fn render(entries: &[Entry], now: u64) -> String {
+    render_at(entries, now, crate::ui::width())
+}
+
+/// `text` cut to `room` columns, ending in "…" when something was cut.
+fn fit(text: &str, room: usize) -> String {
+    if UnicodeWidthStr::width(text) <= room {
+        return text.to_string();
+    }
+    let ellipsis_width = UnicodeWidthChar::width('…').unwrap_or(1);
+    let prefix_room = room.saturating_sub(ellipsis_width);
+    let mut used = 0;
+    let mut kept = String::new();
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > prefix_room {
+            break;
+        }
+        kept.push(ch);
+        used += ch_width;
+    }
+    if room < ellipsis_width {
+        return kept.trim_end().to_owned();
+    }
+    format!("{}…", kept.trim_end())
+}
+
+/// Each session in two lines that fit `width` columns: its id (a prefix
+/// still finds it when the id is cut), then age, size and title.
+fn render_at(entries: &[Entry], now: u64, width: usize) -> String {
     if entries.is_empty() {
         return format!("  {}\n", crate::ui::dim("no sessions here yet"));
     }
-    let room = crate::ui::width().saturating_sub(20).max(10);
     let mut output = String::new();
     for entry in entries {
         let title = if entry.title.is_empty() { "(untitled)" } else { &entry.title };
+        let detail = format!("    {:>4}  {:>4} msgs  ", age(entry.updated, now), entry.messages);
+        let room = width.saturating_sub(UnicodeWidthStr::width(detail.as_str()));
         output.push_str(&format!(
-            "  {}\n    {:>4}  {:>4} msgs  {}\n",
-            crate::ui::info(&entry.id),
-            age(entry.updated, now),
-            entry.messages,
-            crate::ui::truncate(title, room)
+            "  {}\n{detail}{}\n",
+            crate::ui::info(&fit(&entry.id, width.saturating_sub(2))),
+            fit(title, room)
         ));
     }
     output
@@ -631,7 +675,7 @@ mod tests {
         }
         let first = list(&dir).unwrap();
         assert_eq!(first.len(), 6);
-        drop(index_ready(&dir).unwrap());
+        drop(index_ready(&dir, true).unwrap());
         assert_eq!(list(&dir).unwrap().len(), 6);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -660,6 +704,47 @@ mod tests {
         std::fs::write(dir.join(INDEX), b"not a sqlite database").unwrap();
         assert_eq!(search(&dir, "amber").unwrap().len(), 1);
         assert!(search(&dir, "turquoise").unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_session_file_that_appears_after_the_index_is_picked_up() {
+        let dir = temp_dir("late-file");
+        assert!(list(&dir).unwrap().is_empty());
+        let late = dir.join("1700000001-42.json");
+        let history = serde_json::json!({"history":[{"role":"user","content":"fix the websocket reconnect"}]});
+        rusty::privacy::write_json(&late, history).unwrap();
+        rusty::privacy::write_json(&dir.join("reserved.json"), serde_json::json!({})).unwrap();
+        let all = list(&dir).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!((all[0].id.as_str(), all[0].title.as_str()), ("1700000001-42", "fix the websocket reconnect"));
+        assert_eq!(search(&dir, "websocket").unwrap().len(), 1);
+        assert_eq!(find(&dir, "1700000001").unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ordinary_session_saves_do_not_backfill_the_catalog() {
+        let dir = temp_dir("incremental-save");
+        assert!(list(&dir).unwrap().is_empty()); // Initialize an empty catalog.
+        let late = dir.join("1700000001-42.json");
+        rusty::privacy::write_json(
+            &late,
+            serde_json::json!({"history":[{"role":"user","content":"imported websocket reconnect"}]}),
+        )
+        .unwrap();
+
+        let current = create(&dir).unwrap();
+        let history = vec![serde_json::json!({"role":"user","content":"current session ask"})];
+        publish_and_record(&dir, &current, serde_json::json!({"history":history}), &history, &[]).unwrap();
+        let index = Connection::open(dir.join(INDEX)).unwrap();
+        let imported: i64 =
+            index.query_row("SELECT count(*) FROM sessions WHERE id='1700000001-42'", [], |row| row.get(0)).unwrap();
+        assert_eq!(imported, 0, "a routine save updates its own row without scanning unrelated files");
+
+        let found = search(&dir, "websocket").unwrap();
+        assert_eq!(found.len(), 1, "catalog reads still discover copied-in legacy files");
+        assert_eq!(found[0].id, "1700000001-42");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -693,15 +778,14 @@ mod tests {
     fn pending_marker_recovers_publish_window_without_directory_backfill() {
         let dir = temp_dir("pending-recovery");
         // Mark the already-published transcript as if the process crashed
-        // before its SQLite transaction. Normal index backfill is complete,
-        // so recovery must use the marker rather than scan all JSON files.
+        // before its SQLite transaction; the marker goes once it is indexed.
         let old = dir.join("old.json");
         rusty::privacy::write_json(
             &old,
             serde_json::json!({"history":[{"role":"user","content":"old marker phrase"}]}),
         )
         .unwrap();
-        drop(index_ready(&dir).unwrap());
+        drop(index_ready(&dir, true).unwrap());
 
         let transcript = create(&dir).unwrap();
         let id = id_of(&transcript);
@@ -784,7 +868,7 @@ mod tests {
     #[test]
     fn recovery_keeps_old_file_mtime_below_newer_indexed_session() {
         let dir = temp_dir("recovery-order");
-        drop(index_ready(&dir).unwrap()); // Mark initial backfill complete.
+        drop(index_ready(&dir, true).unwrap());
         let older = dir.join("older-pending.json");
         rusty::privacy::write_json(
             &older,
@@ -806,7 +890,7 @@ mod tests {
         let newer_ns = mtime_ns(&newer);
         assert!(older_ns < newer_ns);
 
-        let mut index = index_ready(&dir).unwrap();
+        let mut index = index_ready(&dir, true).unwrap();
         let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         let entry = Entry {
             id: id_of(&newer),
@@ -823,12 +907,26 @@ mod tests {
 
         let newest = latest(&dir).unwrap().unwrap();
         assert_eq!(newest.id, id_of(&newer));
-        let index = index_ready(&dir).unwrap();
+        let index = index_ready(&dir, true).unwrap();
         let older_indexed_ns: u64 = index
             .db
             .query_row("SELECT updated_ns FROM sessions WHERE id='older-pending'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(older_indexed_ns, older_ns, "recovery preserves the transcript's actual mtime");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_title_stays_when_the_history_no_longer_starts_with_it() {
+        let dir = temp_dir("title-kept");
+        let path = create(&dir).unwrap();
+        let ask = |text: &str| serde_json::json!({"role":"user","content":text});
+        let first = vec![ask("fix the zebra bug"), serde_json::json!({"role":"assistant","content":"ok"})];
+        record(&dir, &path, &first, &[]).unwrap();
+        // Resumed after a compaction: the history now opens with a later ask.
+        record(&dir, &path, &[ask("and the yak?")], &[]).unwrap();
+        let entry = find(&dir, &id_of(&path)).unwrap().remove(0);
+        assert_eq!((entry.title.as_str(), entry.messages), ("fix the zebra bug", 1));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -841,15 +939,35 @@ mod tests {
             started: 90,
             messages: 12,
         };
-        let rendered = render(&[entry], 120);
+        let rendered = render(std::slice::from_ref(&entry), 120);
         assert!(rendered.starts_with("  0123456789abcdef0123456789abcdef\n"));
         assert!(rendered.contains("    now    12 msgs  A useful session\n"));
+        let long = Entry { title: "fix the second flaky test in the parser module today".into(), ..entry };
+        for width in [30, 40, 80] {
+            let rendered = render_at(std::slice::from_ref(&long), 120, width);
+            for line in rendered.lines() {
+                assert!(UnicodeWidthStr::width(line) <= width, "{width}: {line:?}");
+            }
+            assert_eq!(rendered.contains('…'), width < 72, "{width}: {rendered}");
+        }
+        assert!(render_at(std::slice::from_ref(&long), 120, 30).starts_with("  0123456789abcdef0123456789a…\n"));
+
+        for title in ["界界界界界界界界界界", "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"] {
+            let entry = Entry { title: title.into(), ..long.clone() };
+            let rendered = render_at(std::slice::from_ref(&entry), 120, 30);
+            for line in rendered.lines() {
+                assert!(UnicodeWidthStr::width(line) <= 30, "30: {line:?}");
+            }
+            assert!(rendered.contains('…'), "{rendered}");
+        }
+        assert_eq!(fit("界界界", 4), "界…");
+        assert_eq!(fit("e\u{301}xyz", 3), "e\u{301}x…");
     }
 
     #[test]
     fn large_catalog_search_uses_fts_and_caps_results() {
         let dir = temp_dir("large");
-        let mut index = index_ready(&dir).unwrap();
+        let mut index = index_ready(&dir, true).unwrap();
         let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         for n in 0..5_000 {
             let id = format!("s{n:05}");
@@ -869,7 +987,7 @@ mod tests {
         assert!(search(&dir, "catalog").unwrap().len() <= MAX_MATCHES);
         assert_eq!(list(&dir).unwrap().len(), MAX_LIST);
 
-        let index = index_ready(&dir).unwrap();
+        let index = index_ready(&dir, true).unwrap();
         let plan: String = index
             .db
             .query_row(
@@ -885,7 +1003,7 @@ mod tests {
     #[test]
     fn newest_session_uses_subsecond_update_order() {
         let dir = temp_dir("same-second");
-        let mut index = index_ready(&dir).unwrap();
+        let mut index = index_ready(&dir, true).unwrap();
         let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         for (id, updated_ns) in [("older", 1_800_000_000_100_000_000), ("newer", 1_800_000_000_900_000_000)] {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
@@ -898,6 +1016,44 @@ mod tests {
         let newest = latest(&dir).unwrap().unwrap();
         assert_eq!(newest.id, "newer");
         assert_eq!(newest.updated, 1_800_000_000);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_shared_id_prefix_finds_every_session_that_has_it() {
+        let dir = temp_dir("prefix");
+        let mut index = index_ready(&dir, true).unwrap();
+        let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        for (n, id) in ["aa11", "aa22", "bb33"].into_iter().enumerate() {
+            rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
+            let entry = Entry { id: id.into(), title: id.into(), started: 1, updated: 1, messages: 2 };
+            upsert(&tx, &entry, n as u64, id).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(index);
+        let ids = |key: &str| find(&dir, key).unwrap().into_iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids("aa"), ["aa11", "aa22"]);
+        assert_eq!(ids("aa2"), ["aa22"]);
+        assert_eq!(ids("bb33"), ["bb33"]);
+        assert!(ids("cc").is_empty() && ids("").is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_session_is_never_listed_or_latest() {
+        let dir = temp_dir("empty-latest");
+        let mut index = index_ready(&dir, true).unwrap();
+        let tx = index.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        // An older build indexed a REPL opened and closed without a turn.
+        for (id, messages, ns) in [("spoken", 2, 1_000), ("silent", 0, 2_000)] {
+            rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
+            let entry = Entry { id: id.into(), title: String::new(), started: 1, updated: 1, messages };
+            upsert(&tx, &entry, ns, "").unwrap();
+        }
+        tx.commit().unwrap();
+        drop(index);
+        assert_eq!(latest(&dir).unwrap().unwrap().id, "spoken");
+        assert_eq!(list(&dir).unwrap().iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["spoken"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

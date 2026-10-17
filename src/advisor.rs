@@ -35,8 +35,8 @@ const GLOBAL: &str = "global";
 /// BM25 becomes a 0-1 relevance as s / (s + 2): one shared everyday term
 /// gives 0.33, three give 0.6, one rare term more.
 const RELEVANCE_HALF: f64 = 2.0;
-/// Two lessons of one kind whose terms overlap this much are one lesson.
-const DUPLICATE: f64 = 0.8;
+/// Two lessons of one kind sharing this much of the shorter one's terms are one lesson.
+const DUPLICATE: f64 = 0.7;
 
 /// How much memory does. Each level includes the ones before it; higher
 /// levels capture more, offer lessons more readily and prune harder.
@@ -248,6 +248,9 @@ pub struct Response {
 
 /// How a successful `remember` reply starts; anything else is a refusal.
 pub const SAVED_PREFIX: &str = "saved memory ";
+/// What `remember` answers when a near-duplicate was already on file and
+/// only its anchors were refreshed.
+pub const KNOWN_PREFIX: &str = "already saved ";
 pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
     // Hooks still return after HOOK_MS. Explicit management may flush SQLite
@@ -606,9 +609,45 @@ fn query(board: &Board, observe: bool) -> HashSet<String> {
 }
 
 /// Jaccard similarity of two lessons' term sets.
+/// How much of the shorter lesson's wording the other one shares. Measured
+/// against the smaller set rather than the union: two short facts that
+/// differ by one word ("the repository's test command is …" against "the
+/// project's test command is …") are the same lesson, and a Jaccard score
+/// would put them under the duplicate line.
 fn overlap(a: &str, b: &str) -> f64 {
-    let (a, b) = (crate::recall::query(a), crate::recall::query(b));
-    a.intersection(&b).count() as f64 / a.union(&b).count().max(1) as f64
+    let polarity = |text: &str| {
+        let normalized = text.to_ascii_lowercase().replace("n't", " not");
+        normalized
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| matches!(*word, "no" | "not" | "never" | "without" | "cannot"))
+            .map(str::to_string)
+            .collect::<HashSet<_>>()
+    };
+    if polarity(a) != polarity(b) {
+        return 0.0;
+    }
+    let duplicate_terms = |text: &str| {
+        crate::recall::query(text)
+            .into_iter()
+            .map(|term| {
+                if matches!(term.as_str(), "repo" | "repository" | "project") {
+                    "repo_project".to_string()
+                } else {
+                    term
+                }
+            })
+            .collect::<HashSet<_>>()
+    };
+    let (a, b) = (duplicate_terms(a), duplicate_terms(b));
+    let shared = a.intersection(&b).count();
+    // A strict subset can add a meaningful command option or value. Do not
+    // collapse `run cargo test` with `run cargo test --release` just because
+    // all the shorter fact's terms happen to occur in the longer one.
+    if a != b && shared == a.len().min(b.len()) {
+        return 0.0;
+    }
+    let union = a.union(&b).count().max(1);
+    shared as f64 / union as f64
 }
 
 struct Store {
@@ -849,14 +888,14 @@ impl Engine {
             .lessons(scope)?
             .into_iter()
             .find(|l| l.kind == kind && (l.id == id || overlap(&l.text, &text) >= DUPLICATE));
-        let reply_id = match twin {
+        let (prefix, reply_id) = match twin {
             Some(l) => {
                 self.store.db.execute(
                     "UPDATE lessons SET anchors=CASE WHEN ?1='[]' THEN anchors ELSE ?1 END,
                        source=CASE WHEN ?2='user' THEN 'user' ELSE source END WHERE id=?3",
                     params![serde_json::to_string(&anchors)?, source, l.id],
                 )?;
-                l.id
+                (KNOWN_PREFIX, l.id)
             }
             None => {
                 self.store.make_room()?;
@@ -872,11 +911,11 @@ impl Engine {
                     credited_at: now(),
                 };
                 self.store.insert(&l)?;
-                id
+                (SAVED_PREFIX, id)
             }
         };
         self.cache.clear();
-        Ok(Response { text: format!("{SAVED_PREFIX}{reply_id}"), id: reply_id, ..Response::default() })
+        Ok(Response { text: format!("{prefix}{reply_id}"), id: reply_id, ..Response::default() })
     }
     /// The best lesson for this session right now, if any clears the bar.
     fn advise(&mut self, r: &Request, key: &str) -> Result<Response> {
@@ -1303,6 +1342,17 @@ pub fn serve(home: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reworded_short_fact_counts_as_a_twin() {
+        let a = "The repository's test command is `make check-all`.";
+        let b = "The project's test command is `make check-all`.";
+        assert!(overlap(a, b) >= DUPLICATE, "{}", overlap(a, b));
+        assert!(overlap("run cargo test before pushing", "the deploy needs an aws profile") < DUPLICATE);
+        assert!(overlap("run cargo test", "run cargo test --release") < DUPLICATE);
+        assert!(overlap("deploy production", "never deploy production") < DUPLICATE);
+        assert!(overlap("deploy production", "do not deploy production") < DUPLICATE);
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
 

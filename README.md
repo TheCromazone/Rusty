@@ -148,7 +148,7 @@ to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
 it keeps retrying rate limits and server errors for up to five minutes
 (`RUSTY_RETRY_SECS`), with jitter so parallel agents don't retry in step, and
 gives up quickly on a key that is refused. While it waits, the panel says so
-(`retrying in 8s · HTTP 429 …`). A reply that goes quiet for two minutes
+(`retrying in 8s · HTTP 429 …`). A reply that goes quiet for five minutes
 (`RUSTY_STREAM_IDLE_SECS`) is dropped and asked for again, as long as no
 answer text has been shown yet.
 

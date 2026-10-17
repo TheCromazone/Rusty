@@ -1,5 +1,5 @@
 //! Real-process service tests. No model or cloud account is involved.
-use rusty::advisor::{rpc, Hooks, Level, Request, Response};
+use rusty::advisor::{rpc, Hooks, Level, Request, Response, KNOWN_PREFIX, SAVED_PREFIX};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
@@ -66,6 +66,40 @@ impl Drop for Service {
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn remembering_a_near_duplicate_reports_known_without_adding_a_row() {
+    let s = Service::new();
+    let first =
+        s.call("remember", "repo-a", 1, json!({"kind":"fact","text":"Always inspect workspace packages manifest"}));
+    assert!(!first.error, "first remember failed: {}", first.text);
+    assert!(first.text.starts_with(SAVED_PREFIX), "unexpected first reply: {}", first.text);
+    assert!(!first.id.is_empty());
+
+    let second =
+        s.call("remember", "repo-a", 2, json!({"kind":"fact","text":"Always inspect workspace packages manifest"}));
+    assert!(!second.error, "duplicate remember failed: {}", second.text);
+    assert!(second.text.starts_with(KNOWN_PREFIX), "unexpected duplicate reply: {}", second.text);
+    assert_eq!(second.id, first.id, "duplicate should retain the existing lesson id");
+    assert_eq!(s.call("status", "repo-a", 2, Value::Null).data["lessons"], 1);
+}
+
+#[test]
+fn remembering_a_command_extension_or_opposite_polarity_keeps_both_facts() {
+    let s = Service::new();
+    for (seq, text) in [
+        (1, "run cargo test"),
+        (2, "run cargo test --release"),
+        (3, "deploy production"),
+        (4, "never deploy production"),
+        (5, "do not deploy production"),
+    ] {
+        let saved = s.call("remember", "repo-a", seq, json!({"kind":"fact","text":text}));
+        assert!(!saved.error, "remember failed for {text}: {}", saved.text);
+        assert!(saved.text.starts_with(SAVED_PREFIX), "{text} was collapsed: {}", saved.text);
+    }
+    assert_eq!(s.call("status", "repo-a", 5, Value::Null).data["lessons"], 5);
 }
 
 #[test]

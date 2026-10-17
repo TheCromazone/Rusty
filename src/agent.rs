@@ -23,7 +23,7 @@ use crate::tips;
 use crate::tools;
 use crate::ui;
 use crate::verification::{self, CheckRecord, CheckSpec};
-use rusty::advisor::{Hooks, Level, KINDS, SAVED_PREFIX};
+use rusty::advisor::{Hooks, Level, KINDS, KNOWN_PREFIX, SAVED_PREFIX};
 
 const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
@@ -319,6 +319,9 @@ pub struct Agent {
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
+    /// Where the saved session starts in `archived`: what `/clear` or
+    /// `/resume` archived belongs to the session before it.
+    session_from: usize,
     /// Every compaction this session, for `--stats` and the trajectory.
     pub compactions: Vec<CompactionEvent>,
     /// Tool calls run so far, so a compaction can say how many came since the last.
@@ -424,6 +427,7 @@ impl Agent {
             side_meta: None,
             side_receipts: Default::default(),
             archived: Vec::new(),
+            session_from: 0,
             trajectory_path: None,
             trajectory_saved: None,
             policy,
@@ -565,12 +569,13 @@ impl Agent {
         }
         // The user only saw the worker's status line; show them the gist of the findings.
         if display::view() != View::Adhd {
-            if let Some(first) = report.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("##")) {
-                let room = ui::width().saturating_sub(16).max(20);
+            if let Some(first) = checker_gist(&report) {
+                // "  ◇ checker · " is 14 columns; keep the last column free so it never wraps.
+                let room = ui::width().saturating_sub(15).max(8);
                 let gist: String = if first.chars().count() > room {
                     first.chars().take(room - 1).chain(std::iter::once('…')).collect()
                 } else {
-                    first.to_string()
+                    first
                 };
                 d.line(&format!("  {} {}", ui::dim("◇ checker ·"), ui::dim(&gist)));
             }
@@ -581,8 +586,9 @@ impl Agent {
              \"Checked: nothing to fix.\") plus anything it could not verify, then stop. If it found something \
              actionable, fix it, verify the fix the usual way, and report only what changed since your last \
              message. There is no second review. If the checker failed or couldn't verify something, say so \
-             plainly. In a goal, call goal_done with evidence instead of answering in text.",
-            context::NOTE
+             plainly.{}",
+            context::NOTE,
+            if self.goal.is_some() { " In a goal, call goal_done with evidence instead of answering in text." } else { "" }
         )}));
         Ok(())
     }
@@ -593,6 +599,7 @@ impl Agent {
         self.side_book = Default::default();
         self.aside_memory = Default::default();
         self.archived.append(&mut self.history);
+        self.session_from = self.archived.len();
         self.plan.clear();
         self.goal = None;
         self.verification_records.clear();
@@ -2631,11 +2638,14 @@ impl Agent {
         // Unverified compaction lessons are kept only from reflect up; the
         // service may still refuse one, so count what it confirmed.
         let kept = self.advisor.as_ref().is_some_and(|h| h.level.reflects());
-        let mut saved = 0;
+        let (mut saved, mut known) = (0, 0);
         if kept {
             for (kind, text) in &memories {
-                if self.remember_as(kind, text, false, "compaction", &[]).starts_with(SAVED_PREFIX) {
+                let reply = self.remember_as(kind, text, false, "compaction", &[]);
+                if reply.starts_with(SAVED_PREFIX) {
                     saved += 1;
+                } else if reply.starts_with(KNOWN_PREFIX) {
+                    known += 1;
                 }
             }
         }
@@ -2669,7 +2679,7 @@ impl Agent {
             "  ⇣ compacted ~{} → ~{} tokens{}",
             ui::human(before as u64),
             ui::human(context::estimate(&self.history) as u64),
-            context::memory_note(memories.len(), saved, kept)
+            context::memory_note(memories.len(), saved, known, kept)
         )));
         Ok(())
     }
@@ -2771,9 +2781,12 @@ impl Agent {
         let body = json!({"side_receipts":self.side_receipts,"side":self.side_meta,"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         // Side transcripts have their own directory and browsing lifecycle.
         // Keep them out of the parent project's searchable session catalog.
-        if self.side_meta.is_none() {
+        // A session nothing was said in yet stays out of the catalog, so it
+        // is never listed or picked up by `rusty -c`.
+        let archived = &self.archived[self.session_from.min(self.archived.len())..];
+        if self.side_meta.is_none() && !(self.history.is_empty() && archived.is_empty()) {
             if let Some(dir) = path.parent() {
-                crate::session::publish_and_record(dir, path, body, &self.history, &self.archived)?;
+                crate::session::publish_and_record(dir, path, body, &self.history, archived)?;
             }
         } else {
             crate::session::save(path, body)?;
@@ -2788,11 +2801,32 @@ impl Agent {
         Ok(())
     }
 
+    /// Saves the session before leaving it, or, when nothing was said in it
+    /// (a REPL opened and closed, or `/clear` then `/resume`), removes the
+    /// file `new_session` reserved. Returns whether there is something to
+    /// resume. A parent with side chats keeps its file for them to point at.
+    pub fn end_session(&mut self) -> Result<bool> {
+        let Some(path) = &self.session_path else { return Ok(false) };
+        let spoken = !self.history.is_empty() || self.archived.len() > self.session_from;
+        if spoken || self.side_meta.is_some() || crate::side::any(&self.side_book) {
+            self.save_session()?;
+            return Ok(spoken);
+        }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+        Ok(false)
+    }
+
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
         let lease = crate::session::Lease::acquire(path)?;
-        let v: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("can't read session file {}: {e}", path.display()))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("session file {} is damaged and can't be resumed ({e})", path.display()))?;
         self.side_meta = serde_json::from_value(v["side"].clone()).ok();
         self.side_receipts = serde_json::from_value(v["side_receipts"].clone()).unwrap_or_default();
+        self.archived.append(&mut self.history);
+        self.session_from = self.archived.len();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
@@ -2966,5 +3000,68 @@ mod stable_prompt_tests {
         assert_eq!(aside.len(), agent.history.len() + 2, "the aside note is ephemeral and follows the copied history");
         assert!(!serde_json::to_string(&agent.history).unwrap().contains("Owned shell activities"));
         agent.activities.cancel_all(false);
+    }
+}
+
+/// The first real line of a checker's report: not a heading, not a bare
+/// label like "Findings:", with list markers and bold stripped.
+fn checker_gist(report: &str) -> Option<String> {
+    fn is_bare_filename(line: &str) -> bool {
+        if line.split_whitespace().count() != 1 {
+            return false;
+        }
+        // Trim sentence punctuation before recognizing a filename suffix;
+        // e.g. "Fail." is a complete finding, not a file named "Fail".
+        let token = line.trim_end_matches([',', ';', '.', '!', '?']);
+        let token = token.split(':').next().unwrap_or(token);
+        let Some((stem, extension)) = token.rsplit_once('.') else { return false };
+        !stem.is_empty()
+            && (extension.len() >= 2 || matches!(extension, "c" | "h" | "m" | "R"))
+            && extension.chars().all(char::is_alphanumeric)
+    }
+
+    report
+        .lines()
+        // A list marker is "- " or "* "; a bare "**" is bold, not a marker.
+        .map(|l| l.trim().strip_prefix("- ").or_else(|| l.trim().strip_prefix("* ")).unwrap_or(l.trim()).trim())
+        .filter(|l| !l.starts_with('#') && !l.starts_with("```"))
+        // A bold word or two on its own is a label, like "**Findings**" or "- **stats.py**".
+        .filter(|l| !(l.starts_with("**") && l.ends_with("**") && l.split_whitespace().count() <= 3))
+        .map(|l| l.replace("**", "").trim().to_string())
+        // "It is correct. The file now contains:" → "It is correct."
+        .map(|l| match (l.ends_with(':'), l.rfind(". ")) {
+            (true, Some(i)) => l[..=i].to_string(),
+            _ => l,
+        })
+        // A bare file name says nothing; the finding is on the next line.
+        .find(|l| !l.is_empty() && !l.ends_with(':') && !is_bare_filename(l))
+}
+
+#[cfg(test)]
+mod gist_tests {
+    use super::checker_gist;
+
+    #[test]
+    fn the_checker_gist_is_the_first_finding_not_a_label() {
+        let report =
+            "## careful check (done)\nFindings:\n- **Bug — stats.py:8**: the even-case indices are off by one\n- more";
+        assert_eq!(checker_gist(report).as_deref(), Some("Bug — stats.py:8: the even-case indices are off by one"));
+        assert_eq!(checker_gist("## done\n\nChecked: nothing to fix.").as_deref(), Some("Checked: nothing to fix."));
+        assert_eq!(checker_gist("Fail.").as_deref(), Some("Fail."));
+        assert_eq!(checker_gist("e.g.").as_deref(), Some("e.g."));
+        assert_eq!(checker_gist("Findings:\n"), None);
+        assert_eq!(
+            checker_gist("## check\n- **stats.py**\n  - clamp returns lo instead of hi at line 8").as_deref(),
+            Some("clamp returns lo instead of hi at line 8")
+        );
+        assert_eq!(checker_gist("stats.py\nThe finding is below.").as_deref(), Some("The finding is below."));
+        assert_eq!(
+            checker_gist("The fix is correct. The file now contains:\n```py\nx\n```").as_deref(),
+            Some("The fix is correct.")
+        );
+        assert_eq!(
+            checker_gist("**Findings**\n\n1. note.txt:1 lacks a newline").as_deref(),
+            Some("1. note.txt:1 lacks a newline")
+        );
     }
 }

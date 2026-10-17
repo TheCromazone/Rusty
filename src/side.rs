@@ -87,6 +87,10 @@ impl Drop for Book {
 pub fn focused(book: &Shared) -> bool {
     book.lock().unwrap().focus.is_some()
 }
+/// Whether any side chat was opened from this session.
+pub fn any(book: &Shared) -> bool {
+    !book.lock().unwrap().children.is_empty()
+}
 pub fn running(book: &Shared) -> bool {
     let book = book.lock().unwrap();
     book.focus.as_ref().is_some_and(|id| matches!(book.children[id].state, State::Running { .. }))
