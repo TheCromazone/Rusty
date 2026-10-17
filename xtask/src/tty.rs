@@ -123,7 +123,7 @@ fn offline(cmd: &mut Command, endpoint: &str, home: &Path) {
 }
 
 /// Check the actual cells after soft wraps and an explicit Ctrl-J newline.
-fn inspect_input(text: &str, cols: u16, plain: bool) -> Result<()> {
+fn inspect_input(text: &str, cols: u16, plain: bool, indexed: bool) -> Result<()> {
     let mut screen = Screen::new(ROWS as usize, cols as usize);
     screen.feed(text, |_, _| {});
     let lines = screen.lines();
@@ -132,7 +132,13 @@ fn inspect_input(text: &str, cols: u16, plain: bool) -> Result<()> {
     if last <= first {
         bail!("input did not wrap");
     }
-    let wanted = if plain { Color::Default } else { Color::Rgb(64, 124, 208) };
+    let wanted = if plain {
+        Color::Default
+    } else if indexed {
+        Color::Indexed(68)
+    } else {
+        Color::Rgb(64, 124, 208)
+    };
     for row in first..=last {
         for col in 0..cols as usize {
             let cell = screen.cell(row, col);
@@ -147,11 +153,11 @@ fn inspect_input(text: &str, cols: u16, plain: bool) -> Result<()> {
     Ok(())
 }
 
-fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: bool) -> Result<()> {
+fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: bool, indexed: bool) -> Result<()> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
     offline(&mut cmd, endpoint, &dest.join("home"));
-    cmd.env("COLORTERM", "truecolor").env("RUSTY_CONTEXT_TOKENS", "128000");
+    cmd.env("COLORTERM", if indexed { "" } else { "truecolor" }).env("RUSTY_CONTEXT_TOKENS", "128000");
     if plain {
         cmd.env("NO_COLOR", "1");
     }
@@ -163,16 +169,16 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     s.send(&wrapped)?;
     s.send("\x0aUSER_PROMPT_END")?;
     s.drain(0.3)?;
-    inspect_input(&s.text, cols, plain)?;
+    inspect_input(&s.text, cols, plain, indexed)?;
     std::fs::write(dest.join("input-live.ansi"), &s.text)?;
     s.send("\r")?;
     s.wait_for(&[Lit("pong"), Space], "submitted input did not run")?;
     s.wait_for(&[Lit("?2004h")], "next prompt missing")?;
     s.drain(0.2)?;
-    inspect_input(&s.text, cols, plain)?;
+    inspect_input(&s.text, cols, plain, indexed)?;
     s.send("/quit\r")?;
     s.finish()?;
-    println!("PASS: input keeps its colour across wraps, Ctrl-J and submission at {cols} columns (NO_COLOR={plain})");
+    println!("PASS: input keeps its colour across wraps, Ctrl-J and submission at {cols} columns (NO_COLOR={plain}, indexed={indexed})");
     Ok(())
 }
 
@@ -397,11 +403,14 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
         for cols in WIDTHS {
             let dest = out.join(format!("input-{cols}"));
             std::fs::create_dir_all(&dest)?;
-            input_capture(&binary, &provider.endpoint, cols, &dest, false)?;
+            input_capture(&binary, &provider.endpoint, cols, &dest, false, false)?;
         }
         let dest = out.join("input-plain");
         std::fs::create_dir_all(&dest)?;
-        input_capture(&binary, &provider.endpoint, 80, &dest, true)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, true, false)?;
+        let dest = out.join("input-indexed");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
     }
     if checks.contains(&Check::Approval) {
         let dest = out.join("approval");
