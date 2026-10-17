@@ -91,6 +91,11 @@ fn serve(stream: TcpStream) -> Result<()> {
         sse.content("PTY_SIDE_SUMMARY: inspect idempotency before applying a retry.\n", Some("stop"))?;
     } else if prompt == "aside-sentinel" {
         sse.content("ASIDE_ANSWER: this is a context-only answer.\n", Some("stop"))?;
+    } else if prompt == "side-slow" {
+        pause(0.4);
+        sse.content("SIDE_SLOW_ANSWER\n", Some("stop"))?;
+    } else if prompt == "side-followup" {
+        sse.content("SIDE_FOLLOWUP_ANSWER\n", Some("stop"))?;
     } else if prompt == "side-sentinel" {
         if tools == 0 {
             sse.call("read", "read_file", r#"{"path":"side-fact.txt"}"#)?;

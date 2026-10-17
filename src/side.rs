@@ -88,6 +88,10 @@ impl Drop for Book {
 pub fn focused(book: &Shared) -> bool {
     book.lock().unwrap().focus.is_some()
 }
+pub fn running(book: &Shared) -> bool {
+    let book = book.lock().unwrap();
+    book.focus.as_ref().is_some_and(|id| matches!(book.children[id].state, State::Running { .. }))
+}
 fn set_focus(book: &mut Book, id: Option<String>) {
     let token = id.as_ref().and_then(|id| book.children.get(id)).map(|child| match &child.state {
         State::Running { cancel, .. } => cancel.clone(),
@@ -166,6 +170,9 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
         if live.len() == 1 {
             (live[0].clone(), None)
         } else {
+            if book.children.len() >= 8 {
+                bail!("eight side chats are already open; restart before opening more");
+            }
             let mut matches = Vec::new();
             for entry in std::fs::read_dir(parent.dir()).context("no saved side chats")? {
                 let path = entry?.path();
@@ -307,6 +314,9 @@ pub fn poll(parent: &Parent) {
                 display::notice(&format!("side: {e:#}"));
             }
         } else if focused(&parent.book) && !input.starts_with("/btw") {
+            if !input.starts_with('/') && running(&parent.book) {
+                return;
+            }
             signal::take_queued();
             if input.starts_with('/') {
                 display::notice("use /back before main-chat commands");

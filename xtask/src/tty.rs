@@ -150,6 +150,9 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
                 s.send("/send main\r")?;
                 s.wait_for(&[Lit("already sent")], "summary revision was not deduplicated")?;
             } else {
+                s.send("side-slow\rside-followup\r")?;
+                s.wait_for(&[Lit("SIDE_SLOW_ANSWER")], "slow side response missing")?;
+                s.wait_for(&[Lit("SIDE_FOLLOWUP_ANSWER")], "busy side dropped its queued follow-up")?;
                 s.send("side-cancel\r")?;
                 s.wait_for(&[Lit("side question running")], "second side did not start")?;
                 s.send("\x03")?;
