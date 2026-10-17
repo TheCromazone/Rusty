@@ -23,7 +23,7 @@ use crate::tips;
 use crate::tools;
 use crate::ui;
 use crate::verification::{self, CheckRecord, CheckSpec};
-use rusty::advisor::{Hooks, Level, KINDS};
+use rusty::advisor::{Hooks, Level, KINDS, SAVED_PREFIX};
 
 const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
@@ -2237,10 +2237,15 @@ impl Agent {
         if summary.is_empty() {
             bail!("the model returned an empty summary");
         }
-        // Unverified compaction lessons are kept only from reflect up.
-        if self.advisor.as_ref().is_some_and(|h| h.level.reflects()) {
+        // Unverified compaction lessons are kept only from reflect up; the
+        // service may still refuse one, so count what it confirmed.
+        let kept = self.advisor.as_ref().is_some_and(|h| h.level.reflects());
+        let mut saved = 0;
+        if kept {
             for (kind, text) in &memories {
-                self.remember_as(kind, text, false, "compaction", &[]);
+                if self.remember_as(kind, text, false, "compaction", &[]).starts_with(SAVED_PREFIX) {
+                    saved += 1;
+                }
             }
         }
         let tail = self.history.split_off(split);
@@ -2273,7 +2278,7 @@ impl Agent {
             "  ⇣ compacted ~{} → ~{} tokens{}",
             ui::human(before as u64),
             ui::human(context::estimate(&self.history) as u64),
-            if memories.is_empty() { String::new() } else { format!(", {} memories saved", memories.len()) }
+            context::memory_note(memories.len(), saved, kept)
         )));
         Ok(())
     }
