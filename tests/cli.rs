@@ -4110,3 +4110,23 @@ fn an_offered_lesson_stays_in_the_prompt_for_the_rest_of_the_turn() {
     assert_eq!(offered[0]["usage_index"], first, "{offered}");
     assert!(offered[0]["text"].as_str().unwrap().contains("STATS_SEED"), "{offered}");
 }
+
+#[test]
+fn starting_a_new_session_preserves_the_previous_saved_conversation() {
+    let s = Sandbox::new("session-preserve");
+    let (url, server) = scripted_endpoint(vec![say("first answer"), say("second answer")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["FIRST_SESSION_SENTINEL", "/new", "SECOND_SESSION_SENTINEL", "/quit"]);
+    assert_eq!(server.join().unwrap().len(), 2);
+    let project = std::fs::read_dir(s.home.join("projects")).unwrap().next().unwrap().unwrap().path();
+    let sessions: Vec<String> = std::fs::read_dir(project.join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().any(|s| s.contains("FIRST_SESSION_SENTINEL") && !s.contains("SECOND_SESSION_SENTINEL")));
+    assert!(sessions.iter().any(|s| s.contains("SECOND_SESSION_SENTINEL") && !s.contains("FIRST_SESSION_SENTINEL")));
+}

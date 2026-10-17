@@ -14,6 +14,7 @@ mod llm;
 mod markdown;
 mod mcp;
 mod permissions;
+mod session;
 mod signal;
 mod skills;
 mod slash;
@@ -384,7 +385,7 @@ fn run() -> Result<i32> {
 
     let sessions = pdir.join("sessions");
     if cli.resume {
-        match latest_session(&sessions) {
+        match session::latest(&sessions) {
             Some(p) => {
                 agent.load_session(&p)?;
                 println!("{}", ui::dim(&format!("resumed {} messages", agent.history.len())));
@@ -393,7 +394,7 @@ fn run() -> Result<i32> {
         }
     }
     if agent.session_path.is_none() {
-        agent.session_path = Some(new_session_path(&sessions));
+        agent.new_session(&sessions)?;
     }
     agent.trajectory_path = cli.trajectory.clone();
 
@@ -419,7 +420,7 @@ fn run() -> Result<i32> {
                 agent.run_turn(&input).map(|_| ())
             }
         };
-        agent.save_session();
+        agent.save_session()?;
         print_changes(&agent);
         if cli.stats {
             print_stats(&agent, started);
@@ -554,34 +555,28 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut armed_quit = false;
 
     loop {
-        // Something typed while the last turn ran goes next, as if just entered.
-        if let Some(queued) = signal::take_queued() {
+        // Queued and freshly typed input go through the same slash router.
+        let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::primary("›"), queued);
             println!("{}", ui::dim("  (typed while rusty was working)"));
-            signal::restore_terminal();
-            signal::reset();
-            let _ = rl.add_history_entry(rusty::privacy::redact(&queued).0);
-            if let Err(e) = agent.run_turn(&queued) {
-                println!("{} {e:#}\n", ui::err("error:"));
-            }
-            agent.save_session();
-            continue;
-        }
-        let mut input = match rl.readline(&prompt) {
-            Ok(l) => {
-                armed_quit = false;
-                l
-            }
-            Err(ReadlineError::Interrupted) => {
-                if armed_quit {
-                    break;
+            queued
+        } else {
+            match rl.readline(&prompt) {
+                Ok(l) => {
+                    armed_quit = false;
+                    l
                 }
-                armed_quit = true;
-                println!("{}", ui::dim("  (ctrl-c again to quit)"));
-                continue;
+                Err(ReadlineError::Interrupted) => {
+                    if armed_quit {
+                        break;
+                    }
+                    armed_quit = true;
+                    println!("{}", ui::dim("  (ctrl-c again to quit)"));
+                    continue;
+                }
+                Err(ReadlineError::Eof) => break,
+                Err(e) => return Err(e.into()),
             }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
         };
         // A trailing backslash continues the message on the next line.
         while input.ends_with('\\') {
@@ -632,7 +627,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         if let Err(e) = result {
             println!("{} {e:#}\n", ui::err("error:"));
         }
-        agent.save_session();
+        agent.save_session()?;
     }
     if let Some(h) = &history_file {
         if let Some(dir) = h.parent() {
@@ -642,7 +637,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             let _ = rl.save_history(h);
         }
     }
-    agent.save_session();
+    agent.save_session()?;
     print_changes(agent);
     println!("{}", ui::dim("  ◌ link closed. go ship something."));
     Ok(())
@@ -669,10 +664,12 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/exit" | "/quit" | "/q" => return Ok(true),
         "/help" | "/?" => print_help(cwd),
         "/clear" | "/new" => {
-            agent.save_session();
+            agent.save_session()?;
             agent.clear();
             if let Some(p) = &agent.session_path {
-                agent.session_path = p.parent().map(new_session_path);
+                if let Some(dir) = p.parent().map(Path::to_path_buf) {
+                    agent.new_session(&dir)?;
+                }
             }
             println!("{}", ui::dim("  fresh context. memories kept."));
         }
@@ -1257,18 +1254,6 @@ fn project_dir(cwd: &Path) -> PathBuf {
     let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "root".into());
     let id = format!("{name}-{:08x}", rusty::fnv(&cwd.display().to_string()) as u32);
     config::config_dir().unwrap_or_else(|| PathBuf::from(".rusty")).join("projects").join(id)
-}
-
-fn new_session_path(dir: &Path) -> PathBuf {
-    dir.join(format!("{}.json", rusty::unix_now()))
-}
-
-fn latest_session(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".trace.json"))
-        .max()
 }
 
 #[cfg(test)]
