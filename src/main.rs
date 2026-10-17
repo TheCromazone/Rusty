@@ -554,37 +554,34 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut armed_quit = false;
 
     loop {
-        // Something typed while the last turn ran goes next, as if just entered.
-        if let Some(queued) = signal::take_queued() {
-            println!("{} {}", ui::primary("›"), queued);
-            println!("{}", ui::dim("  (typed while rusty was working)"));
-            signal::restore_terminal();
-            signal::reset();
-            let _ = rl.add_history_entry(rusty::privacy::redact(&queued).0);
-            if let Err(e) = agent.run_turn(&queued) {
-                println!("{} {e:#}\n", ui::err("error:"));
+        // Something typed while the last turn ran goes next, as if just
+        // entered: the same slash handling and dispatch as a typed line.
+        let queued = signal::take_queued();
+        let mut input = match queued {
+            Some(ref text) => {
+                println!("{} {}", ui::primary("›"), text);
+                println!("{}", ui::dim("  (typed while rusty was working)"));
+                text.clone()
             }
-            agent.save_session();
-            continue;
-        }
-        let mut input = match rl.readline(&prompt) {
-            Ok(l) => {
-                armed_quit = false;
-                l
-            }
-            Err(ReadlineError::Interrupted) => {
-                if armed_quit {
-                    break;
+            None => match rl.readline(&prompt) {
+                Ok(l) => {
+                    armed_quit = false;
+                    l
                 }
-                armed_quit = true;
-                println!("{}", ui::dim("  (ctrl-c again to quit)"));
-                continue;
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => return Err(e.into()),
+                Err(ReadlineError::Interrupted) => {
+                    if armed_quit {
+                        break;
+                    }
+                    armed_quit = true;
+                    println!("{}", ui::dim("  (ctrl-c again to quit)"));
+                    continue;
+                }
+                Err(ReadlineError::Eof) => break,
+                Err(e) => return Err(e.into()),
+            },
         };
         // A trailing backslash continues the message on the next line.
-        while input.ends_with('\\') {
+        while queued.is_none() && input.ends_with('\\') {
             input.pop();
             input.push('\n');
             menu.lock().map(|mut m| m.paused = true).ok();
@@ -597,15 +594,16 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         }
         // A partly typed command runs what the menu had highlighted, matched
         // against the line as typed (a trailing space opens a value menu).
+        // Queued text never went through the menu, so it resolves on its own.
         if input.starts_with('/') {
             let typed = input.trim_end().to_string();
             let resolved = match menu.lock() {
-                Ok(mut m) => {
+                Ok(mut m) if queued.is_none() => {
                     let r = slash::resolve(&input, Some((&m.line, &m.rows, m.selected)), &skill_list);
                     m.line.clear();
                     r
                 }
-                Err(_) => slash::resolve(&input, None, &skill_list),
+                _ => slash::resolve(&input, None, &skill_list),
             };
             if resolved.trim_end() != typed {
                 println!("{}", ui::dim(&format!("  → {}", resolved.trim_end())));
