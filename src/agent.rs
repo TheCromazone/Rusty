@@ -601,16 +601,6 @@ impl Agent {
                 s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
             }
         }
-        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
-        if !active.is_empty() {
-            s.push_str(&format!("\nOwned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
-        }
-        if !self.plan.is_empty() {
-            s.push_str("\nCurrent plan:\n");
-            for p in &self.plan {
-                s.push_str(&format!("- [{}] {}\n", p.status, p.text));
-            }
-        }
         if display::view() == View::Adhd {
             // Last in the prompt, where it carries the most weight.
             s.push_str(
@@ -620,6 +610,24 @@ impl Agent {
             );
         }
         s
+    }
+
+    /// The plan and running commands: they change every few steps, so they
+    /// ride in the note after the history instead of the system prompt,
+    /// where each change would throw away the provider's cached prefix.
+    fn live_state(&self) -> Option<String> {
+        let mut s = String::new();
+        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
+        if !active.is_empty() {
+            s.push_str(&format!("Owned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
+        }
+        if !self.plan.is_empty() {
+            s.push_str("Current plan:\n");
+            for p in &self.plan {
+                s.push_str(&format!("- [{}] {}\n", p.status, p.text));
+            }
+        }
+        (!s.is_empty()).then(|| s.trim_end().to_string())
     }
 
     /// What `--toolset shell` offers: a shell, plus the control calls that
@@ -823,6 +831,7 @@ impl Agent {
             messages.extend(self.history.iter().cloned());
             // Last, so the cached prefix stays the same; never stored in history.
             let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
+            notes.extend(self.live_state());
             if self.smart_compaction() {
                 notes.push(format!("Context in use: {}% of the context budget.", self.context_used()));
             }
@@ -1960,7 +1969,8 @@ impl Agent {
             return n;
         }
         let advice = if self.advisor.is_some() { context::MEMORY_CHARS } else { 0 };
-        (self.system_prompt().len() + self.tool_defs().to_string().len() + advice) / 4
+        let live = self.live_state().map_or(0, |s| s.len());
+        (self.system_prompt().len() + live + self.tool_defs().to_string().len() + advice) / 4
     }
 
     /// Context tokens past which old tool output is trimmed, and past which
