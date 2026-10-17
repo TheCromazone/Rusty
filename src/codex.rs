@@ -16,7 +16,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 use crate::execution::ExecutionMode;
@@ -337,7 +336,7 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     let mut saw_data = false;
     let mut raw = String::new();
 
-    for line in BufReader::new(resp).lines() {
+    for line in crate::llm::lines(resp) {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data && !line.starts_with("event:") {

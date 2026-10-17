@@ -1916,6 +1916,7 @@ fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
         .env("CODEX_HOME", &codex_home)
         .env("RUSTY_CODEX_BASE_URL", &codex)
         .env("RUSTY_CODEX_REFRESH_URL", format!("{refresh}/oauth/token"))
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
         .env_remove("OPENAI_API_KEY")
         .args(["--model", "gpt-5", "hi"])
         .stdin(Stdio::null())
