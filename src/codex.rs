@@ -396,7 +396,10 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
                         let text = text_of(&item["content"]);
                         if !text.is_empty() {
                             reply.content.push_str(&text);
-                            let _ = on(Delta::Content(&text));
+                            if !on(Delta::Content(&text)) {
+                                reply.finish_reason = Some("interrupted".into());
+                                return Ok(finish(reply, items));
+                            }
                         }
                     }
                     _ => {}
@@ -657,6 +660,19 @@ mod tests {
         let reply = parse_stream(resp, &mut |_| true).unwrap();
         assert_eq!(reply.finish_reason.as_deref(), Some("length"));
         assert_eq!(reply.content, "partial");
+    }
+
+    #[test]
+    fn cancellation_on_a_complete_message_stops_before_later_items() {
+        let resp = stream(&[
+            json!({"type": "response.output_item.done", "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}}),
+            json!({"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "call_1", "name": "bash", "arguments": "{}"}}),
+            json!({"type": "response.completed", "response": {"usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ]);
+        let reply = parse_stream(resp, &mut |_| false).unwrap();
+        assert_eq!(reply.content, "answer");
+        assert_eq!(reply.finish_reason.as_deref(), Some("interrupted"));
+        assert!(reply.tool_calls.is_empty(), "cancellation must stop before later tool calls");
     }
 
     #[test]
