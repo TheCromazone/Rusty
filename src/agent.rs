@@ -483,10 +483,25 @@ impl Agent {
             self.client.budget.halt();
             bail!("model budget exhausted: required careful review could not finish");
         }
+        // The user only saw the worker's status line; show them the gist of the findings.
+        if display::view() != View::Adhd {
+            if let Some(first) = report.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("##")) {
+                let room = ui::width().saturating_sub(16).max(20);
+                let gist: String = if first.chars().count() > room {
+                    first.chars().take(room - 1).chain(std::iter::once('…')).collect()
+                } else {
+                    first.to_string()
+                };
+                d.line(&format!("  {} {}", ui::dim("◇ checker ·"), ui::dim(&gist)));
+            }
+        }
         self.history.push(json!({"role": "user", "content": format!(
-            "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
-             There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
-             give your final answer, or call goal_done with evidence.",
+            "{}[checker's review]\n{report}\n\nThe user has already seen your previous message. Do not repeat it. \
+             If the checker found nothing actionable, reply in one or two short lines (for example \
+             \"Checked: nothing to fix.\") plus anything it could not verify, then stop. If it found something \
+             actionable, fix it, verify the fix the usual way, and report only what changed since your last \
+             message. There is no second review. If the checker failed or couldn't verify something, say so \
+             plainly. In a goal, call goal_done with evidence instead of answering in text.",
             context::NOTE
         )}));
         Ok(())
