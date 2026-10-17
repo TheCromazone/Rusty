@@ -134,6 +134,8 @@ rusty                                         # interactive
 rusty "why does the build fail?"              # one shot
 rusty --goal "get cargo test green" --verify "cargo test" --yolo
 rusty -c                                      # resume the last session here
+rusty -c 3f9a12c0                             # resume one by id (a prefix is enough)
+rusty --sessions [words]                      # list the sessions saved here, or search them
 rusty --doctor                                # which providers are set up and answering
 rusty --capabilities                          # accepted values as JSON, for harnesses
 rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
@@ -181,6 +183,7 @@ unknown one gets a "did you mean".
 | `/agents off\|sub\|swarm\|auto` | delegation · `/agents model <id>` sets the subagent model |
 | `/swarm size\|models\|spread` | workers at once (up to 16; a swarm call takes up to 32 tasks and workers share findings), model rotation, temperature spread |
 | `/compact [focus]` | summarise now, keeping what you name in detail |
+| `/resume [id|words]` | list saved sessions, search them, or pick one up |
 | `/compact settings [mode]` | when to compact: `aggressive` (summarise at 60% of the usable window), `standard` (80%, the default), `passive` (95%) or `smart` (the model compacts when a sub-task is done; rusty refuses at a bad moment and keeps its last two steps verbatim) |
 | `/target` · `/audit [n]` · `/changes` | where infra commands will land · the infra audit log · what this session changed |
 | `/triage` `/change` `/postmortem` | infra skills: incident triage, a change plan with rollback, a blameless write-up |
