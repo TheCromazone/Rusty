@@ -2385,6 +2385,77 @@ fn registered_unchanged_waits_finish_without_disabling_the_stall_guard() {
 }
 
 #[test]
+fn volatile_plan_and_activity_state_stays_after_the_history() {
+    let s = Sandbox::new("volatile-prompt-state");
+    let trajectory = s.project.join("trace.json");
+    let plan = |text: &str| tool_reply("plan", serde_json::json!({"items":[{"text":text,"status":"in_progress"}]}));
+    let (_, _, baseline) =
+        scripted_run(&s, &["--memory", "off", "--mode", "standard", "baseline"], vec![text_reply("done")]);
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--memory", "off", "--mode", "standard", "--trajectory", "trace.json", "inspect the project"],
+        vec![
+            plan("plan-alpha"),
+            plan("plan-beta"),
+            start_shell("sleep 30", 60),
+            tool_reply("bash_cancel", serde_json::json!({"id":"__owned_shell__"})),
+            text_reply("done"),
+        ],
+    );
+    assert_eq!(requests.len(), 5);
+    let system = |request: &serde_json::Value| request["messages"][0]["content"].as_str().unwrap().to_owned();
+    let baseline_system = system(&baseline[0]);
+    assert!(requests.iter().all(|request| system(request) == baseline_system));
+
+    let tail = |request: &serde_json::Value| {
+        request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_owned()
+    };
+    assert!(tail(&requests[1]).contains("Current plan:") && tail(&requests[1]).contains("plan-alpha"));
+    assert!(tail(&requests[2]).contains("plan-beta") && !tail(&requests[2]).contains("plan-alpha"));
+    assert!(tail(&requests[3]).contains("Owned shell activities") && tail(&requests[3]).contains("sleep 30"));
+    assert!(tail(&requests[4]).contains("plan-beta") && !tail(&requests[4]).contains("Owned shell activities"));
+
+    let persisted: serde_json::Value = serde_json::from_slice(&std::fs::read(trajectory).unwrap()).unwrap();
+    let messages = persisted["messages"].to_string();
+    assert!(!messages.contains("Current plan:") && !messages.contains("Owned shell activities"));
+}
+
+#[test]
+fn btw_receives_current_plan_after_main_history_is_compacted() {
+    let s = Sandbox::new("aside-compacted-plan");
+    let trajectory = s.project.join("trace.json");
+    let long_prompt = "MAIN_HISTORY_SENTINEL ".repeat(1_500);
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("plan", serde_json::json!({"items":[{"text":"PLAN_AFTER_COMPACTION","status":"in_progress"}]})),
+        say("main answer"),
+        say("compacted summary without the plan"),
+        say("aside answer"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off", "--trajectory"]).arg(&trajectory);
+    let _ = s.repl_with(cmd, &[long_prompt.as_str(), "/compact", "/btw what is the current plan?", "/quit"]);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2]["messages"].to_string().contains("MAIN_HISTORY_SENTINEL"));
+    assert!(requests[3]["messages"].to_string().contains("Current plan:"));
+    let plan_messages: Vec<_> = requests[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message.to_string().contains("PLAN_AFTER_COMPACTION"))
+        .collect();
+    assert_eq!(plan_messages.len(), 1, "{:#?}", requests[3]["messages"]);
+    assert_eq!(plan_messages[0]["role"], "user");
+    assert!(plan_messages[0]["content"].as_str().unwrap().contains("Current plan:"));
+    assert!(requests[3]["tools"].is_null() || requests[3]["tools"].as_array().is_some_and(Vec::is_empty));
+
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(trajectory).unwrap()).unwrap();
+    assert!(!saved["messages"].to_string().contains("Current plan:"));
+    assert!(saved["messages"].to_string().contains("MAIN_HISTORY_SENTINEL"));
+    assert!(saved["compactions"].as_array().is_some_and(|events| !events.is_empty()));
+}
+
+#[test]
 fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review() {
     for mode in ["standard", "careful"] {
         let s = Sandbox::new(&format!("owned-premature-{mode}"));
@@ -3769,6 +3840,48 @@ fn memory_tools_are_offered_only_when_memory_is_on() {
             assert_eq!(tools.contains(&format!("\"{name}\"")), offered, "{level}: {name}");
         }
     }
+}
+
+#[test]
+fn a_channel_marker_in_a_tool_name_is_normalized_before_permissions() {
+    let s = Sandbox::new("tool-channel-marker");
+    let (out, _, requests) = scripted_run(
+        &s,
+        &["--permissions", "read-only", "--memory", "off", "run a command"],
+        vec![
+            tool_reply("bash<|channel|>commentary", serde_json::json!({"command":"touch marker"})),
+            text_reply("done"),
+        ],
+    );
+    assert_eq!(requests.len(), 2);
+    assert!(out.contains("denied by permissions"), "{out}");
+    assert!(!s.project.join("marker").exists(), "normalized calls still pass through permission checks");
+}
+
+#[test]
+fn a_channel_marker_is_normalized_when_the_server_ignores_streaming() {
+    let s = Sandbox::new("tool-channel-marker-json");
+    let call = serde_json::json!({
+        "choices":[{"message":{"tool_calls":[{"id":"call","type":"function","function":{
+            "name":"bash<|channel|>commentary","arguments":"{\"command\":\"touch marker\"}"
+        }}]},"finish_reason":"tool_calls"}]
+    });
+    let done = serde_json::json!({"choices":[{"message":{"content":"done"},"finish_reason":"stop"}]});
+    let (url, server) = scripted_sse(vec![call.to_string(), done.to_string()]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--permissions", "read-only", "--memory", "off", "run a command"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(30)))
+        .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("denied by permissions"));
+    assert!(!s.project.join("marker").exists());
 }
 
 #[test]

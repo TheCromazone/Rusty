@@ -635,9 +635,14 @@ impl Agent {
              Read a file before editing it.\n\
              - Make the smallest change that fully solves the task, in the project's existing style.\n\
              - Verify with a build, the tests, or by running the code. Never claim something works without evidence.\n\
-             - For multi-step work keep a short plan with the plan tool and update it as you go.\n\
-             - Save durable lessons with remember: build and test commands, conventions, traps, user preferences.\n\
-             - If a tool call is denied, don't retry it. Find another way or ask.\n\
+             - For multi-step work keep a short plan with the plan tool and update it as you go.\n",
+        );
+        // Only when the memory tools are offered; with memory off there is no remember.
+        if self.advisor.is_some() {
+            s.push_str("- Save durable lessons with remember: build and test commands, conventions, traps, user preferences.\n");
+        }
+        s.push_str(
+            "- If a tool call is denied, don't retry it. Find another way or ask.\n\
              - No flattery, no filler, no apologies. When you finish, say what changed and how you checked it.\n\
              \n\
              Token discipline: every token you pull into context is paid for on every later step. Search before \
@@ -709,16 +714,6 @@ impl Agent {
                 s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
             }
         }
-        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
-        if !active.is_empty() {
-            s.push_str(&format!("\nOwned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
-        }
-        if !self.plan.is_empty() {
-            s.push_str("\nCurrent plan:\n");
-            for p in &self.plan {
-                s.push_str(&format!("- [{}] {}\n", p.status, p.text));
-            }
-        }
         if display::view() == View::Adhd {
             // Last in the prompt, where it carries the most weight.
             s.push_str(
@@ -728,6 +723,24 @@ impl Agent {
             );
         }
         s
+    }
+
+    /// The plan and running commands: they change every few steps, so they
+    /// ride in the note after the history instead of the system prompt,
+    /// where each change would throw away the provider's cached prefix.
+    fn live_state(&self) -> Option<String> {
+        let mut s = String::new();
+        let active: Vec<_> = self.activities.records().into_iter().filter(|r| r.running()).collect();
+        if !active.is_empty() {
+            s.push_str(&format!("Owned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
+        }
+        if !self.plan.is_empty() {
+            s.push_str("Current plan:\n");
+            for p in &self.plan {
+                s.push_str(&format!("- [{}] {}\n", p.status, p.text));
+            }
+        }
+        (!s.is_empty()).then(|| s.trim_end().to_string())
     }
 
     /// What `--toolset shell` offers: a shell, plus the control calls that
@@ -985,6 +998,9 @@ impl Agent {
         system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
         let mut messages = vec![json!({"role":"system","content":system})];
         messages.extend(self.history.clone());
+        if let Some(state) = self.live_state() {
+            messages.push(json!({"role":"user","content":format!("{}{}", context::NOTE, state)}));
+        }
         messages
     }
 
@@ -1092,6 +1108,7 @@ impl Agent {
             messages.extend(self.history.iter().cloned());
             // Last, so the cached prefix stays the same; never stored in history.
             let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
+            notes.extend(self.live_state());
             if self.smart_compaction() {
                 notes.push(format!("Context in use: {}% of the context budget.", self.context_used()));
             }
@@ -2333,7 +2350,8 @@ impl Agent {
             return n;
         }
         let advice = if self.advisor.is_some() { context::MEMORY_CHARS } else { 0 };
-        (self.system_prompt().len() + self.tool_defs().to_string().len() + advice) / 4
+        let live = self.live_state().map_or(0, |s| s.len());
+        (self.system_prompt().len() + live + self.tool_defs().to_string().len() + advice) / 4
     }
 
     /// Context tokens past which old tool output is trimmed, and past which
@@ -2901,5 +2919,52 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         // A stray Enter must not approve a call that asked first.
         "" | "n" | "N" | "no" => Answer::No(None),
         other => Answer::No(Some(other.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod stable_prompt_tests {
+    use super::*;
+
+    fn agent() -> Agent {
+        let endpoint = crate::llm::Endpoint::new(
+            crate::config::Provider::Compatible,
+            "http://127.0.0.1:1/v1".into(),
+            vec!["offline-test-key".into()],
+        );
+        let client = Arc::new(Client::new(vec![endpoint]).unwrap());
+        Agent::new(client, "test-model".into(), std::env::temp_dir(), Policy::new(Mode::Yolo))
+    }
+
+    #[test]
+    fn plan_and_running_commands_are_ephemeral_and_included_in_estimate() {
+        let mut agent = agent();
+        let system = agent.system_prompt();
+        let initial_estimate = agent.fixed_estimate();
+
+        agent.plan.push(PlanItem { text: "plan detail ".repeat(100), status: "in_progress".into() });
+        let plan_estimate = agent.fixed_estimate();
+        let plan_state = agent.live_state().unwrap();
+        assert!(plan_state.contains("Current plan:") && plan_state.contains("plan detail"));
+        assert!(plan_estimate > initial_estimate, "the plan note must be counted in the fixed context estimate");
+        assert_eq!(agent.system_prompt(), system, "changing the plan must not change the system prompt");
+
+        let command = format!("sleep 30; # {}", "activity detail ".repeat(100));
+        agent.activities.start(&command, 60).unwrap();
+        let activity_estimate = agent.fixed_estimate();
+        let live_state = agent.live_state().unwrap();
+        assert!(live_state.contains("Owned shell activities") && live_state.contains("activity detail"));
+        assert!(activity_estimate > plan_estimate, "a running activity must be counted in the fixed context estimate");
+        assert_eq!(agent.system_prompt(), system, "changing activities must not change the system prompt");
+
+        let persisted = agent.trajectory()["messages"].to_string();
+        assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
+        let aside = agent.aside_context();
+        let aside_state = aside.last().unwrap()["content"].as_str().unwrap();
+        assert!(aside_state.contains("Current plan:") && aside_state.contains("plan detail"));
+        assert!(aside_state.contains("Owned shell activities") && aside_state.contains("activity detail"));
+        assert_eq!(aside.len(), agent.history.len() + 2, "the aside note is ephemeral and follows the copied history");
+        assert!(!serde_json::to_string(&agent.history).unwrap().contains("Owned shell activities"));
+        agent.activities.cancel_all(false);
     }
 }
