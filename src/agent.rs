@@ -354,6 +354,7 @@ pub struct Agent {
     /// so a compaction can tell an undone edit from a change.
     pub start_blobs: Option<std::collections::HashMap<String, String>>,
     pub session_path: Option<PathBuf>,
+    session_lease: Option<crate::session::Lease>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
     /// MCP servers' tools, offered to the lead only.
@@ -442,6 +443,7 @@ impl Agent {
             snapshot: String::new(),
             start_blobs: None,
             session_path: None,
+            session_lease: None,
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
@@ -1910,7 +1912,7 @@ impl Agent {
         let mut stalls_in_a_row = 0;
         loop {
             let finished = self.run_turn(&prompt)?;
-            self.save_session();
+            self.save_session()?;
             stalls_in_a_row = if self.last_turn_stalled { stalls_in_a_row + 1 } else { 0 };
             if stalls_in_a_row == 3 {
                 // An unfinished goal, not an error: the harness contract
@@ -2039,7 +2041,7 @@ impl Agent {
             if let Err(e) = self.run_turn(&text) {
                 break Err(e);
             }
-            self.save_session();
+            self.save_session()?;
             let ctl = self.loop_ctl.as_ref().unwrap();
             if signal::interrupted() || ctl.stop || max_runs.is_some_and(|m| run >= m) {
                 break Ok(());
@@ -2493,13 +2495,21 @@ impl Agent {
         self.client.budget.snapshot()
     }
 
-    pub fn save_session(&mut self) {
-        let Some(path) = &self.session_path else { return };
+    pub fn new_session(&mut self, dir: &std::path::Path) -> Result<()> {
+        let path = crate::session::create(dir)?;
+        let lease = crate::session::Lease::acquire(&path)?;
+        self.session_path = Some(path);
+        self.session_lease = Some(lease);
+        self.save_session()
+    }
+
+    pub fn save_session(&mut self) -> Result<()> {
+        let Some(path) = &self.session_path else { return Ok(()) };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
-        let _ = rusty::privacy::write_json(path, body);
+        crate::session::save(path, body)?;
         let changes = self.infra.change_record();
         if !changes.is_empty() {
             use std::io::Write;
@@ -2507,9 +2517,11 @@ impl Agent {
                 let _ = f.write_all(infra::redact(&changes).0.as_bytes());
             }
         }
+        Ok(())
     }
 
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
+        let lease = crate::session::Lease::acquire(path)?;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
@@ -2520,6 +2532,7 @@ impl Agent {
             self.history.push(json!({"role":"user","content":format!("{}Saved shell activity receipts are diagnostic only. No live handles are restored and no command is replayed. Inspect prior effects before explicitly starting new work.", context::NOTE)}));
         }
         self.session_path = Some(path.to_path_buf());
+        self.session_lease = Some(lease);
         Ok(())
     }
 
