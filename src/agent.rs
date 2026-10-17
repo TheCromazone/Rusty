@@ -58,7 +58,7 @@ pub struct Calls {
 
 impl Safety {
     /// Records one consequential call from its class and what dispatch said.
-    fn record(&mut self, class: &crate::permissions::Class, out: &str) {
+    fn record(&mut self, class: &crate::permissions::Class, refusal: Option<RefusalKind>) {
         use crate::permissions::Class;
         let calls = match class {
             Class::Risky(_) => &mut self.risky,
@@ -66,17 +66,12 @@ impl Safety {
             _ => return,
         };
         calls.proposed += 1;
-        let declined = out.starts_with("the user declined");
-        let slot = if out.starts_with("denied") {
-            &mut calls.denied
-        } else if declined && (out.contains("nobody is watching") || out.contains("non-interactive session")) {
-            &mut calls.unattended
-        } else if declined {
-            &mut calls.declined
-        } else if out.starts_with("blocked by careful mode") {
-            &mut calls.careful_gate
-        } else {
-            &mut calls.executed
+        let slot = match refusal {
+            Some(RefusalKind::Denied) => &mut calls.denied,
+            Some(RefusalKind::Declined) => &mut calls.declined,
+            Some(RefusalKind::Unattended) => &mut calls.unattended,
+            Some(RefusalKind::CarefulGate) => &mut calls.careful_gate,
+            None => &mut calls.executed,
         };
         *slot += 1;
     }
@@ -142,7 +137,57 @@ struct LoopCtl {
 
 enum Authorization {
     Allowed(Verdict),
-    Refused(String),
+    Refused { kind: RefusalKind, message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusalKind {
+    Denied,
+    Declined,
+    Unattended,
+    CarefulGate,
+}
+
+fn refusal_from_answer() -> RefusalKind {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        RefusalKind::Declined
+    } else {
+        RefusalKind::Unattended
+    }
+}
+
+#[derive(Debug)]
+struct AuthorizationRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl std::fmt::Display for AuthorizationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AuthorizationRefusal {}
+
+fn refusal_error(kind: RefusalKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(AuthorizationRefusal { kind, message })
+}
+
+struct DispatchResult {
+    text: String,
+    refusal: Option<RefusalKind>,
+}
+
+impl DispatchResult {
+    fn refused(kind: RefusalKind, text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: Some(kind) }
+    }
+
+    fn failed(text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: None }
+    }
 }
 
 /// Token accounting for the session, including delegated work.
@@ -984,14 +1029,13 @@ impl Agent {
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
-                    let mut out = self.dispatch(call, &mut d);
-                    self.safety.record(&class, &out);
+                    let result = self.dispatch(call, &mut d);
+                    self.safety.record(&class, result.refusal);
                     // Only a call that actually ran changes anything.
-                    let refused =
-                        ["denied", "the user declined", "blocked by careful mode"].iter().any(|p| out.starts_with(p));
-                    if class != crate::permissions::Class::ReadOnly && !refused {
+                    if class != crate::permissions::Class::ReadOnly && result.refusal.is_none() {
                         changed = true;
                     }
+                    let mut out = result.text;
                     if call.name == "bash" {
                         let failed = out.starts_with("exit code: ") && !out.starts_with("exit code: 0\n");
                         failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
@@ -1209,10 +1253,10 @@ impl Agent {
         }
     }
 
-    fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+    fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> DispatchResult {
         self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
-            return format!("error: unknown tool `{}`; this run offers only bash", call.name);
+            return DispatchResult::failed(format!("error: unknown tool `{}`; this run offers only bash", call.name));
         }
         if self.is_worker
             && !matches!(
@@ -1220,13 +1264,18 @@ impl Agent {
                 "read_file" | "list_files" | "search" | "glob" | "outline" | "bash" | "share"
             )
         {
-            return "denied: a read-only worker can only inspect files and run read-only commands".into();
+            return DispatchResult::refused(
+                RefusalKind::Denied,
+                "denied: a read-only worker can only inspect files and run read-only commands",
+            );
         }
         let raw = if call.arguments.trim().is_empty() { "{}" } else { &call.arguments };
         let args: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                return format!("error: arguments were not valid JSON ({e}). Call the tool again with valid JSON.")
+                return DispatchResult::failed(format!(
+                    "error: arguments were not valid JSON ({e}). Call the tool again with valid JSON."
+                ))
             }
         };
         if let Some(p) = &self.progress {
@@ -1285,15 +1334,18 @@ impl Agent {
                 None => Err(anyhow::anyhow!("unknown MCP tool `{name}`; use one of the mcp__ tools you were given")),
                 Some(tool) => match self.authorize(&tool, &args, d) {
                     Ok(Authorization::Allowed(_)) => self.mcp.call(&tool, &args),
-                    Ok(Authorization::Refused(why)) => Ok(why),
+                    Ok(Authorization::Refused { kind, message }) => Err(refusal_error(kind, message)),
                     Err(e) => Err(e),
                 },
             },
             name => self.run_guarded(name, &args, d),
         };
-        let (text, ok) = match result {
-            Ok(t) => (t, true),
-            Err(e) => (format!("error: {e:#}"), false),
+        let (text, ok, refusal) = match result {
+            Ok(t) => (t, true, None),
+            Err(e) => {
+                let refusal = e.downcast_ref::<AuthorizationRefusal>().map(|r| r.kind);
+                (format!("error: {e:#}"), false, refusal)
+            }
         };
         if ok && self.is_worker && self.board.is_some() {
             if let Ok(cwd) = self.cwd.canonicalize() {
@@ -1320,14 +1372,14 @@ impl Agent {
                 ui::dim(&format!("⊘ {redacted} secret{} redacted", if redacted == 1 { "" } else { "s" }))
             ));
         }
-        text
+        DispatchResult { text, refusal }
     }
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
-            Authorization::Refused(why) => bail!("{why}"),
+            Authorization::Refused { kind, message } => return Err(refusal_error(kind, message)),
         };
         if name == "bash" {
             return self.run_bash(args, &approval, d);
@@ -1355,8 +1407,8 @@ impl Agent {
                 if infra::inspect(command).is_some_and(|a| a.mutating) {
                     bail!("mutating infrastructure commands need the ordinary bash snapshot/verification harness");
                 }
-                if let Authorization::Refused(why) = self.authorize("bash", args, d)? {
-                    return Ok(why);
+                if let Authorization::Refused { kind, message } = self.authorize("bash", args, d)? {
+                    return Err(refusal_error(kind, message));
                 }
                 self.activities.start(command, timeout)?
             }
@@ -1372,9 +1424,10 @@ impl Agent {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.refused(name, args, "denied", &why);
-                return Ok(Authorization::Refused(format!(
-                    "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
-                )));
+                return Ok(Authorization::Refused {
+                    kind: RefusalKind::Denied,
+                    message: format!("denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."),
+                });
             }
             Verdict::Confirm(why) if unattended_destructive(self.policy.mode) => {
                 d.line(&ui::warn(&format!("  ‼ {why}: allowed unattended by RUSTY_ALLOW_DESTRUCTIVE")));
@@ -1389,15 +1442,19 @@ impl Agent {
                     Answer::Yes | Answer::Always => {}
                     Answer::No(None) => {
                         self.refused(name, args, "declined", &why);
-                        return Ok(Authorization::Refused(
-                            "the user declined this destructive call. Do not retry it or look for another \
-                                   route to the same result; ask what they want instead."
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: "the user declined this destructive call. Do not retry it or look for another \
+                                      route to the same result; ask what they want instead."
                                 .into(),
-                        ));
+                        });
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: format!("the user declined this call and said: {fb}"),
+                        });
                     }
                 }
             }
@@ -1418,13 +1475,17 @@ impl Agent {
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
-                        return Ok(Authorization::Refused(
-                            "the user declined this call. Do not retry it; ask what they want instead.".into(),
-                        ));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: "the user declined this call. Do not retry it; ask what they want instead.".into(),
+                        });
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: format!("the user declined this call and said: {fb}"),
+                        });
                     }
                 }
             }
@@ -1443,8 +1504,8 @@ impl Agent {
             bail!("fixed acceptance must be a check, not an infrastructure change");
         }
         let args = json!({"command":check.command(), "timeout_secs":check.timeout().as_secs()});
-        if let Authorization::Refused(why) = self.authorize("bash", &args, d)? {
-            bail!("{why}");
+        if let Authorization::Refused { message, .. } = self.authorize("bash", &args, d)? {
+            bail!("{message}");
         }
         let before = verification::fingerprint(&self.cwd)?;
         d.tool("bash", &args);
@@ -1488,7 +1549,7 @@ impl Agent {
         if self.execution_mode == ExecutionMode::Careful {
             if let Some(refusal) = self.infra.gate(&action) {
                 self.infra.record_refusal("careful", &cmd, "blocked", "needs a dry run first");
-                return Ok(refusal);
+                return Err(refusal_error(RefusalKind::CarefulGate, refusal));
             }
         }
         let mut snapshot = None;
