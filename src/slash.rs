@@ -508,17 +508,17 @@ impl Hinter for SlashHelper {
 
 impl Highlighter for SlashHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        let first = line.split(' ').next().unwrap_or("");
-        let known = COMMANDS.iter().any(|c| c.name == first) || ALIASES.contains(&first);
-        if line.starts_with('/') && known {
-            Cow::Owned(format!("{}{}", ui::info(first), &line[first.len()..]))
-        } else {
-            Cow::Borrowed(line)
-        }
+        Cow::Owned(ui::user(line))
     }
 
-    fn highlight_char(&self, line: &str, _pos: usize, _forced: bool) -> bool {
-        line.starts_with('/')
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
+        Cow::Owned(ui::user(prompt))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        // Include ordinary text and continuation lines in every redraw,
+        // including the final redraw on Enter. Wrap length is not a state.
+        true
     }
 }
 
