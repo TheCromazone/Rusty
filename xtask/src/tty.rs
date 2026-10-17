@@ -386,6 +386,10 @@ fn side_ctrl_c(binary: &Path, cwd: &Path, endpoint: &str, home: &Path) -> Result
     busy.wait_for(&[Lit("side question running")], "busy side task did not start")?;
     busy.send("\x03")?;
     busy.wait_for(&[Lit("side turn interrupted")], "first Ctrl-C did not cancel the selected child")?;
+    // The side-result notice is emitted before the REPL starts its next
+    // readline call. Wait for raw-mode/prompt readiness before sending /back;
+    // otherwise the PTY can deliver the command during the handoff.
+    busy.wait_for(prompt, "parent prompt did not return after child cancellation")?;
     busy.send("/back\r")?;
     busy.wait_for(&[Lit("main chat selected")], "parent did not survive child cancellation")?;
     busy.wait_for(prompt, "parent prompt did not return after child cancellation")?;
