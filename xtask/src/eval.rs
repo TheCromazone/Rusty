@@ -1117,6 +1117,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_binary_still_open_for_writing_starts_once_it_is_closed() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_dir().unwrap();

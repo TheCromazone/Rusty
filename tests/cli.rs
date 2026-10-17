@@ -23,7 +23,10 @@ struct Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("rusty-e2e-{name}-{}", std::process::id()));
+        // macOS's per-user temporary directory can leave no room for the
+        // memory daemon's Unix socket name. Match the other offline fixtures.
+        let parent = if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+        let root = parent.join(format!("rusty-e2e-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
         let project = root.join("project");
