@@ -1962,6 +1962,63 @@ fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
 }
 
 #[test]
+fn codex_eof_retries_before_text_but_not_after_text() {
+    let s = Sandbox::new("codex-eof-before-text");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let access = fake_jwt(serde_json::json!({"exp": rusty::unix_now() + 3600}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":access,"refresh_token":"fixture-refresh","account_id":"acct_fixture"}}).to_string(),
+    )
+    .unwrap();
+
+    let incomplete = "data: {\"type\":\"response.created\",\"response\":{}}\n\n".to_owned();
+    let completed = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered answer\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n\n"
+    )
+    .to_owned();
+    let (codex, server) = scripted_http(vec![(200, incomplete), (200, completed)]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5-codex-test", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("recovered answer"));
+    assert_eq!(server.join().unwrap().len(), 2, "an EOF before answer text is retried");
+
+    let s = Sandbox::new("codex-eof-after-text");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let access = fake_jwt(serde_json::json!({"exp": rusty::unix_now() + 3600}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":access,"refresh_token":"fixture-refresh","account_id":"acct_fixture"}}).to_string(),
+    )
+    .unwrap();
+    let partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial answer\"}\n\n".to_owned();
+    let (codex, server) = scripted_http(vec![(200, partial)]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5-codex-test", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a partial answer without a terminal event is incomplete");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("partial answer"));
+    assert_eq!(server.join().unwrap().len(), 1, "never retry after answer text was shown");
+}
+
+#[test]
 fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     let s = Sandbox::new("codex-default");
     let codex_home = s.home.join("codex");

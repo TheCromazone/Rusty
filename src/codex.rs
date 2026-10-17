@@ -333,6 +333,7 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     let mut reply = Reply { raw_key: ITEMS_KEY, ..Default::default() };
     let mut items: Vec<Value> = Vec::new();
     let mut streamed_text = false;
+    let mut saw_terminal = false;
     let mut saw_data = false;
     let mut raw = String::new();
 
@@ -406,6 +407,7 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
                 }
             }
             "response.completed" | "response.incomplete" | "response.done" => {
+                saw_terminal = true;
                 let r = &v["response"];
                 if let Some(u) = r.get("usage").filter(|u| !u.is_null()) {
                     reply.usage = Some(Usage {
@@ -428,6 +430,9 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     }
     if !saw_data && !raw.trim().is_empty() {
         bail!("unexpected response: {}", crate::ui::truncate(raw.trim(), 300));
+    }
+    if !saw_terminal {
+        bail!("stream interrupted: Codex Responses stream ended before a terminal event");
     }
     if reply.finish_reason.is_none() {
         reply.finish_reason = Some(if reply.tool_calls.is_empty() { "stop".into() } else { "tool_calls".into() });
@@ -674,6 +679,26 @@ mod tests {
         let reply = parse_stream(resp, &mut |_| true).unwrap();
         assert_eq!(reply.finish_reason.as_deref(), Some("length"));
         assert_eq!(reply.content, "partial");
+    }
+
+    #[test]
+    fn eof_without_terminal_event_is_interrupted_before_or_after_text() {
+        let resp = stream(&[json!({"type": "response.created", "response": {}})]);
+        let err = parse_stream(resp, &mut |_| true).unwrap_err().to_string();
+        assert!(err.contains("stream interrupted") && err.contains("terminal event"), "{err}");
+
+        let resp = stream(&[json!({"type": "response.output_text.delta", "delta": "partial answer"})]);
+        let mut shown = String::new();
+        let err = parse_stream(resp, &mut |delta| {
+            if let Delta::Content(text) = delta {
+                shown.push_str(text);
+            }
+            true
+        })
+        .unwrap_err()
+        .to_string();
+        assert_eq!(shown, "partial answer");
+        assert!(err.contains("stream interrupted") && err.contains("terminal event"), "{err}");
     }
 
     #[test]
