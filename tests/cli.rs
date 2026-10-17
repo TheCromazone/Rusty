@@ -4130,3 +4130,82 @@ fn starting_a_new_session_preserves_the_previous_saved_conversation() {
     assert!(sessions.iter().any(|s| s.contains("FIRST_SESSION_SENTINEL") && !s.contains("SECOND_SESSION_SENTINEL")));
     assert!(sessions.iter().any(|s| s.contains("SECOND_SESSION_SENTINEL") && !s.contains("FIRST_SESSION_SENTINEL")));
 }
+
+#[test]
+fn workers_inherit_project_rules_and_parent_user_constraints() {
+    let s = Sandbox::new("worker-contract");
+    std::fs::write(s.project.join("AGENTS.md"), "PROJECT_RULE_SENTINEL: do not inspect private files.").unwrap();
+    let (url, server) = scripted_endpoint(vec![swarm_call(1), say("no issues"), say("done")]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--memory", "off", "--agents", "swarm", "USER_RULE_SENTINEL: exclude billing"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    let worker = requests[1]["messages"].to_string();
+    assert!(worker.contains("PROJECT_RULE_SENTINEL"), "project rules missing: {worker}");
+    assert!(worker.contains("USER_RULE_SENTINEL"), "parent constraints missing: {worker}");
+    assert!(!requests[1]["tools"].to_string().contains("write_file"));
+}
+
+#[test]
+fn worker_terminal_state_does_not_come_from_its_prose() {
+    for (name, worker_replies, label) in [
+        ("prefix", vec![say("failed: the parser rejects valid input")], "done"),
+        (
+            "length",
+            vec![serde_json::json!({"choices":[{"delta":{"content":"partial finding"},"finish_reason":"length"}]})],
+            "incomplete: output limit",
+        ),
+        ("empty", vec![say(""), say("")], "failed"),
+    ] {
+        let s = Sandbox::new(&format!("worker-state-{name}"));
+        let mut replies = vec![swarm_call(1)];
+        replies.extend(worker_replies);
+        replies.push(say("done"));
+        let (url, server) = scripted_endpoint(replies);
+        let out = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--mode", "standard", "--memory", "off", "--agents", "swarm", "inspect"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let requests = server.join().unwrap();
+        let lead = requests.last().unwrap()["messages"].to_string();
+        assert!(lead.contains(&format!("slice 0 ({label})")), "{name}: {lead}");
+        if name == "prefix" {
+            assert!(lead.contains("failed: the parser rejects valid input"));
+        }
+    }
+}
+
+#[test]
+fn a_worker_that_exhausts_its_steps_returns_partial_findings_as_incomplete() {
+    let s = Sandbox::new("worker-step-limit");
+    let mut replies = vec![swarm_call(1)];
+    for i in 0..30 {
+        let mut r = tool_reply("glob", serde_json::json!({"pattern":format!("missing-{i}")}));
+        r["choices"][0]["delta"]["content"] = serde_json::json!("still investigating");
+        replies.push(r);
+    }
+    replies.push(say("done"));
+    let (url, server) = scripted_endpoint(replies);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--memory", "off", "--agents", "swarm", "inspect"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 32);
+    let lead = requests.last().unwrap()["messages"].to_string();
+    assert!(lead.contains("slice 0 (incomplete: step limit)"), "{lead}");
+    assert!(lead.contains("still investigating"));
+}
