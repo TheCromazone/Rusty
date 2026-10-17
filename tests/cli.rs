@@ -1936,6 +1936,47 @@ fn an_overload_inside_the_stream_is_retried() {
 }
 
 #[test]
+fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-stall");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let answer = format!("data: {}\n\ndata: [DONE]\n\n", text_reply("still here"));
+        let mut seen = 0;
+        for body in ["", answer.as_str()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = stream.read(&mut buf);
+            seen += 1;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            if body.is_empty() {
+                // Headers arrived, then nothing: longer than the idle limit below.
+                std::thread::sleep(Duration::from_secs(3));
+            } else {
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        }
+        seen
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still here"));
+    assert_eq!(server.join().unwrap(), 2, "the quiet stream was given up on and retried");
+    assert!(started.elapsed() < Duration::from_secs(20), "the stall was noticed within the idle limit");
+}
+
+#[test]
 fn an_error_after_text_has_streamed_is_not_retried() {
     let s = Sandbox::new("stream-late-error");
     let partial = serde_json::json!({"choices": [{"delta": {"content": "half an answer"}, "finish_reason": null}]});
