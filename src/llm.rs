@@ -782,6 +782,13 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
         reply.usage = v.get("usage").and_then(usage_of);
     }
 
+    for c in &mut calls {
+        // gpt-oss on some servers leaks its channel marker into the name
+        // (`read_file<|channel|>commentary`); the tool is the part before it.
+        if let Some(at) = c.name.find("<|") {
+            c.name.truncate(at);
+        }
+    }
     calls.retain(|c| !c.name.is_empty());
     for (i, c) in calls.iter_mut().enumerate() {
         if c.id.is_empty() {
