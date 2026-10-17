@@ -83,7 +83,23 @@ fn serve(stream: TcpStream) -> Result<()> {
 
     out.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")?;
     let mut sse = Sse(out);
-    if prompt.contains("Unix") {
+    if prompt == "aside-sentinel" {
+        sse.content("ASIDE_ANSWER: this is a context-only answer.\n", Some("stop"))?;
+    } else if prompt == "aside-capture" {
+        if tools == 0 {
+            sse.call(
+                "running",
+                "bash",
+                r#"{"command":"printf started > main-started.txt; sleep 3; printf finished > main-finished.txt"}"#,
+            )?;
+        } else {
+            for i in 0..24 {
+                sse.content(&format!("Main line {i:02}: the side answer did not interrupt this task.\n"), None)?;
+                pause(0.03);
+            }
+            sse.content("CAPTURE_COMPLETE\n", Some("stop"))?;
+        }
+    } else if prompt.contains("Unix") {
         for _ in 0..60 {
             pause(0.15);
             sse.content("A long streamed reply for interruption.\n", None)?;
