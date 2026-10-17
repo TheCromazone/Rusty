@@ -998,6 +998,9 @@ impl Agent {
         system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
         let mut messages = vec![json!({"role":"system","content":system})];
         messages.extend(self.history.clone());
+        if let Some(state) = self.live_state() {
+            messages.push(json!({"role":"user","content":format!("{}{}", context::NOTE, state)}));
+        }
         messages
     }
 
@@ -2956,6 +2959,12 @@ mod stable_prompt_tests {
 
         let persisted = agent.trajectory()["messages"].to_string();
         assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
+        let aside = agent.aside_context();
+        let aside_state = aside.last().unwrap()["content"].as_str().unwrap();
+        assert!(aside_state.contains("Current plan:") && aside_state.contains("plan detail"));
+        assert!(aside_state.contains("Owned shell activities") && aside_state.contains("activity detail"));
+        assert_eq!(aside.len(), agent.history.len() + 2, "the aside note is ephemeral and follows the copied history");
+        assert!(!serde_json::to_string(&agent.history).unwrap().contains("Owned shell activities"));
         agent.activities.cancel_all(false);
     }
 }

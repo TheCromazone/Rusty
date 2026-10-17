@@ -2421,6 +2421,41 @@ fn volatile_plan_and_activity_state_stays_after_the_history() {
 }
 
 #[test]
+fn btw_receives_current_plan_after_main_history_is_compacted() {
+    let s = Sandbox::new("aside-compacted-plan");
+    let trajectory = s.project.join("trace.json");
+    let long_prompt = "MAIN_HISTORY_SENTINEL ".repeat(1_500);
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("plan", serde_json::json!({"items":[{"text":"PLAN_AFTER_COMPACTION","status":"in_progress"}]})),
+        say("main answer"),
+        say("compacted summary without the plan"),
+        say("aside answer"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off", "--trajectory"]).arg(&trajectory);
+    let _ = s.repl_with(cmd, &[long_prompt.as_str(), "/compact", "/btw what is the current plan?", "/quit"]);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[2]["messages"].to_string().contains("MAIN_HISTORY_SENTINEL"));
+    assert!(requests[3]["messages"].to_string().contains("Current plan:"));
+    let plan_messages: Vec<_> = requests[3]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message.to_string().contains("PLAN_AFTER_COMPACTION"))
+        .collect();
+    assert_eq!(plan_messages.len(), 1, "{:#?}", requests[3]["messages"]);
+    assert_eq!(plan_messages[0]["role"], "user");
+    assert!(plan_messages[0]["content"].as_str().unwrap().contains("Current plan:"));
+    assert!(requests[3]["tools"].is_null() || requests[3]["tools"].as_array().is_some_and(Vec::is_empty));
+
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(trajectory).unwrap()).unwrap();
+    assert!(!saved["messages"].to_string().contains("Current plan:"));
+    assert!(saved["messages"].to_string().contains("MAIN_HISTORY_SENTINEL"));
+    assert!(saved["compactions"].as_array().is_some_and(|events| !events.is_empty()));
+}
+
+#[test]
 fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review() {
     for mode in ["standard", "careful"] {
         let s = Sandbox::new(&format!("owned-premature-{mode}"));
