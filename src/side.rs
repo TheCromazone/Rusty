@@ -26,6 +26,10 @@ pub struct Meta {
     pub base_len: usize,
     #[serde(default)]
     pub discussion: Vec<Value>,
+    #[serde(default)]
+    pub observations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sent_heads: Vec<String>,
 }
 #[derive(Clone)]
 pub struct Parent {
@@ -98,6 +102,12 @@ fn set_focus(book: &mut Book, id: Option<String>) {
 
 pub fn command(parent: &Parent, input: &str) -> Result<()> {
     poll_results(&parent.book);
+    if input.starts_with("/send") {
+        if input.trim() != "/send main" {
+            bail!("usage: /send main (from a selected side chat)");
+        }
+        return start_job(parent, None);
+    }
     let rest = input.strip_prefix("/side").unwrap_or("").trim();
     let (action, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     if input == "/back" || action == "back" {
@@ -141,6 +151,8 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
                 parent_id: parent.id(),
                 base_len: parent.history.len(),
                 discussion: Vec::new(),
+                observations: BTreeMap::new(),
+                sent_heads: Vec::new(),
             },
         );
         agent.new_session(&parent.dir())?;
@@ -199,6 +211,9 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
 }
 
 pub fn submit(parent: &Parent, question: &str) -> Result<()> {
+    start_job(parent, Some(question))
+}
+fn start_job(parent: &Parent, question: Option<&str>) -> Result<()> {
     poll_results(&parent.book);
     let mut book = parent.book.lock().unwrap();
     let id = book.focus.clone().context("no side chat selected")?;
@@ -208,41 +223,56 @@ pub fn submit(parent: &Parent, question: &str) -> Result<()> {
         book.children.insert(id, Child { title, state });
         bail!("side chat is still running; wait for its answer or use /back");
     };
+    let source_head = crate::inbox::digest(&serde_json::to_vec(&agent.side_meta.as_ref().unwrap().discussion)?);
+    if question.is_none() && agent.side_meta.as_ref().unwrap().sent_heads.contains(&source_head) {
+        book.children.insert(id, Child { title, state: State::Idle(agent) });
+        display::notice("this side revision was already sent to main");
+        return Ok(());
+    }
+    let target = parent.path.clone();
+    let source_id = id.clone();
+    let summarizing = question.is_none();
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let stop = cancel.clone();
-    let question = question.to_string();
+    let question = question.map(str::to_string);
     let join = std::thread::spawn(move || {
         let _scope = signal::cancel_scope(stop);
         let before = (agent.totals.prompt, agent.totals.completion);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent.run_turn(&question)))
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("side turn panicked")))
-            .and_then(|finished| {
-                let answer = agent
-                    .history
-                    .iter()
-                    .rev()
-                    .find(|m| m["role"] == "assistant")
-                    .and_then(|m| m["content"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !finished {
-                    bail!("side turn interrupted; partial findings are unconfirmed");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String> {
+            if let Some(question)=question {
+                let finished=agent.run_turn(&question)?;
+                let answer=agent.history.iter().rev().find(|m|m["role"]=="assistant")
+                    .and_then(|m|m["content"].as_str()).unwrap_or("").to_string();
+                if let Some(meta)=&mut agent.side_meta {
+                    meta.discussion.push(json!({"question":crate::ui::truncate(&question,8000),"answer":crate::ui::truncate(&answer,8000),"interrupted":!finished}));
+                    if meta.discussion.len()>64 {meta.discussion.remove(0);}
                 }
+                if !finished {bail!("side turn interrupted; partial findings are unconfirmed");}
                 Ok(answer)
-            });
-        if let Some(meta) = &mut agent.side_meta {
-            meta.discussion.push(
-                json!({"question":question,"answer":result.as_ref().map(String::as_str).unwrap_or("unconfirmed")}),
-            );
-        }
+            } else {
+                let summary=agent.summarize_side()?;
+                let meta=agent.side_meta.as_mut().unwrap();
+                let transfer=crate::inbox::Transfer {
+                    id:crate::inbox::digest(format!("{source_id}:{source_head}").as_bytes()),parent_id:meta.parent_id.clone(),
+                    source_id,source_head:source_head.clone(),title:meta.title.clone(),summary:crate::ui::truncate(&summary,8000).to_string(),observations:meta.observations.clone(),
+                };
+                crate::inbox::enqueue(&target,&transfer)?;
+                meta.sent_heads.push(source_head);
+                Ok(format!("summary queued for main:\n{summary}"))
+            }
+        })).unwrap_or_else(|_|Err(anyhow::anyhow!("side turn panicked")));
         let result = agent.save_session().and(result);
         let used = (agent.totals.prompt - before.0, agent.totals.completion - before.1);
         let _ = tx.send((agent, result, used.0, used.1));
     });
     book.children.insert(id.clone(), Child { title, state: State::Running { rx, cancel, join: Some(join) } });
     set_focus(&mut book, Some(id));
-    display::notice("side question running; /back returns to main, Ctrl-C stops this side");
+    display::notice(if summarizing {
+        "preparing side summary for main"
+    } else {
+        "side question running; /back returns to main, Ctrl-C stops this side"
+    });
     Ok(())
 }
 fn poll_results(shared: &Shared) {
@@ -277,7 +307,7 @@ fn poll_results(shared: &Shared) {
 pub fn poll(parent: &Parent) {
     poll_results(&parent.book);
     if let Some(input) = signal::peek_queued() {
-        if input == "/back" || input == "/side" || input.starts_with("/side ") {
+        if input == "/back" || input == "/side" || input.starts_with("/side ") || input.starts_with("/send") {
             signal::take_queued();
             if let Err(e) = command(parent, &input) {
                 display::notice(&format!("side: {e:#}"));

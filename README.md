@@ -517,3 +517,18 @@ outstanding side turns. Settings commands require returning to main first.
 The shared checkout is live, not frozen, and side tools are classifier-enforced
 read-only, not an OS sandbox. Side tools are local-only for now, with no MCP
 servers or nested delegation. All model calls share the parent's root budget.
+
+### Returning findings to main
+
+From a selected side, `/send main` prepares a bounded summary of that side's
+own discussion and queues it for its recorded parent. It uses no tools and
+shares the root budget. The parent receives the note between tool steps, or
+on the next idle input cycle, with source/revision labels and warnings when
+observed files changed. The note is generated advice, not a user instruction,
+permission grant or passing verification receipt. An idle parent does not start
+a new coding turn automatically; use `/back` and continue when ready.
+
+The inbox survives restart. Delivery receipts are saved with the parent before
+queued notes are removed, so replay does not duplicate a summary. Repeating
+`/send main` without further side discussion does not spend another model call.
+Sending findings does not apply a patch, merge a branch or close the main goal.

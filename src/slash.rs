@@ -66,6 +66,7 @@ pub const COMMANDS: &[Command] = &[
         "open a persistent read-only side discussion",
         "memory & context",
     ),
+    cmd("/send", "main", "send selected side findings to the main chat", "memory & context"),
     cmd("/back", "", "return to the main chat", "memory & context"),
     cmd("/btw", "[question]", "ask from existing context without changing the main chat", "memory & context"),
     cmd("/context", "", "where the window is going", "memory & context"),
