@@ -4130,3 +4130,33 @@ fn starting_a_new_session_preserves_the_previous_saved_conversation() {
     assert!(sessions.iter().any(|s| s.contains("FIRST_SESSION_SENTINEL") && !s.contains("SECOND_SESSION_SENTINEL")));
     assert!(sessions.iter().any(|s| s.contains("SECOND_SESSION_SENTINEL") && !s.contains("FIRST_SESSION_SENTINEL")));
 }
+
+#[test]
+fn a_btw_answer_has_no_tools_and_stays_out_of_the_main_transcript() {
+    let s = Sandbox::new("context-aside");
+    let attack = tool_reply("write_file", serde_json::json!({"path":"should-not-exist","content":"bad"}));
+    let (url, server) = scripted_endpoint(vec![say("MAIN_FACT"), attack, say("main continues")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off", "--max-requests", "3"]);
+    let shown = s.repl_with(cmd, &["Remember MAIN_FACT", "/btw PRIVATE_ASIDE_QUESTION", "continue main", "/quit"]);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1]["tools"].is_null() || requests[1]["tools"].as_array().is_some_and(Vec::is_empty));
+    assert!(requests[1]["messages"].to_string().contains("MAIN_FACT"));
+    assert!(!requests[2]["messages"].to_string().contains("PRIVATE_ASIDE_QUESTION"));
+    assert!(!s.project.join("should-not-exist").exists());
+    assert!(shown.contains("No tools were executed"));
+}
+
+#[test]
+fn btw_followups_retain_only_the_private_aside_context() {
+    let s = Sandbox::new("aside-followup");
+    let (url, server) = scripted_endpoint(vec![say("PRIVATE_ASIDE_ANSWER"), say("second aside"), say("main answer")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["/btw PRIVATE_FIRST_QUESTION", "/btw follow up", "main question", "/quit"]);
+    let requests = server.join().unwrap();
+    assert!(requests[1]["messages"].to_string().contains("PRIVATE_ASIDE_ANSWER"));
+    assert!(!requests[2]["messages"].to_string().contains("PRIVATE_ASIDE_ANSWER"));
+    assert!(!requests[2]["messages"].to_string().contains("PRIVATE_FIRST_QUESTION"));
+}

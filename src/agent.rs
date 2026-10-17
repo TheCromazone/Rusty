@@ -246,6 +246,7 @@ pub struct Agent {
     checker_owed: bool,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
+    aside_memory: crate::aside::Shared,
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
@@ -347,6 +348,7 @@ impl Agent {
             checker_owed: false,
             cwd,
             history: Vec::new(),
+            aside_memory: Default::default(),
             archived: Vec::new(),
             trajectory_path: None,
             trajectory_saved: None,
@@ -495,6 +497,7 @@ impl Agent {
     }
 
     pub fn clear(&mut self) {
+        self.aside_memory = Default::default();
         self.archived.append(&mut self.history);
         self.plan.clear();
         self.goal = None;
@@ -755,6 +758,33 @@ impl Agent {
         Value::Array(defs)
     }
 
+    fn aside_context(&self) -> Vec<Value> {
+        let mut system = self.system_prompt();
+        system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
+        let mut messages = vec![json!({"role":"system","content":system})];
+        messages.extend(self.history.clone());
+        messages
+    }
+
+    fn collect_aside_usage(&mut self) {
+        for (model, prompt, completion) in self.aside_memory.lock().unwrap().usage.drain(..) {
+            self.totals.add_request(&model, prompt, completion);
+        }
+    }
+
+    pub fn ask_aside(&mut self, question: &str) -> Result<()> {
+        let _scope = crate::aside::Scope::enter(
+            self.client.clone(),
+            self.model.clone(),
+            self.aside_context(),
+            self.aside_memory.clone(),
+        );
+        crate::aside::submit(question);
+        crate::aside::settle()?;
+        self.collect_aside_usage();
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ turn
 
     /// Runs one user turn to completion. Returns false if interrupted.
@@ -770,6 +800,14 @@ impl Agent {
         }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
         let mut d = Display::new(self.is_worker);
+        let _aside_scope = (!self.is_worker).then(|| {
+            crate::aside::Scope::enter(
+                self.client.clone(),
+                self.model.clone(),
+                self.aside_context(),
+                self.aside_memory.clone(),
+            )
+        });
         let before = self.totals.clone();
         // Only consecutive unchanged results count: an edit, a different call,
         // or new output is progress. Retain one call rather than a turn-sized map.
@@ -833,6 +871,9 @@ impl Agent {
             }
 
             let started = Instant::now();
+            if !self.is_worker {
+                crate::aside::refresh(self.aside_context());
+            }
             let tools = self.tool_defs();
             let sent = context::estimate(&messages) + tools.to_string().len() / 4;
             let mut reply = match self.ask(&mut d, messages, tools) {
@@ -1060,6 +1101,10 @@ impl Agent {
             }
         }
 
+        if !self.is_worker {
+            crate::aside::settle()?;
+            self.collect_aside_usage();
+        }
         let cancelled = self.activities.cancel_all(signal::interrupted());
         if cancelled > 0 {
             let note = format!("cancelled {cancelled} owned command(s) at turn end; their work is unconfirmed");
@@ -2399,6 +2444,7 @@ impl Agent {
         }
         self.session_path = Some(path.to_path_buf());
         self.session_lease = Some(lease);
+        self.aside_memory = Default::default();
         Ok(())
     }
 

@@ -474,3 +474,13 @@ against a local stand-in provider. The inspection replays each capture on a
 small terminal screen model and checks every panel frame for complete borders,
 an unused wrap column, colour, a footer that stays on the bottom row, and a
 clean exit. `cargo xtask tty` runs the same checks as a quick pass/fail.
+
+### A question on the side
+
+`/btw <question>` answers from the current conversation with no tools. It can
+run while a model response or shell command is in progress. The main task
+continues; the aside is shown separately and never enters its transcript,
+plan, goal, verification or learned memory. Recent aside exchanges provide
+context for follow-up `/btw` questions. `/btw` alone shows the last answer.
+Asides use the same model client and root budget, and their usage is included
+in the session totals. They are temporary and disappear when the process exits.

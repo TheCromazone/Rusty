@@ -9,9 +9,24 @@
 //! reasoning stream) and `adhd` (one status line, short answers, nothing else).
 
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU8, Ordering};
+thread_local! { static ACTIVE_FOOTER: RefCell<Weak<RefCell<crate::footer::Footer>>> = const { RefCell::new(Weak::new()) }; }
+
+/// Runtime side results use the terminal owner's footer rather than painting
+/// a second progress panel over the active turn.
+pub fn notice(text: &str) {
+    ACTIVE_FOOTER.with(|f| {
+        if let Some(footer) = f.borrow().upgrade() {
+            footer.borrow_mut().clear(&mut std::io::stdout());
+        }
+    });
+    println!("\n{}", crate::ui::info(text));
+}
+
 use std::time::{Duration, Instant};
 
 use crate::ui;
@@ -72,7 +87,7 @@ pub struct Display {
     started: Instant,
     last_draw: Instant,
     frame: usize,
-    footer: crate::footer::Footer,
+    footer: Rc<RefCell<crate::footer::Footer>>,
     in_content: bool,
     in_reasoning: bool,
     /// Something was printed this turn, so the answer gets a blank line above it.
@@ -98,13 +113,17 @@ impl Drop for Display {
 impl Display {
     pub fn new(quiet: bool) -> Self {
         let now = Instant::now();
+        let footer = Rc::new(RefCell::new(crate::footer::Footer::default()));
+        if !quiet {
+            ACTIVE_FOOTER.with(|f| *f.borrow_mut() = Rc::downgrade(&footer));
+        }
         Self {
             quiet,
             verb: ui::VERBS[ui::rand(ui::VERBS.len())],
             started: now,
             last_draw: now - Duration::from_secs(1),
             frame: 0,
-            footer: crate::footer::Footer::default(),
+            footer,
             in_content: false,
             in_reasoning: false,
             printed: false,
@@ -147,7 +166,7 @@ impl Display {
         };
         let verb = if self.in_content { "Responding" } else { self.verb };
         let mut buf = Vec::new();
-        self.footer.draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
+        self.footer.borrow_mut().draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(&buf);
         let _ = out.flush();
@@ -155,19 +174,19 @@ impl Display {
 
     fn clear_spinner(&mut self) {
         let mut out = std::io::stdout().lock();
-        self.footer.clear(&mut out);
+        self.footer.borrow_mut().clear(&mut out);
         let _ = out.flush();
     }
 
     /// Clear, append and repaint in one write, so logs flow past a steady panel.
     fn append(&mut self, s: &str) {
         let mut buf = Vec::new();
-        self.footer.clear(&mut buf);
+        self.footer.borrow_mut().clear(&mut buf);
         let _ = writeln!(buf, "{s}");
         if ui::tty() && !self.in_reasoning {
             let extra = if self.status.is_empty() { String::new() } else { self.status.clone() };
             let verb = if self.in_content { "Responding" } else { self.verb };
-            self.footer.draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
+            self.footer.borrow_mut().draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
         }
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(&buf);
