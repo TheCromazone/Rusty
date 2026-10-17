@@ -227,10 +227,38 @@ fn banner_and_help_list_every_command() {
         "/triage",
         "/change",
         "/postmortem",
+        "/resume",
     ] {
         assert!(out.contains(cmd), "/help is missing {cmd}");
     }
     assert!(out.contains("link closed"), "no goodbye on EOF");
+}
+
+#[test]
+fn sessions_get_ids_titles_a_listing_search_and_resume() {
+    let s = Sandbox::new("sessions");
+    let (out, _, _) = scripted_run(&s, &["make the parser faster"], vec![text_reply("done")]);
+    let id = out.split("rusty -c ").nth(1).map(|r| r.chars().take(8).collect::<String>()).unwrap_or_default();
+    assert_eq!(id.len(), 8, "no resume hint in:\n{out}");
+    let list = |args: &[&str]| {
+        let out = s.cmd().args(args).stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let all = list(&["--sessions"]);
+    assert!(all.contains(&id) && all.contains("make the parser faster") && all.contains("2 msgs"), "{all}");
+    assert!(list(&["--sessions", "parser speed"]).contains(&id));
+    assert!(!list(&["--sessions", "kubernetes"]).contains(&id));
+    let (out, _, requests) = scripted_run(&s, &["-c", &id[..4], "and the lexer?"], vec![text_reply("sure")]);
+    assert!(out.contains("resumed") && out.contains(&id) && out.contains("make the parser faster"), "{out}");
+    assert!(requests[0]["messages"].to_string().contains("make the parser faster"), "history was not carried over");
+    let (out, _, _) = scripted_run(&s, &["-c", "and now?"], vec![text_reply("ok")]);
+    assert!(out.contains("resumed") && out.contains("4 messages"), "{out}");
+    let missing = s.cmd().args(["-c", "deadbeef", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no session deadbeef"));
+    let repl = s.repl(&["/resume", "/resume parser"]);
+    assert!(repl.matches(&id).count() >= 2 && repl.contains("picks one up"), "{repl}");
 }
 
 #[test]

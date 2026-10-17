@@ -14,6 +14,7 @@ mod llm;
 mod markdown;
 mod mcp;
 mod permissions;
+mod session;
 mod signal;
 mod skills;
 mod slash;
@@ -104,9 +105,13 @@ struct Cli {
     #[arg(long)]
     view: Option<String>,
 
-    /// Resume the most recent session in this directory
-    #[arg(short = 'c', long = "continue")]
-    resume: bool,
+    /// Resume a session here: the most recent one, or the one with this id
+    #[arg(short = 'c', long = "continue", value_name = "ID", num_args = 0..=1, default_missing_value = "latest")]
+    resume: Option<String>,
+
+    /// List the sessions saved here, or those matching a search, then exit
+    #[arg(long, value_name = "QUERY", num_args = 0..=1, default_missing_value = "")]
+    sessions: Option<String>,
 
     /// Work on this goal until it's done, then exit
     #[arg(long)]
@@ -188,7 +193,7 @@ fn run() -> Result<i32> {
         return backend::serve_rpc();
     }
     config::load_env();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     if let Some(d) = &cli.dir {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
@@ -383,17 +388,29 @@ fn run() -> Result<i32> {
     }
 
     let sessions = pdir.join("sessions");
-    if cli.resume {
-        match latest_session(&sessions) {
-            Some(p) => {
-                agent.load_session(&p)?;
-                println!("{}", ui::dim(&format!("resumed {} messages", agent.history.len())));
-            }
-            None => println!("{}", ui::dim("no previous session here; starting fresh")),
+    if let Some(query) = &cli.sessions {
+        let found = if query.trim().is_empty() { session::list(&sessions) } else { session::search(&sessions, query) };
+        print!("{}", session::render(&found, rusty::unix_now()));
+        return Ok(0);
+    }
+    if let Some(key) = cli.resume.clone() {
+        // `rusty -c "fix the tests"`: a word that is not an id is the prompt.
+        let key = if key == "latest" || key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            key
+        } else {
+            cli.prompt.insert(0, key);
+            "latest".to_string()
+        };
+        let entry =
+            if key == "latest" { session::list(&sessions).into_iter().next() } else { session::find(&sessions, &key) };
+        match entry {
+            Some(e) => resume_session(&mut agent, &sessions, &e)?,
+            None if key == "latest" => println!("{}", ui::dim("no previous session here; starting fresh")),
+            None => return Err(anyhow!("no session {key} here; `rusty --sessions` lists them")),
         }
     }
     if agent.session_path.is_none() {
-        agent.session_path = Some(new_session_path(&sessions));
+        agent.session_path = Some(session::path(&sessions, &session::new_id(&sessions)));
     }
     agent.trajectory_path = cli.trajectory.clone();
 
@@ -421,6 +438,10 @@ fn run() -> Result<i32> {
         };
         agent.save_session();
         print_changes(&agent);
+        let hint = resume_hint(&agent);
+        if !hint.is_empty() {
+            println!("{}", ui::dim(&format!(" {}", hint.trim_start())));
+        }
         if cli.stats {
             print_stats(&agent, started);
         }
@@ -642,7 +663,24 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     }
     agent.save_session();
     print_changes(agent);
-    println!("{}", ui::dim("  ◌ link closed. go ship something."));
+    signal::restore_terminal();
+    println!("{}", ui::dim(&format!("  ◌ link closed. go ship something.{}", resume_hint(agent))));
+    Ok(())
+}
+
+/// How to pick this conversation up again, once it has one.
+fn resume_hint(agent: &Agent) -> String {
+    match &agent.session_path {
+        Some(p) if !agent.history.is_empty() => format!(" resume with `rusty -c {}`", session::id_of(p)),
+        _ => String::new(),
+    }
+}
+
+/// Loads a saved session and says which one.
+fn resume_session(agent: &mut Agent, dir: &Path, e: &session::Entry) -> Result<()> {
+    agent.load_session(&session::path(dir, &e.id))?;
+    let title = if e.title.is_empty() { String::new() } else { format!(" · {}", e.title) };
+    println!("{}", ui::dim(&format!("  resumed {}{title} · {} messages", e.id, agent.history.len())));
     Ok(())
 }
 
@@ -669,10 +707,30 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/clear" | "/new" => {
             agent.save_session();
             agent.clear();
-            if let Some(p) = &agent.session_path {
-                agent.session_path = p.parent().map(new_session_path);
+            if let Some(dir) = agent.session_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) {
+                agent.session_path = Some(session::path(&dir, &session::new_id(&dir)));
             }
             println!("{}", ui::dim("  fresh context. memories kept."));
+        }
+        "/resume" | "/sessions" => {
+            let Some(dir) = agent.session_path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf)) else {
+                return Ok(false);
+            };
+            let now = rusty::unix_now();
+            if rest.is_empty() {
+                print!("{}", session::render(&session::list(&dir), now));
+                println!("{}", ui::dim("  /resume <id> picks one up · /resume <words> searches"));
+            } else if let Some(e) = session::find(&dir, rest) {
+                agent.save_session();
+                resume_session(agent, &dir, &e)?;
+            } else {
+                let hits = session::search(&dir, rest);
+                if hits.is_empty() {
+                    println!("{}", ui::dim("  no session matches"));
+                } else {
+                    print!("{}", session::render(&hits, now));
+                }
+            }
         }
         "/model" => {
             if !rest.is_empty() {
@@ -1257,40 +1315,6 @@ fn project_dir(cwd: &Path) -> PathBuf {
     config::config_dir().unwrap_or_else(|| PathBuf::from(".rusty")).join("projects").join(id)
 }
 
-/// A session file nothing else will write to. The start time alone is not
-/// enough: a `/clear` in the first second, or two rusty processes started
-/// together, would share it and the later save would wipe the earlier
-/// session. So the name is `<secs>-<pid>.json`, and later sessions of the
-/// same process get `-2`, `-3`, ... appended.
-fn new_session_path(dir: &Path) -> PathBuf {
-    static OPENED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let mut name = format!("{}-{}", rusty::unix_now(), std::process::id());
-    if n > 1 {
-        name.push_str(&format!("-{n}"));
-    }
-    dir.join(format!("{name}.json"))
-}
-
-/// Newest first by the name's start time, then by its counter, so a
-/// `1700000000-42-2.json` opened by `/clear` beats the `1700000000-42.json`
-/// of the same second; a plain string compare would put `.` after `-`.
-fn session_order(p: &Path) -> (u64, u32) {
-    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let mut parts = stem.split('-');
-    let secs = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let n = parts.nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-    (secs, n)
-}
-
-fn latest_session(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".trace.json"))
-        .max_by_key(|p| (session_order(p), p.clone()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,29 +1324,5 @@ mod tests {
         assert_eq!(parse_loop("5m x3 check ci"), Some((Some(300), Some(3), "check ci".into())));
         assert_eq!(parse_loop("check ci"), Some((None, None, "check ci".into())));
         assert_eq!(parse_loop("30s"), None);
-    }
-
-    #[test]
-    fn session_paths_stay_apart_within_a_second() {
-        let dir = Path::new("sessions");
-        let first = new_session_path(dir);
-        let second = new_session_path(dir);
-        assert_ne!(first, second);
-        assert!(session_order(&second) > session_order(&first), "{first:?} {second:?}");
-        let pid = std::process::id().to_string();
-        assert!(first.file_stem().unwrap().to_str().unwrap().contains(&pid));
-    }
-
-    #[test]
-    fn latest_session_follows_time_then_counter() {
-        let dir = std::env::temp_dir().join(format!("rusty-latest-session-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        for name in ["1700000000.json", "1700000001-42.json", "1700000001-42-2.json", "1700000000-99-3.json"] {
-            std::fs::write(dir.join(name), "{}").unwrap();
-        }
-        std::fs::write(dir.join("1700000002-42.trace.jsonl"), "").unwrap();
-        assert_eq!(latest_session(&dir), Some(dir.join("1700000001-42-2.json")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

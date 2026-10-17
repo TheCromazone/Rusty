@@ -2366,6 +2366,20 @@ impl Agent {
         }
         let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         let _ = rusty::privacy::write_json(path, body);
+        if let Some(dir) = path.parent() {
+            let all: Vec<Value> = self.archived.iter().chain(self.history.iter()).cloned().collect();
+            let _ = crate::session::note(
+                dir,
+                crate::session::Entry {
+                    id: crate::session::id_of(path),
+                    title: crate::session::title_for(&all),
+                    started: 0,
+                    updated: rusty::unix_now(),
+                    messages: all.len(),
+                    text: crate::session::text_for(&all),
+                },
+            );
+        }
         let changes = self.infra.change_record();
         if !changes.is_empty() {
             use std::io::Write;

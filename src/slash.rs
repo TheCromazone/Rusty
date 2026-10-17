@@ -107,6 +107,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("/forget", "<id>", "remove a saved memory", "memory & context"),
     cmd("/tokens", "", "spend by model and by tool", "memory & context"),
     cmd("/clear", "", "fresh conversation, memories kept", "memory & context"),
+    cmd("/resume", "[id|words]", "list saved sessions, search them, or pick one up", "memory & context"),
     with(
         "/agents",
         "[mode]",
@@ -624,8 +625,8 @@ mod tests {
     fn skills_join_the_menu_after_commands() {
         let skills = vec![("review".to_string(), "review the diff".to_string())];
         let rows = items("/re", &skills);
-        assert_eq!(lines(&rows), ["/remember", "/review"]);
-        assert!(rows[1].about.starts_with("skill"));
+        assert_eq!(lines(&rows), ["/remember", "/resume", "/review"]);
+        assert!(rows[2].about.starts_with("skill"));
     }
 
     #[test]
