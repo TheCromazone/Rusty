@@ -1259,8 +1259,30 @@ fn project_dir(cwd: &Path) -> PathBuf {
     config::config_dir().unwrap_or_else(|| PathBuf::from(".rusty")).join("projects").join(id)
 }
 
+/// A session file nothing else will write to. The start time alone is not
+/// enough: a `/clear` in the first second, or two rusty processes started
+/// together, would share it and the later save would wipe the earlier
+/// session. So the name is `<secs>-<pid>.json`, and later sessions of the
+/// same process get `-2`, `-3`, ... appended.
 fn new_session_path(dir: &Path) -> PathBuf {
-    dir.join(format!("{}.json", rusty::unix_now()))
+    static OPENED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = OPENED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let mut name = format!("{}-{}", rusty::unix_now(), std::process::id());
+    if n > 1 {
+        name.push_str(&format!("-{n}"));
+    }
+    dir.join(format!("{name}.json"))
+}
+
+/// Newest first by the name's start time, then by its counter, so a
+/// `1700000000-42-2.json` opened by `/clear` beats the `1700000000-42.json`
+/// of the same second; a plain string compare would put `.` after `-`.
+fn session_order(p: &Path) -> (u64, u32) {
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut parts = stem.split('-');
+    let secs = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let n = parts.nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    (secs, n)
 }
 
 fn latest_session(dir: &Path) -> Option<PathBuf> {
@@ -1268,7 +1290,7 @@ fn latest_session(dir: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "json") && !p.to_string_lossy().ends_with(".trace.json"))
-        .max()
+        .max_by_key(|p| (session_order(p), p.clone()))
 }
 
 #[cfg(test)]
@@ -1280,5 +1302,29 @@ mod tests {
         assert_eq!(parse_loop("5m x3 check ci"), Some((Some(300), Some(3), "check ci".into())));
         assert_eq!(parse_loop("check ci"), Some((None, None, "check ci".into())));
         assert_eq!(parse_loop("30s"), None);
+    }
+
+    #[test]
+    fn session_paths_stay_apart_within_a_second() {
+        let dir = Path::new("sessions");
+        let first = new_session_path(dir);
+        let second = new_session_path(dir);
+        assert_ne!(first, second);
+        assert!(session_order(&second) > session_order(&first), "{first:?} {second:?}");
+        let pid = std::process::id().to_string();
+        assert!(first.file_stem().unwrap().to_str().unwrap().contains(&pid));
+    }
+
+    #[test]
+    fn latest_session_follows_time_then_counter() {
+        let dir = std::env::temp_dir().join(format!("rusty-latest-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["1700000000.json", "1700000001-42.json", "1700000001-42-2.json", "1700000000-99-3.json"] {
+            std::fs::write(dir.join(name), "{}").unwrap();
+        }
+        std::fs::write(dir.join("1700000002-42.trace.jsonl"), "").unwrap();
+        assert_eq!(latest_session(&dir), Some(dir.join("1700000001-42-2.json")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
