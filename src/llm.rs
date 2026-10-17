@@ -65,9 +65,12 @@ pub fn lines(resp: Response) -> impl Iterator<Item = std::io::Result<String>> {
 fn stream_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("stream timer runtime");
-        runtime.spawn(std::future::pending::<()>());
-        runtime
+        // One shared timer worker, independent of CPU count and retry count.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("stream timer runtime")
     })
 }
 
