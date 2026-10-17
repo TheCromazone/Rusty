@@ -178,6 +178,10 @@ impl Display {
         self.status = s;
     }
 
+    pub fn status(&self) -> &str {
+        &self.status
+    }
+
     /// Clears transient output so something else can print cleanly.
     pub fn pause(&mut self) {
         if self.quiet {

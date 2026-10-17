@@ -83,7 +83,7 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
     assert!(s.call("advice", "repo-a", 1, Value::Null).text.is_empty(), "duplicate advice");
     assert!(!s.call("feedback", "repo-a", 1, json!({"helpful":true})).error);
     let snapshot = s.call("export", "repo-a", 1, Value::Null).data;
-    assert!(s.call("list", "repo-b", 0, Value::Null).text.is_empty());
+    assert_eq!(s.call("list", "repo-b", 0, Value::Null).text, "no memories saved yet");
     assert!(s.call("event", "repo-a", 1, json!({})).error, "stale observation accepted");
     let second = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).output().unwrap();
     assert!(!second.status.success());
@@ -118,7 +118,22 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
     assert!(status["l1"].is_null(), "short-term observations survived restart");
     s.call("forget", "repo-a", 1, json!({"id":id}));
     assert!(!s.call("import", "repo-a", 1, snapshot).error);
-    assert!(s.call("list", "repo-a", 1, Value::Null).text.is_empty(), "deleted lesson resurrected");
+    assert_eq!(s.call("list", "repo-a", 1, Value::Null).text, "no memories saved yet", "deleted lesson resurrected");
+}
+
+#[test]
+fn an_empty_recall_says_whether_anything_is_saved() {
+    let s = Service::new();
+    assert_eq!(s.call("recall", "repo-a", 0, json!({"query":"packages"})).text, "no memories saved yet");
+    let id = s.call("remember", "repo-a", 0, json!({"kind":"fact","text":"Run the workspace tests with cargo"})).id;
+    assert!(!id.is_empty());
+    // A query that matches nothing still says the memory is not empty.
+    assert_eq!(
+        s.call("recall", "repo-a", 0, json!({"query":"kubernetes"})).text,
+        "no memories match; 1 saved in total"
+    );
+    assert!(s.call("recall", "repo-a", 0, json!({"query":"workspace tests"})).text.contains(&id));
+    assert!(s.call("list", "repo-a", 0, Value::Null).text.contains(&id));
 }
 
 #[test]

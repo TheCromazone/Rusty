@@ -1363,7 +1363,11 @@ fn careful_checks_an_answer_after_a_change() {
         ],
     );
     assert_eq!(requests.len(), 4);
-    assert!(requests[3]["messages"].to_string().contains("checker's review"));
+    let note = requests[3]["messages"].to_string();
+    assert!(note.contains("checker's review"), "{note}");
+    // The user already saw the answer once; the follow-up must not restate it.
+    assert!(note.contains("Do not repeat it") && note.contains("nothing to fix"), "{note}");
+    assert!(!note.contains("give your final answer"), "{note}");
 }
 
 #[test]
@@ -1863,6 +1867,185 @@ fn doctor_checks_every_provider_without_showing_keys() {
     assert!(headers.starts_with("get /v1/models"), "{headers}");
 }
 
+/// A JWT with these claims and no real signature, enough for an expiry or an email.
+fn fake_jwt(claims: serde_json::Value) -> String {
+    fn b64(b: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut s = String::new();
+        for chunk in b.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+            for i in 0..chunk.len() + 1 {
+                s.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        s
+    }
+    format!("{}.{}.sig", b64(b"{\"alg\":\"none\"}"), b64(claims.to_string().as_bytes()))
+}
+
+#[test]
+fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
+    let s = Sandbox::new("codex-login");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let access = fake_jwt(serde_json::json!({"exp": now + 3600}));
+    let id = fake_jwt(serde_json::json!({"email": "dev@example.com"}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "last_refresh": "2026-10-01T00:00:00Z",
+            "tokens": {"id_token": id, "access_token": access, "refresh_token": "refresh-1", "account_id": "acct_1"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5-codex-test\"\n").unwrap();
+
+    let reply = [
+        r#"{"type":"response.created","response":{}}"#.to_string(),
+        r#"{"type":"response.output_text.delta","delta":"signed in fine"}"#.into(),
+        r#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"signed in fine"}]}}"#.into(),
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}"#.into(),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    // The first call is refused; after a refresh the second one answers.
+    let (codex, codex_server) = scripted_http(vec![(401, r#"{"detail":"token expired"}"#.into()), (200, reply)]);
+    let (refresh, refresh_server) = scripted_http(vec![(
+        200,
+        serde_json::json!({"access_token": fake_jwt(serde_json::json!({"exp": now + 7200})), "refresh_token": "refresh-2", "id_token": fake_jwt(serde_json::json!({"email": "dev@example.com"}))}).to_string(),
+    )]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env("RUSTY_CODEX_REFRESH_URL", format!("{refresh}/oauth/token"))
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}\n{err}");
+    assert!(text.contains("signed in fine"), "{text}\n{err}");
+
+    let requests = codex_server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let (headers, body) = &requests[1];
+    assert!(headers.starts_with("post /v1/codex/responses"), "{headers}");
+    assert!(headers.contains("chatgpt-account-id: acct_1"), "{headers}");
+    assert!(headers.contains("openai-beta: responses=experimental"), "{headers}");
+    assert!(!headers.contains("refresh-"), "the refresh token never travels as a header: {headers}");
+    assert!(
+        headers.contains("authorization: bearer ") && !headers.contains(&access.to_ascii_lowercase()),
+        "retried with the new token: {headers}"
+    );
+    assert_eq!(body["model"], "gpt-5");
+    assert_eq!(body["store"], false);
+    assert!(
+        body["messages"].is_null() && !body["instructions"].as_str().unwrap().is_empty(),
+        "Responses API shape: {body}"
+    );
+    assert_eq!(body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"], "hi");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert!(body["tools"][0]["name"].is_string(), "{}", body["tools"][0]);
+
+    let refreshes = refresh_server.join().unwrap();
+    assert_eq!(refreshes.len(), 1);
+    assert_eq!(refreshes[0].1["grant_type"], "refresh_token");
+    assert_eq!(refreshes[0].1["refresh_token"], "refresh-1");
+    assert!(refreshes[0].1["client_id"].as_str().unwrap().starts_with("app_"));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(saved["tokens"]["refresh_token"], "refresh-2", "the refreshed tokens are saved for Codex too");
+    assert_ne!(saved["tokens"]["access_token"], access);
+    assert_eq!(saved["auth_mode"], "chatgpt", "Codex's own fields stay");
+    assert_ne!(saved["last_refresh"], "2026-10-01T00:00:00Z");
+    assert!(!text.contains("refresh-") && !err.contains("refresh-"), "tokens are never printed");
+}
+
+#[test]
+fn codex_eof_retries_before_text_but_not_after_text() {
+    let s = Sandbox::new("codex-eof-before-text");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let access = fake_jwt(serde_json::json!({"exp": rusty::unix_now() + 3600}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":access,"refresh_token":"fixture-refresh","account_id":"acct_fixture"}}).to_string(),
+    )
+    .unwrap();
+
+    let incomplete = "data: {\"type\":\"response.created\",\"response\":{}}\n\n".to_owned();
+    let completed = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered answer\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}}\n\n"
+    )
+    .to_owned();
+    let (codex, server) = scripted_http(vec![(200, incomplete), (200, completed)]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5-codex-test", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("recovered answer"));
+    assert_eq!(server.join().unwrap().len(), 2, "an EOF before answer text is retried");
+
+    let s = Sandbox::new("codex-eof-after-text");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let access = fake_jwt(serde_json::json!({"exp": rusty::unix_now() + 3600}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode":"chatgpt","tokens":{"access_token":access,"refresh_token":"fixture-refresh","account_id":"acct_fixture"}}).to_string(),
+    )
+    .unwrap();
+    let partial = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial answer\"}\n\n".to_owned();
+    let (codex, server) = scripted_http(vec![(200, partial)]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5-codex-test", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a partial answer without a terminal event is incomplete");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("partial answer"));
+    assert_eq!(server.join().unwrap().len(), 1, "never retry after answer text was shown");
+}
+
+#[test]
+fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
+    let s = Sandbox::new("codex-default");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode": "chatgpt", "tokens": {"access_token": "a", "refresh_token": "r", "account_id": "acct_9"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(codex_home.join("config.toml"), "# comment\nmodel = \"gpt-5-codex-test\"\n").unwrap();
+    let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("✓ codex") && text.contains("chatgpt sign-in"), "{text}");
+    assert!(text.contains("model gpt-5-codex-test → codex"), "Codex's own model is the default: {text}");
+    assert!(text.contains("not set up · add NVIDIA_API_KEY"), "{text}");
+    assert!(!text.contains("acct_9"), "{text}");
+
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not set up · run `codex login`"), "{text}");
+}
+
 #[test]
 fn an_empty_base_url_means_the_default() {
     let s = Sandbox::new("empty-base");
@@ -1905,7 +2088,7 @@ fn retries_stop_at_the_budget() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 1 attempts") && err.contains("429"), "{err}");
+    assert!(err.contains("giving up after 1 attempts") && err.contains("429") && err.contains("slow down"), "{err}");
     assert_eq!(server.join().unwrap().len(), 1);
 }
 
@@ -1918,7 +2101,7 @@ fn a_refused_key_fails_fast() {
     let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 2 attempts") && err.contains("401"), "{err}");
+    assert!(err.contains("giving up after 2 attempts") && err.contains("401") && err.contains("bad key"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
     assert_eq!(server.join().unwrap().len(), 2);
 }
@@ -1936,6 +2119,89 @@ fn an_overload_inside_the_stream_is_retried() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("reviewed it"));
     assert_eq!(server.join().unwrap().len(), 2, "the overloaded stream was retried once");
+}
+
+#[test]
+fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-stall");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let answer = format!("data: {}\n\ndata: [DONE]\n\n", text_reply("still here"));
+        let mut seen = 0;
+        let mut first_closed = false;
+        for body in ["", answer.as_str()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = stream.read(&mut buf);
+            seen += 1;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            if body.is_empty() {
+                // Headers arrived, then nothing: longer than the idle limit below.
+                let mut byte = [0u8; 1];
+                first_closed = matches!(stream.read(&mut byte), Ok(0));
+            } else {
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        }
+        (seen, first_closed)
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still here"));
+    let (requests, first_closed) = server.join().unwrap();
+    assert_eq!(requests, 2, "the quiet stream was given up on and retried");
+    assert!(first_closed, "the timed-out response was dropped before retrying");
+    assert!(started.elapsed() < Duration::from_secs(20), "the stall was noticed within the idle limit");
+}
+
+#[test]
+fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-active-long");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        let pieces = ["still ", "working ", "after ", "idle limit"];
+        for piece in pieces {
+            let event = serde_json::json!({"choices": [{"delta": {"content": piece}, "finish_reason": null}]});
+            write!(stream, "data: {event}\n\n").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        let done = serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        write!(stream, "data: {done}\n\ndata: [DONE]\n\n").unwrap();
+        stream.flush().unwrap();
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still working after idle limit"));
+    assert!(started.elapsed() > Duration::from_secs(2));
+    server.join().unwrap();
 }
 
 #[test]

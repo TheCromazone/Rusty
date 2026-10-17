@@ -23,7 +23,7 @@ use crate::tips;
 use crate::tools;
 use crate::ui;
 use crate::verification::{self, CheckRecord, CheckSpec};
-use rusty::advisor::{Hooks, Level, KINDS};
+use rusty::advisor::{Hooks, Level, KINDS, SAVED_PREFIX};
 
 const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
@@ -483,10 +483,25 @@ impl Agent {
             self.client.budget.halt();
             bail!("model budget exhausted: required careful review could not finish");
         }
+        // The user only saw the worker's status line; show them the gist of the findings.
+        if display::view() != View::Adhd {
+            if let Some(first) = report.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("##")) {
+                let room = ui::width().saturating_sub(16).max(20);
+                let gist: String = if first.chars().count() > room {
+                    first.chars().take(room - 1).chain(std::iter::once('…')).collect()
+                } else {
+                    first.to_string()
+                };
+                d.line(&format!("  {} {}", ui::dim("◇ checker ·"), ui::dim(&gist)));
+            }
+        }
         self.history.push(json!({"role": "user", "content": format!(
-            "{}[checker's review]\n{report}\n\nFix anything actionable it found and verify the fix the usual way. \
-             There is no second review. If the checker failed or couldn't verify something, say so plainly. Then \
-             give your final answer, or call goal_done with evidence.",
+            "{}[checker's review]\n{report}\n\nThe user has already seen your previous message. Do not repeat it. \
+             If the checker found nothing actionable, reply in one or two short lines (for example \
+             \"Checked: nothing to fix.\") plus anything it could not verify, then stop. If it found something \
+             actionable, fix it, verify the fix the usual way, and report only what changed since your last \
+             message. There is no second review. If the checker failed or couldn't verify something, say so \
+             plainly. In a goal, call goal_done with evidence instead of answering in text.",
             context::NOTE
         )}));
         Ok(())
@@ -877,7 +892,7 @@ impl Agent {
                 );
             }
             if let Some(raw) = reply.raw.take() {
-                msg[crate::anthropic::BLOCKS_KEY] = raw;
+                msg[reply.raw_key] = raw;
             }
             self.history.push(msg);
 
@@ -1120,6 +1135,8 @@ impl Agent {
             self.temperature,
             (self.execution_mode, self.request_role, Some(cap)),
         );
+        // A retry wait borrows the status line and hands it back afterwards.
+        let status_before = d.status().to_string();
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
             if signal::interrupted() {
@@ -1135,6 +1152,7 @@ impl Agent {
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
+                Ok(Event::Status(s)) => d.set_status(if s.is_empty() { status_before.clone() } else { s }),
                 Ok(Event::Done(r)) => {
                     d.end_stream();
                     self.client.budget.remaining()?;
@@ -2237,10 +2255,15 @@ impl Agent {
         if summary.is_empty() {
             bail!("the model returned an empty summary");
         }
-        // Unverified compaction lessons are kept only from reflect up.
-        if self.advisor.as_ref().is_some_and(|h| h.level.reflects()) {
+        // Unverified compaction lessons are kept only from reflect up; the
+        // service may still refuse one, so count what it confirmed.
+        let kept = self.advisor.as_ref().is_some_and(|h| h.level.reflects());
+        let mut saved = 0;
+        if kept {
             for (kind, text) in &memories {
-                self.remember_as(kind, text, false, "compaction", &[]);
+                if self.remember_as(kind, text, false, "compaction", &[]).starts_with(SAVED_PREFIX) {
+                    saved += 1;
+                }
             }
         }
         let tail = self.history.split_off(split);
@@ -2273,7 +2296,7 @@ impl Agent {
             "  ⇣ compacted ~{} → ~{} tokens{}",
             ui::human(before as u64),
             ui::human(context::estimate(&self.history) as u64),
-            if memories.is_empty() { String::new() } else { format!(", {} memories saved", memories.len()) }
+            context::memory_note(memories.len(), saved, kept)
         )));
         Ok(())
     }
