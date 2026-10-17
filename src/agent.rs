@@ -58,7 +58,7 @@ pub struct Calls {
 
 impl Safety {
     /// Records one consequential call from its class and what dispatch said.
-    fn record(&mut self, class: &crate::permissions::Class, out: &str) {
+    fn record(&mut self, class: &crate::permissions::Class, refusal: Option<RefusalKind>) {
         use crate::permissions::Class;
         let calls = match class {
             Class::Risky(_) => &mut self.risky,
@@ -66,17 +66,12 @@ impl Safety {
             _ => return,
         };
         calls.proposed += 1;
-        let declined = out.starts_with("the user declined");
-        let slot = if out.starts_with("denied") {
-            &mut calls.denied
-        } else if declined && (out.contains("nobody is watching") || out.contains("non-interactive session")) {
-            &mut calls.unattended
-        } else if declined {
-            &mut calls.declined
-        } else if out.starts_with("blocked by careful mode") {
-            &mut calls.careful_gate
-        } else {
-            &mut calls.executed
+        let slot = match refusal {
+            Some(RefusalKind::Denied) => &mut calls.denied,
+            Some(RefusalKind::Declined) => &mut calls.declined,
+            Some(RefusalKind::Unattended) => &mut calls.unattended,
+            Some(RefusalKind::CarefulGate) => &mut calls.careful_gate,
+            None => &mut calls.executed,
         };
         *slot += 1;
     }
@@ -142,7 +137,57 @@ struct LoopCtl {
 
 enum Authorization {
     Allowed(Verdict),
-    Refused(String),
+    Refused { kind: RefusalKind, message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusalKind {
+    Denied,
+    Declined,
+    Unattended,
+    CarefulGate,
+}
+
+fn refusal_from_answer() -> RefusalKind {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        RefusalKind::Declined
+    } else {
+        RefusalKind::Unattended
+    }
+}
+
+#[derive(Debug)]
+struct AuthorizationRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl std::fmt::Display for AuthorizationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AuthorizationRefusal {}
+
+fn refusal_error(kind: RefusalKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(AuthorizationRefusal { kind, message })
+}
+
+struct DispatchResult {
+    text: String,
+    refusal: Option<RefusalKind>,
+}
+
+impl DispatchResult {
+    fn refused(kind: RefusalKind, text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: Some(kind) }
+    }
+
+    fn failed(text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: None }
+    }
 }
 
 /// Token accounting for the session, including delegated work.
@@ -209,6 +254,27 @@ pub struct CompactionEvent {
     pub reverted: usize,
     /// The model that wrote the summary.
     pub model: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStop {
+    Complete,
+    StepLimit,
+    OutputLimit,
+    Interrupted,
+    Failed,
+}
+
+impl TurnStop {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "done",
+            Self::StepLimit => "incomplete: step limit",
+            Self::OutputLimit => "incomplete: output limit",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 pub struct Agent {
@@ -293,6 +359,8 @@ pub struct Agent {
     /// MCP servers' tools, offered to the lead only.
     pub mcp: crate::mcp::Mcp,
     is_worker: bool,
+    turn_stop: TurnStop,
+    worker_constraints: String,
     request_role: &'static str,
     /// A swarm worker's board, its index, how many notes it has seen and its label.
     board: Option<(crate::swarm::Board, usize, usize, String)>,
@@ -377,6 +445,8 @@ impl Agent {
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
+            turn_stop: TurnStop::Complete,
+            worker_constraints: String::new(),
             request_role: "lead",
             board: None,
             opened: Default::default(),
@@ -534,7 +604,10 @@ impl Agent {
                     ""
                 }
             );
-            return s;
+            return format!(
+                "{s}\nProject instructions:\n{}\n\nUser constraints from the parent:\n{}",
+                self.project_notes, self.worker_constraints
+            );
         }
         let mut s = format!(
             "You are Rusty, a coding agent working in the user's terminal on the project at {}. You're a calm, \
@@ -772,6 +845,7 @@ impl Agent {
 
     /// Runs one user turn to completion. Returns false if interrupted.
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
+        self.turn_stop = TurnStop::StepLimit;
         self.history.push(json!({"role": "user", "content": user}));
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
@@ -925,6 +999,11 @@ impl Agent {
                     }
                     continue;
                 }
+                self.turn_stop = if reply.finish_reason.as_deref() == Some("length") {
+                    TurnStop::OutputLimit
+                } else {
+                    TurnStop::Complete
+                };
                 break;
             }
             for call in &reply.tool_calls {
@@ -948,14 +1027,13 @@ impl Agent {
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
-                    let mut out = self.dispatch(call, &mut d);
-                    self.safety.record(&class, &out);
+                    let result = self.dispatch(call, &mut d);
+                    self.safety.record(&class, result.refusal);
                     // Only a call that actually ran changes anything.
-                    let refused =
-                        ["denied", "the user declined", "blocked by careful mode"].iter().any(|p| out.starts_with(p));
-                    if class != crate::permissions::Class::ReadOnly && !refused {
+                    if class != crate::permissions::Class::ReadOnly && result.refusal.is_none() {
                         changed = true;
                     }
+                    let mut out = result.text;
                     if call.name == "bash" {
                         let failed = out.starts_with("exit code: ") && !out.starts_with("exit code: 0\n");
                         failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
@@ -1041,6 +1119,7 @@ impl Agent {
             if reply.finish_reason.as_deref() == Some("length") {
                 self.discard_claim();
                 d.line(&ui::warn(TOKEN_LIMIT_NOTE));
+                self.turn_stop = TurnStop::OutputLimit;
                 break;
             }
             if let Some(args) = self.pending_goal.take() {
@@ -1089,6 +1168,11 @@ impl Agent {
         }
         for (tool, n) in &d.stats.tool_tokens {
             *self.totals.by_tool.entry(tool.clone()).or_default() += n;
+        }
+        if outcome.is_err() {
+            self.turn_stop = TurnStop::Failed;
+        } else if matches!(outcome, Ok(false)) || signal::interrupted() {
+            self.turn_stop = TurnStop::Interrupted;
         }
         if self.is_worker {
             return outcome;
@@ -1167,10 +1251,10 @@ impl Agent {
         }
     }
 
-    fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> String {
+    fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> DispatchResult {
         self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
-            return format!("error: unknown tool `{}`; this run offers only bash", call.name);
+            return DispatchResult::failed(format!("error: unknown tool `{}`; this run offers only bash", call.name));
         }
         if self.is_worker
             && !matches!(
@@ -1178,20 +1262,20 @@ impl Agent {
                 "read_file" | "list_files" | "search" | "glob" | "outline" | "bash" | "share"
             )
         {
-            return "denied: a read-only worker can only inspect files and run read-only commands".into();
+            return DispatchResult::refused(
+                RefusalKind::Denied,
+                "denied: a read-only worker can only inspect files and run read-only commands",
+            );
         }
         let raw = if call.arguments.trim().is_empty() { "{}" } else { &call.arguments };
         let args: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                return format!("error: arguments were not valid JSON ({e}). Call the tool again with valid JSON.")
+                return DispatchResult::failed(format!(
+                    "error: arguments were not valid JSON ({e}). Call the tool again with valid JSON."
+                ))
             }
         };
-        if self.is_worker && self.board.is_some() {
-            if let Ok(cwd) = self.cwd.canonicalize() {
-                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
-            }
-        }
         if let Some(p) = &self.progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
@@ -1248,16 +1332,24 @@ impl Agent {
                 None => Err(anyhow::anyhow!("unknown MCP tool `{name}`; use one of the mcp__ tools you were given")),
                 Some(tool) => match self.authorize(&tool, &args, d) {
                     Ok(Authorization::Allowed(_)) => self.mcp.call(&tool, &args),
-                    Ok(Authorization::Refused(why)) => Ok(why),
+                    Ok(Authorization::Refused { kind, message }) => Err(refusal_error(kind, message)),
                     Err(e) => Err(e),
                 },
             },
             name => self.run_guarded(name, &args, d),
         };
-        let (text, ok) = match result {
-            Ok(t) => (t, true),
-            Err(e) => (format!("error: {e:#}"), false),
+        let (text, ok, refusal) = match result {
+            Ok(t) => (t, true, None),
+            Err(e) => {
+                let refusal = e.downcast_ref::<AuthorizationRefusal>().map(|r| r.kind);
+                (format!("error: {e:#}"), false, refusal)
+            }
         };
+        if ok && self.is_worker && self.board.is_some() {
+            if let Ok(cwd) = self.cwd.canonicalize() {
+                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
+            }
+        }
         if ok && matches!(call.name.as_str(), "write_file" | "edit_file") {
             self.infra.invalidate(args["path"].as_str().unwrap_or(""));
         }
@@ -1278,14 +1370,14 @@ impl Agent {
                 ui::dim(&format!("⊘ {redacted} secret{} redacted", if redacted == 1 { "" } else { "s" }))
             ));
         }
-        text
+        DispatchResult { text, refusal }
     }
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
-            Authorization::Refused(why) => return Ok(why),
+            Authorization::Refused { kind, message } => return Err(refusal_error(kind, message)),
         };
         if name == "bash" {
             return self.run_bash(args, &approval, d);
@@ -1313,8 +1405,8 @@ impl Agent {
                 if infra::inspect(command).is_some_and(|a| a.mutating) {
                     bail!("mutating infrastructure commands need the ordinary bash snapshot/verification harness");
                 }
-                if let Authorization::Refused(why) = self.authorize("bash", args, d)? {
-                    return Ok(why);
+                if let Authorization::Refused { kind, message } = self.authorize("bash", args, d)? {
+                    return Err(refusal_error(kind, message));
                 }
                 self.activities.start(command, timeout)?
             }
@@ -1330,9 +1422,10 @@ impl Agent {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.refused(name, args, "denied", &why);
-                return Ok(Authorization::Refused(format!(
-                    "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
-                )));
+                return Ok(Authorization::Refused {
+                    kind: RefusalKind::Denied,
+                    message: format!("denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."),
+                });
             }
             Verdict::Confirm(why) if unattended_destructive(self.policy.mode) => {
                 d.line(&ui::warn(&format!("  ‼ {why}: allowed unattended by RUSTY_ALLOW_DESTRUCTIVE")));
@@ -1347,15 +1440,19 @@ impl Agent {
                     Answer::Yes | Answer::Always => {}
                     Answer::No(None) => {
                         self.refused(name, args, "declined", &why);
-                        return Ok(Authorization::Refused(
-                            "the user declined this destructive call. Do not retry it or look for another \
-                                   route to the same result; ask what they want instead."
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: "the user declined this destructive call. Do not retry it or look for another \
+                                      route to the same result; ask what they want instead."
                                 .into(),
-                        ));
+                        });
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: format!("the user declined this call and said: {fb}"),
+                        });
                     }
                 }
             }
@@ -1376,13 +1473,17 @@ impl Agent {
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
-                        return Ok(Authorization::Refused(
-                            "the user declined this call. Do not retry it; ask what they want instead.".into(),
-                        ));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: "the user declined this call. Do not retry it; ask what they want instead.".into(),
+                        });
                     }
                     Answer::No(Some(fb)) => {
                         self.refused(name, args, "declined", &fb);
-                        return Ok(Authorization::Refused(format!("the user declined this call and said: {fb}")));
+                        return Ok(Authorization::Refused {
+                            kind: refusal_from_answer(),
+                            message: format!("the user declined this call and said: {fb}"),
+                        });
                     }
                 }
             }
@@ -1401,8 +1502,8 @@ impl Agent {
             bail!("fixed acceptance must be a check, not an infrastructure change");
         }
         let args = json!({"command":check.command(), "timeout_secs":check.timeout().as_secs()});
-        if let Authorization::Refused(why) = self.authorize("bash", &args, d)? {
-            bail!("{why}");
+        if let Authorization::Refused { message, .. } = self.authorize("bash", &args, d)? {
+            bail!("{message}");
         }
         let before = verification::fingerprint(&self.cwd)?;
         d.tool("bash", &args);
@@ -1446,7 +1547,7 @@ impl Agent {
         if self.execution_mode == ExecutionMode::Careful {
             if let Some(refusal) = self.infra.gate(&action) {
                 self.infra.record_refusal("careful", &cmd, "blocked", "needs a dry run first");
-                return Ok(refusal);
+                return Err(refusal_error(RefusalKind::CarefulGate, refusal));
             }
         }
         let mut snapshot = None;
@@ -1542,6 +1643,8 @@ impl Agent {
         let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(jobs)));
         let counters: Arc<Vec<AtomicUsize>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        let constraints = context::user_messages(&self.history, self.carry_chars());
         for _ in 0..parallel {
             let (queue, counters, board, tx) = (queue.clone(), counters.clone(), board.clone(), tx.clone());
             let (client, cwd, deny, backend) =
@@ -1550,7 +1653,8 @@ impl Agent {
             let lead_window = (self.meter.window, self.meter.window_source);
             // Workers compact as the lead does; smart's own tool is the lead's alone.
             let (compaction, history_cap) = (self.compaction, self.history_cap);
-            std::thread::spawn(move || loop {
+            let (project_notes, constraints) = (self.project_notes.clone(), constraints.clone());
+            handles.push(std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
                 }
@@ -1564,6 +1668,8 @@ impl Agent {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let mut w = Agent::new(client.clone(), model.clone(), cwd.clone(), Policy::new(Mode::ReadOnly));
                 w.is_worker = true;
+                w.project_notes = project_notes.clone();
+                w.worker_constraints = constraints.clone();
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
@@ -1588,19 +1694,19 @@ impl Agent {
                     .and_then(|m| m["content"].as_str())
                     .unwrap_or("")
                     .to_string();
-                let report = match result {
-                    Err(_) => "failed: the worker crashed".to_string(),
-                    Ok(Err(e)) => format!("failed: {e:#}"),
-                    Ok(Ok(_)) if answer.is_empty() => "returned nothing".to_string(),
-                    Ok(Ok(_)) => answer,
+                let (stop, report) = match result {
+                    Err(_) => (TurnStop::Failed, "the worker crashed".to_string()),
+                    Ok(Err(e)) => (TurnStop::Failed, format!("{e:#}")),
+                    Ok(Ok(_)) if answer.is_empty() => (TurnStop::Failed, "returned nothing".to_string()),
+                    Ok(Ok(_)) => (w.turn_stop, answer),
                 };
                 if tx
-                    .send((i, desc, model, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
+                    .send((i, desc, model, stop, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
                     .is_err()
                 {
                     break;
                 }
-            });
+            }));
         }
         drop(tx);
 
@@ -1609,12 +1715,12 @@ impl Agent {
         let mut done = 0;
         while done < n {
             match rx.recv_timeout(Duration::from_millis(60)) {
-                Ok((i, desc, model, report, totals, took, files)) => {
+                Ok((i, desc, model, stop, report, totals, took, files)) => {
                     done += 1;
                     opened.extend(files);
                     self.totals.merge(&totals);
                     let calls = counters[i].load(Ordering::Relaxed);
-                    let failed = report.starts_with("failed:");
+                    let failed = stop != TurnStop::Complete;
                     if display::view() != View::Adhd {
                         let mark = if failed { ui::err("✗") } else { ui::ok("✓") };
                         let short_model = model.rsplit('/').next().unwrap_or(&model).to_string();
@@ -1628,18 +1734,23 @@ impl Agent {
                             ))
                         ));
                     }
-                    reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
+                    reports[i] = format!("## {} ({})\n{}", desc, stop.label(), report);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     signal::poll_keys();
                     if signal::interrupted() {
-                        break;
+                        d.set_status("waiting for interrupted workers to settle".into());
+                    } else {
+                        d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     }
-                    d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     d.tick();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // Do not let a previous worker resume when the next turn resets Ctrl-C.
+        for handle in handles {
+            let _ = handle.join();
         }
         d.set_status(String::new());
         let shared = board.map(|b| b.summary()).filter(|s| !s.is_empty());
@@ -1673,8 +1784,8 @@ impl Agent {
             }
             let more = if total > missed.len() { format!(" (+{} more)", total - missed.len()) } else { String::new() };
             out.push(format!(
-                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. If the task needs \
-                 full coverage, check them yourself or give them to another worker.",
+                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. Only successful read_file/outline calls are tracked; shell and search \
+                 coverage is not measured. If the task needs full coverage, check them yourself or give them to another worker.",
                 missed.join(", ")
             ));
         }
