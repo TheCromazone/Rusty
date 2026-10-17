@@ -40,3 +40,5 @@ jobs:
           cargo test --test worker --locked
       - name: Swift protocol fixtures
         run: swift test --package-path apps/macos/RustyKit --jobs 2
+      - name: native diff model
+        run: swift test --package-path apps/macos/DiffPrototype --jobs 2
