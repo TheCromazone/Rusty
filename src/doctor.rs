@@ -44,7 +44,9 @@ pub fn rows(client: Option<&Client>, model: &str, live: bool) -> Vec<Row> {
                     let started = Instant::now();
                     Some(match c.models_of(ep, crate::llm::Retry::Once) {
                         Ok(ids) => {
-                            if serving.as_ref().is_some_and(|(sp, sb)| *sp == p && *sb == base) {
+                            // Codex publishes no catalog: its one "model" is just the configured default.
+                            if p != Provider::Codex && serving.as_ref().is_some_and(|(sp, sb)| *sp == p && *sb == base)
+                            {
                                 lists_model = Some(ids.iter().any(|id| id == model));
                             }
                             Ok((ids.len(), started.elapsed()))
@@ -105,7 +107,9 @@ pub fn render(rows: &[Row], client: Option<&Client>, model: &str) -> (String, bo
         }
         let (mark, status) = match &r.probe {
             None => (ui::info("•"), ui::dim("not checked")),
-            Some(Ok((n, t))) => (ui::ok("✓"), format!("{} models · {} ms", n, t.as_millis())),
+            Some(Ok((n, t))) => {
+                (ui::ok("✓"), format!("{n} model{} · {} ms", if *n == 1 { "" } else { "s" }, t.as_millis()))
+            }
             Some(Err(e)) => (ui::err("✗"), ui::err(if narrow { ui::truncate(e, room) } else { e })),
         };
         let host = ui::truncate(&r.host, if narrow { room } else { 36 });

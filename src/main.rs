@@ -216,11 +216,17 @@ fn run() -> Result<i32> {
     let mut settings = Settings::load();
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
     if let Some(query) = &cli.sessions {
+        // Unquoted words all belong to the search: `rusty --sessions fix parser`.
+        let query = std::iter::once(query).chain(&cli.prompt).map(String::as_str).collect::<Vec<_>>().join(" ");
         let project = project_dir(&PathBuf::from(backend.identity(&cwd)));
         let sessions = project.join("sessions");
         let found =
-            if query.trim().is_empty() { session::list(&sessions)? } else { session::search(&sessions, query)? };
-        print!("{}", session::render(&found, rusty::unix_now()));
+            if query.trim().is_empty() { session::list(&sessions)? } else { session::search(&sessions, &query)? };
+        if found.is_empty() && !query.trim().is_empty() {
+            println!("  {}", ui::dim(&format!("no session matches `{}`", query.trim())));
+        } else {
+            print!("{}", session::render(&found, rusty::unix_now()));
+        }
         return Ok(0);
     }
     ui::set_theme(&settings.theme);
@@ -307,8 +313,8 @@ fn run() -> Result<i32> {
         match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_level)
         {
             Ok(h) => agent.advisor = Some(h),
-            Err(_) => {
-                eprintln!("memory advisor unavailable; continuing with memory off");
+            Err(e) => {
+                eprintln!("memory advisor unavailable ({e:#}); continuing with memory off");
                 agent.memory_level = Level::Off;
             }
         }
@@ -403,10 +409,14 @@ fn run() -> Result<i32> {
     if let Some(key) = cli.resume.clone() {
         // Try IDs before treating an optional -c value as prompt text. This
         // keeps legacy timestamp-hyphen IDs resumable while retaining `-c prompt`.
+        let found = if key == "latest" { Vec::new() } else { session::find(&sessions, &key)? };
         let (entry, key) = if key == "latest" {
             (session::latest(&sessions)?, key)
-        } else if let Some(entry) = session::find(&sessions, &key)? {
-            (Some(entry), key)
+        } else if let [entry] = found.as_slice() {
+            (Some(entry.clone()), key)
+        } else if found.len() > 1 {
+            let ids: Vec<&str> = found.iter().map(|e| e.id.as_str()).collect();
+            return Err(anyhow!("`{key}` could be {}; give more of the id", ids.join(", ")));
         } else {
             let hex = key.bytes().all(|byte| byte.is_ascii_hexdigit());
             let legacy = key.len() >= 8
@@ -688,10 +698,24 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             let _ = rl.save_history(h);
         }
     }
-    agent.save_session()?;
+    let kept = agent.end_session()?;
     print_changes(agent);
-    println!("{}", ui::dim("  ◌ link closed. go ship something."));
+    let id = agent.session_path.as_deref().filter(|_| kept).map(session::id_of);
+    println!("{}", ui::dim(&goodbye(id.as_deref(), ui::width())));
     Ok(())
+}
+
+/// The REPL's last line, with how to pick the conversation up again when
+/// there is one: on the same line if it fits, else on a line of its own.
+fn goodbye(id: Option<&str>, width: usize) -> String {
+    let bye = "  ◌ link closed. go ship something.";
+    let Some(id) = id else { return bye.to_string() };
+    let hint = format!("resume with `rusty -c {id}`");
+    if bye.chars().count() + 1 + hint.chars().count() <= width {
+        format!("{bye} {hint}")
+    } else {
+        format!("{bye}\n  {hint}")
+    }
 }
 
 /// What this session changed in infrastructure, if anything, with the
@@ -729,7 +753,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/exit" | "/quit" | "/q" => return Ok(true),
         "/help" | "/?" => print_help(cwd),
         "/clear" | "/new" => {
-            agent.save_session()?;
+            agent.end_session()?;
             agent.clear();
             if let Some(p) = &agent.session_path {
                 if let Some(dir) = p.parent().map(Path::to_path_buf) {
@@ -747,15 +771,24 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 let entries = session::list(&dir)?;
                 print!("{}", session::render(&entries, now));
                 println!("{}", ui::dim("  /resume <id> picks one up · /resume <words> searches"));
-            } else if let Some(entry) = session::find(&dir, rest)? {
-                agent.save_session()?;
-                resume_session(agent, &dir, &entry)?;
-            } else {
-                let hits = session::search(&dir, rest)?;
-                if hits.is_empty() {
-                    println!("{}", ui::dim("  no session matches"));
-                } else {
-                    print!("{}", session::render(&hits, now));
+                return Ok(false);
+            }
+            match session::find(&dir, rest)?.as_slice() {
+                [entry] => {
+                    agent.end_session()?;
+                    resume_session(agent, &dir, entry)?;
+                }
+                [] => {
+                    let hits = session::search(&dir, rest)?;
+                    if hits.is_empty() {
+                        println!("{}", ui::dim(&format!("  no session matches `{rest}`")));
+                    } else {
+                        print!("{}", session::render(&hits, now));
+                    }
+                }
+                shared => {
+                    print!("{}", session::render(shared, now));
+                    println!("{}", ui::dim(&format!("  `{rest}` could be any of these; give more of the id")));
                 }
             }
         }
@@ -1359,6 +1392,20 @@ fn resume_session(agent: &mut Agent, dir: &Path, entry: &session::Entry) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_goodbye_says_how_to_resume_and_fits_the_terminal() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(goodbye(None, 80), "  ◌ link closed. go ship something.");
+        assert_eq!(goodbye(Some(id), 120), format!("  ◌ link closed. go ship something. resume with `rusty -c {id}`"));
+        for width in [40, 59, 80] {
+            let lines: Vec<String> = goodbye(Some(id), width).lines().map(String::from).collect();
+            assert_eq!(
+                lines,
+                ["  ◌ link closed. go ship something.".to_string(), format!("  resume with `rusty -c {id}`")]
+            );
+        }
+    }
 
     #[test]
     fn loop_args() {

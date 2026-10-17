@@ -24,11 +24,10 @@ use crate::ui::truncate;
 const RETRY_SECS: u64 = 300;
 /// The longest single wait, whatever a Retry-After header asks for.
 const MAX_WAIT_SECS: u64 = 120;
-/// How long a stream may go quiet before it counts as dropped and is retried,
-/// unless `RUSTY_STREAM_IDLE_SECS` says otherwise. Codex waits five minutes;
-/// a model that is still working sends reasoning or keep-alive lines well
-/// within two.
-const STREAM_IDLE_SECS: u64 = 120;
+/// How long a request may go quiet, waiting for headers or for the next
+/// bytes of the body, before it counts as dropped and is retried, unless
+/// `RUSTY_STREAM_IDLE_SECS` says otherwise. Five minutes, as Codex waits.
+const STREAM_IDLE_SECS: u64 = 300;
 
 fn stream_idle() -> Duration {
     let secs = std::env::var("RUSTY_STREAM_IDLE_SECS")
@@ -44,12 +43,29 @@ thread_local! {
 }
 
 /// Tells whoever started this request what it is waiting for; silent otherwise.
-fn status(text: String) {
-    STATUS.with(|s| {
-        if let Some(tx) = s.borrow().as_ref() {
-            let _ = tx.send(Event::Status(text));
-        }
-    });
+/// False when the one who started it has stopped listening (Ctrl-C, a
+/// budget stop), so a retry nobody will read is not sent.
+fn status(text: String) -> bool {
+    STATUS.with(|s| s.borrow().as_ref().is_none_or(|tx| tx.send(Event::Status(text)).is_ok()))
+}
+
+fn ensure_request_watched() -> Result<()> {
+    if crate::signal::interrupted() {
+        bail!("interrupted before the next request attempt");
+    }
+    if !status(String::new()) {
+        bail!("nobody is waiting for this request any more");
+    }
+    Ok(())
+}
+
+fn refresh_codex_auth(budget: &crate::budget::Budget, refresh: impl FnOnce(Duration) -> Result<()>) -> Result<()> {
+    let timeout =
+        if budget.limited() { budget.remaining()?.min(codex::REFRESH_TIMEOUT) } else { codex::REFRESH_TIMEOUT };
+    refresh(timeout)?;
+    // Refresh may have taken long enough for the request owner to cancel; do
+    // not send the model request after its receiver has gone away.
+    ensure_request_watched()
 }
 
 /// The lines of a streamed response, with the timer runtime entered while
@@ -92,8 +108,8 @@ fn retry_budget() -> Duration {
 /// when it gave one, else 2, 4, 8, 16, then 30 seconds, each with up to 25%
 /// jitter so agents sharing a key don't all come back at the same moment.
 fn backoff(round: u32, retry_after: Option<u64>) -> Duration {
-    let base = retry_after.unwrap_or_else(|| 2u64.saturating_pow(round).min(30)).min(MAX_WAIT_SECS);
-    let jitter = base * 250 * crate::ui::rand(1000) as u64 / 1_000_000;
+    let base = retry_after.unwrap_or_else(|| 2u64.saturating_pow(round).min(30)).clamp(1, MAX_WAIT_SECS);
+    let jitter = base * 250 * crate::ui::rand(1000) as u64 / 1000;
     Duration::from_millis(base * 1000 + jitter)
 }
 
@@ -156,6 +172,10 @@ pub struct Endpoint {
     key_idx: AtomicUsize,
     /// The ChatGPT sign-in, for the Codex provider; refreshed in place.
     codex: Option<Mutex<codex::Auth>>,
+    /// Sent as Codex's `session_id` header. The backend keys its prompt
+    /// cache on it and, without one, gives every request a fresh key, so
+    /// nothing is ever served from the cache.
+    session: String,
 }
 
 impl Endpoint {
@@ -166,6 +186,7 @@ impl Endpoint {
             keys,
             key_idx: AtomicUsize::new(0),
             codex: None,
+            session: String::new(),
         }
     }
 
@@ -173,6 +194,7 @@ impl Endpoint {
     pub fn codex(base_url: String, auth: codex::Auth) -> Self {
         let mut ep = Self::new(Provider::Codex, base_url, Vec::new());
         ep.codex = Some(Mutex::new(auth));
+        ep.session = codex::session_id();
         ep
     }
 
@@ -220,10 +242,16 @@ impl Client {
                  to use your ChatGPT account"
             );
         }
+        // A per-read idle limit, and no total deadline: a long answer that keeps
+        // streaming is never cut off. Budgeted runs set their own deadline below.
         let http = reqwest::blocking::ClientBuilder::from(
             reqwest::Client::builder().connect_timeout(Duration::from_secs(20)).read_timeout(stream_idle()),
         )
-        .timeout(Duration::from_secs(600))
+        // The blocking builder has its own 30-second timeout, separate from
+        // the async client's per-read timeout. Leave it disabled so the
+        // configured idle limit governs unbudgeted requests; budgeted
+        // requests still set an explicit per-request deadline in `send_with`.
+        .timeout(None)
         .build()?;
         Ok(Self { http, endpoints, budget: crate::budget::Budget::unbounded() })
     }
@@ -274,9 +302,10 @@ impl Client {
         let vars = want.key_vars();
         bail!(
             "`{model}` is served by {}, but {} is not set. Add it to your shell or ~/.config/rusty/.env, \
-             or pick another model with /model",
+             {}or pick another model with /model",
             want.name(),
-            vars.iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or(&vars[0])
+            vars.iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or(&vars[0]),
+            if want == Provider::OpenAi { "run `codex login` to use your ChatGPT account, " } else { "" }
         )
     }
 
@@ -432,8 +461,14 @@ impl Client {
     /// key answers in a second instead of after the whole retry budget.
     pub fn models_of(&self, ep: &Endpoint, retry: Retry) -> Result<Vec<String>> {
         if ep.provider == Provider::Codex {
-            // The backend publishes no catalog; the model Codex is set to use is the one known to work.
-            return Ok(vec![Provider::Codex.default_model()]);
+            // The backend publishes no catalog to ask; Codex saves the one it was
+            // shown, and the configured model is known to work either way.
+            let mut ids = codex::listed_models();
+            let chosen = Provider::Codex.default_model();
+            if !ids.contains(&chosen) {
+                ids.insert(0, chosen);
+            }
+            return Ok(ids);
         }
         let url = match ep.provider {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
@@ -505,6 +540,7 @@ impl Client {
         let mut round = 0u32;
         loop {
             for _ in 0..slots {
+                ensure_request_watched()?;
                 let idx = ep.key_idx.load(Ordering::Relaxed) % slots;
                 let mut req = match body {
                     Some(b) => self.http.post(url).json(b),
@@ -515,12 +551,13 @@ impl Client {
                         let mut auth = auth.lock().map_err(|_| anyhow!("codex sign-in poisoned"))?;
                         // Refused once, or about to expire: refresh before trying again.
                         if auth.expiring() || refused[idx] > 0 {
-                            auth.refresh(&self.http)?;
+                            refresh_codex_auth(&self.budget, |timeout| auth.refresh(&self.http, timeout))?;
                         }
                         req.bearer_auth(auth.access_token())
                             .header("chatgpt-account-id", auth.account_id())
                             .header("OpenAI-Beta", "responses=experimental")
                             .header("originator", codex_originator())
+                            .header("session_id", &ep.session)
                     }
                     None if ep.provider == Provider::Anthropic => {
                         req.header("x-api-key", &keys[idx]).header("anthropic-version", anthropic::VERSION)
@@ -530,9 +567,13 @@ impl Client {
                 if let Some(b) = beta {
                     req = req.header("anthropic-beta", b);
                 }
+                // Auth lookup can wait on another request's refresh while
+                // holding the endpoint mutex. Recheck after that wait so a
+                // canceled owner never starts a model request afterward.
+                ensure_request_watched()?;
                 let mut reservation = reserve.map(|n| self.budget.reserve(role, n)).transpose()?;
-                if reservation.is_some() {
-                    req = req.timeout(self.budget.remaining()?.min(Duration::from_secs(600)));
+                if reservation.is_some() && self.budget.limited() {
+                    req = req.timeout(self.budget.remaining()?);
                 }
                 attempts += 1;
                 match req.send() {
@@ -553,7 +594,17 @@ impl Client {
                             retry_after = Some(retry_after.unwrap_or(0).max(secs));
                         }
                         let text = r.text().unwrap_or_default();
-                        last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
+                        // The JSON error's message reads better in the retry footer than the raw body.
+                        let message = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
+                            [&v["error"]["message"], &v["detail"], &v["message"]]
+                                .iter()
+                                .find_map(|m| m.as_str().map(String::from))
+                        });
+                        last_err = format!(
+                            "HTTP {}: {}",
+                            r_status(status),
+                            truncate(message.as_deref().unwrap_or(text.trim()), 400)
+                        );
                         match status {
                             401 | 403 => refused[idx] += 1,
                             // A ChatGPT plan's usage limit lasts hours; waiting it out here only stalls.
@@ -641,6 +692,10 @@ fn settle(reservation: Option<crate::budget::Reservation>, result: &Result<Reply
 fn wait_or_interrupt(wait: Duration, last_err: &str) -> Result<()> {
     let until = std::time::Instant::now() + wait;
     let why = truncate(last_err.lines().next().unwrap_or(last_err), 60);
+    // Without a footer to count down in, say once what the wait is for.
+    if !crate::ui::tty() {
+        eprintln!("retrying in {}s · {why}", wait.as_secs().max(1));
+    }
     let mut shown = u64::MAX;
     while std::time::Instant::now() < until {
         if crate::signal::interrupted() {
@@ -650,7 +705,9 @@ fn wait_or_interrupt(wait: Duration, last_err: &str) -> Result<()> {
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.as_secs() != shown {
             shown = left.as_secs();
-            status(format!("retrying in {}s · {why}", shown + 1));
+            if !status(format!("retrying in {}s · {why}", shown + 1)) {
+                bail!("nobody is waiting for this request any more: {last_err}");
+            }
         }
         std::thread::sleep(Duration::from_millis(100).min(left));
     }
@@ -668,9 +725,18 @@ fn transient_stream_error(e: &str) -> bool {
     if !e.contains("api error") {
         return false;
     }
-    ["overloaded", "service_unavailable", "rate_limit", "api_error", "timeout", "\"code\":429", "\"code\":5"]
-        .iter()
-        .any(|k| e.contains(k))
+    [
+        "overloaded",
+        "service_unavailable",
+        "server_error",
+        "rate_limit",
+        "api_error",
+        "timeout",
+        "\"code\":429",
+        "\"code\":5",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
 }
 
 /// "429 Too Many Requests" style, as reqwest prints a status.
@@ -716,6 +782,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
     let mut reply = Reply::default();
     let mut calls: Vec<ToolCall> = Vec::new();
     let mut saw_data = false;
+    let mut done = false;
     let mut raw = String::new();
 
     for line in lines(resp) {
@@ -729,6 +796,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
         saw_data = true;
         let data = data.trim();
         if data == "[DONE]" {
+            done = true;
             break;
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
@@ -766,6 +834,9 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
         }
     }
 
+    if saw_data && !done && reply.finish_reason.is_none() {
+        bail!("stream interrupted: it ended before the reply finished");
+    }
     // Some servers ignore `stream: true` and answer with one JSON body.
     if !saw_data && !raw.trim().is_empty() {
         let v: Value =
@@ -869,7 +940,203 @@ mod tests {
         }
         assert!(backoff(1, Some(90)).as_secs() >= 90);
         assert!(backoff(1, Some(10_000)).as_secs() <= MAX_WAIT_SECS + MAX_WAIT_SECS / 4);
-        assert_eq!(backoff(3, Some(0)), Duration::ZERO);
+        // A server that says "retry after 0" is not hammered in a loop.
+        assert!(backoff(3, Some(0)) >= Duration::from_secs(1));
+        let spread = (0..50).map(|_| backoff(3, None).as_millis()).max().unwrap() - 8000;
+        assert!(spread > 100, "jitter spreads retries by up to a quarter: {spread}ms");
+    }
+
+    #[test]
+    fn a_closed_request_receiver_stops_key_rotation() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(start.elapsed() < Duration::from_secs(2));
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            // Let the request owner drop its event receiver before provoking
+            // the immediate retry onto the second API key.
+            std::thread::sleep(Duration::from_millis(200));
+            write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+
+            let until = std::time::Instant::now() + Duration::from_millis(300);
+            let mut count = 1;
+            while std::time::Instant::now() < until {
+                match listener.accept() {
+                    Ok((mut next, _)) => {
+                        count += 1;
+                        let _ =
+                            write!(next, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = next.flush();
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            count
+        });
+
+        let client =
+            Client::new(vec![Endpoint::new(Provider::OpenAi, url.clone(), vec!["first".into(), "second".into()])])
+                .unwrap();
+        let endpoint = &client.endpoints[0];
+        let (tx, rx) = channel();
+        STATUS.with(|s| *s.borrow_mut() = Some(tx));
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(rx);
+        });
+        let result = client.send_with(endpoint, &url, (None, "catalog"), None, Retry::Once);
+        STATUS.with(|s| *s.borrow_mut() = None);
+        dropper.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(server.join().unwrap(), 1, "do not rotate keys after the request owner disconnects");
+    }
+
+    #[test]
+    fn a_cancelled_owner_does_not_send_after_codex_refresh() {
+        let budget = crate::budget::Budget::unbounded();
+        let (tx, rx) = channel();
+        STATUS.with(|s| *s.borrow_mut() = Some(tx));
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(rx);
+        });
+        let mut refresh_ran = false;
+        let result = refresh_codex_auth(&budget, |_| {
+            std::thread::sleep(Duration::from_millis(100));
+            refresh_ran = true;
+            Ok(())
+        });
+        STATUS.with(|s| *s.borrow_mut() = None);
+        dropper.join().unwrap();
+        assert!(refresh_ran);
+        assert!(result.is_err(), "cancelled request must stop before the model POST");
+    }
+
+    #[test]
+    fn a_cancelled_waiter_does_not_post_after_another_refreshes() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        fn jwt(exp: u64) -> String {
+            let bytes = format!("{{\"exp\":{exp}}}");
+            let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut encoded = String::new();
+            for chunk in bytes.as_bytes().chunks(3) {
+                let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+                for i in 0..chunk.len() + 1 {
+                    encoded.push(table[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                }
+            }
+            format!("e30.{encoded}.sig")
+        }
+
+        let dir = std::env::temp_dir().join(format!("rusty-llm-refresh-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let expired_path = dir.join("expired.json");
+        let fresh_path = dir.join("fresh.json");
+        let expired_token = jwt(1);
+        let fresh_token = jwt(4_102_444_800);
+        std::fs::write(
+            &expired_path,
+            serde_json::json!({"tokens": {"access_token": expired_token, "refresh_token": "offline-old", "account_id": "offline-account"}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &fresh_path,
+            serde_json::json!({"tokens": {"access_token": fresh_token, "refresh_token": "offline-new", "account_id": "offline-account"}})
+                .to_string(),
+        )
+        .unwrap();
+        let auth = codex::Auth::load_from(expired_path).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let until = std::time::Instant::now() + Duration::from_millis(350);
+            let mut count = 0;
+            while std::time::Instant::now() < until {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count += 1;
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        let _ = stream.flush();
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("local fixture listener failed: {error}"),
+                }
+            }
+            count
+        });
+
+        let client = Client::new(vec![Endpoint::codex(url.clone(), auth)]).unwrap();
+        let endpoint = &client.endpoints[0];
+        let auth_lock = endpoint.codex.as_ref().unwrap();
+        let (locked_tx, locked_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (status_tx, status_rx) = channel();
+        let (result_tx, result_rx) = channel();
+
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                let mut guard = auth_lock.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                *guard = codex::Auth::load_from(fresh_path).unwrap();
+            });
+            locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let client = &client;
+            let url = &url;
+            let requester = scope.spawn(move || {
+                STATUS.with(|s| *s.borrow_mut() = Some(status_tx));
+                let result = client.send_with(endpoint, url, (None, "catalog"), None, Retry::Once);
+                STATUS.with(|s| *s.borrow_mut() = None);
+                result_tx.send(result.is_err()).unwrap();
+            });
+            // This empty status is the request's initial watcher check. It
+            // then blocks on the auth mutex held above.
+            status_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(status_rx);
+            release_tx.send(()).unwrap();
+            assert!(result_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "cancelled request should stop");
+            holder.join().unwrap();
+            requester.join().unwrap();
+        });
+
+        assert_eq!(server.join().unwrap(), 0, "canceled waiter must not send a model POST");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

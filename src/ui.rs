@@ -124,16 +124,35 @@ pub fn animate() -> bool {
     tty() && std::env::var_os("RUSTY_NO_ANIM").is_none()
 }
 
+/// The closest of the 256-colour palette's cube (steps 0, 95, 135, ..., 255,
+/// not evenly spaced) and grey ramp (8, 18, ..., 238), the way tmux picks it.
+fn ansi256((r, g, b): Rgb) -> u8 {
+    let step = |v: u8| {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            (v - 35) / 40
+        }
+    };
+    let level = |i: u8| if i == 0 { 0 } else { 55 + 40 * i as i32 };
+    let dist = |x: i32, y: i32, z: i32| (x - r as i32).pow(2) + (y - g as i32).pow(2) + (z - b as i32).pow(2);
+    let (i, j, k) = (step(r), step(g), step(b));
+    let grey = ((r as u16 + g as u16 + b as u16) / 3).saturating_sub(3).min(238) / 10;
+    let v = 8 + 10 * grey as i32;
+    if dist(v, v, v) < dist(level(i), level(j), level(k)) {
+        232 + grey as u8
+    } else {
+        16 + 36 * i + 6 * j + k
+    }
+}
+
 fn fg((r, g, b): Rgb, s: &str, bold: bool) -> String {
     let weight = if bold { "1;" } else { "" };
     match level() {
         0 => s.to_string(),
-        1 => {
-            // Round to the nearest cube step: truncating turned every mid grey
-            // into the darkest one the palette has.
-            let c = |v: u8| ((v as u16 * 5 + 127) / 255) as u8;
-            format!("\x1b[{weight}38;5;{}m{s}\x1b[0m", 16 + 36 * c(r) + 6 * c(g) + c(b))
-        }
+        1 => format!("\x1b[{weight}38;5;{}m{s}\x1b[0m", ansi256((r, g, b))),
         _ => format!("\x1b[{weight}38;2;{r};{g};{b}m{s}\x1b[0m"),
     }
 }
@@ -577,6 +596,24 @@ pub fn truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colours_map_to_the_nearest_palette_entry() {
+        // Greys go to the grey ramp, not the coarser cube.
+        assert_eq!(ansi256((158, 154, 150)), 247);
+        assert_eq!(ansi256((120, 120, 120)), 243);
+        // Exact cube colours and the corners stay put.
+        assert_eq!(ansi256((255, 175, 0)), 214);
+        assert_eq!(ansi256((0, 0, 0)), 16);
+        assert_eq!(ansi256((255, 255, 255)), 231);
+        // Every theme keeps its colours apart once mapped.
+        for t in THEMES {
+            let roles = [t.primary, t.accent, t.info, t.warn, t.muted].map(ansi256);
+            for (i, a) in roles.iter().enumerate() {
+                assert!(roles[i + 1..].iter().all(|b| b != a), "{}: {roles:?}", t.name);
+            }
+        }
+    }
 
     #[test]
     fn calendar_round_trips() {

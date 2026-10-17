@@ -129,19 +129,42 @@ pub fn take_command(command: &str) -> Option<String> {
     None
 }
 
+/// The entry `take_queued` would return next, left in the queue.
 pub fn peek_queued() -> Option<String> {
-    QUEUED.lock().ok()?.lines().find(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
+    next_queued(&QUEUED.lock().ok()?).map(|(text, _)| text)
 }
 
 fn pop_queued(q: &mut String) -> Option<String> {
-    while !q.is_empty() {
-        let n = q.find('\n').map(|i| i + 1).unwrap_or(q.len());
-        let text = q.drain(..n).collect::<String>().trim().to_string();
-        if !text.is_empty() {
-            return Some(text);
+    let Some((text, end)) = next_queued(q) else {
+        q.clear(); // only blank lines were left
+        return None;
+    };
+    q.drain(..end);
+    Some(text)
+}
+
+/// The next queued entry and how many bytes of the queue it takes, as if it
+/// had been typed at the prompt: a `/command` line on its own, and the lines
+/// up to the next command together as one message, so a pasted block stays
+/// one turn instead of one turn per line.
+fn next_queued(q: &str) -> Option<(String, usize)> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut end = 0;
+    for line in q.split_inclusive('\n') {
+        let text = line.trim();
+        if text.starts_with('/') {
+            if lines.is_empty() {
+                return Some((text.to_string(), end + line.len()));
+            }
+            break;
         }
+        if !text.is_empty() || !lines.is_empty() {
+            lines.push(line.trim_end());
+        }
+        end += line.len();
     }
-    None
+    let text = lines.join("\n").trim().to_string();
+    (!text.is_empty()).then_some((text, end))
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).
@@ -208,5 +231,16 @@ mod queue_tests {
             assert_eq!(super::pop_queued(&mut q).as_deref(), Some(want));
         }
         assert!(super::pop_queued(&mut q).is_none());
+    }
+
+    #[test]
+    fn a_pasted_block_stays_one_message_between_commands() {
+        let mut q = "\nsecond message\r\nwith a pasted line\n/compact\n\nthen this\n/exit\nhalf typ".to_string();
+        for want in ["second message\nwith a pasted line", "/compact", "then this", "/exit", "half typ"] {
+            assert_eq!(super::next_queued(&q).map(|(text, _)| text).as_deref(), Some(want));
+            assert_eq!(super::pop_queued(&mut q).as_deref(), Some(want));
+        }
+        assert!(super::pop_queued(&mut q).is_none());
+        assert!(super::next_queued("\n  \n").is_none());
     }
 }

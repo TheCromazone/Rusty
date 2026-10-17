@@ -313,6 +313,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
     let mut out = String::with_capacity(line.len());
     let mut rest = line.as_str();
     let mut expect: Option<Expect> = None;
+    let mut key = "";
     while !rest.is_empty() {
         let start = rest.find(is_token_char).unwrap_or(rest.len());
         let (sep, after) = rest.split_at(start);
@@ -330,7 +331,10 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
         };
-        if (wanted && secret_value(token) && !code_expression(token, sep, rest)) || secret_shape(token) {
+        let prefix_len = line.len() - rest.len() - token.len() - sep.len();
+        if (wanted && secret_value(token) && !code_expression(key, sep, token, rest, &line[..prefix_len]))
+            || secret_shape(token)
+        {
             let padded = rest.trim_start_matches('='); // base64 padding
             let value = &line[line.len() - rest.len() - token.len()..line.len() - padded.len()];
             out.push_str(&mark(value));
@@ -339,6 +343,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             continue;
         }
         out.push_str(token);
+        key = token;
         expect = if matches!(token.to_ascii_lowercase().as_str(), "bearer" | "basic") {
             Some(Expect::Header)
         } else if secret_key(token) {
@@ -350,28 +355,45 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
     (out, count)
 }
 
-/// `token = self.token.clone()`, `access_token: String,`: an unquoted value
-/// that continues as source code is an expression, not a secret. A bare
-/// `key=value;` or `key=value,` (connection strings, cookies) still counts.
-fn code_expression(token: &str, sep: &str, rest: &str) -> bool {
+/// `token = self.token.clone()`, `self.api_key = api_key`, `access_token: String,`:
+/// an unquoted value that is a call, an index, a path, a known type name or
+/// the key's own name again is source code, not a secret. Anything else
+/// counts, including `{password: …}` in a YAML map, `$(mysql --password=…)` and
+/// `password: SecretValue,`: a capitalised word is not proof of a type.
+fn code_expression(key: &str, sep: &str, value: &str, rest: &str, prefix: &str) -> bool {
     if sep.ends_with(['"', '\'']) {
         return false;
     }
-    // A bare type name in a struct field is token-shaped just like a secret.
-    // Only exempt common Rust type names, and only with the field's comma
-    // terminator; arbitrary capitalized values and semicolon-delimited
-    // credentials still need redaction.
-    let typed_field = sep.trim_end().ends_with(':') && rest.starts_with(',') && is_common_type(token);
-    rest.starts_with(['(', '[', '<', ')', '}']) || rest.starts_with("::") || typed_field
+    // A quoted key with a bare value is ambiguous in ordinary text and YAML.
+    // Exempt it only when the surrounding source explicitly identifies Rust's
+    // `json!` macro; otherwise a scalar such as `"password": hunter2` leaks.
+    if sep.starts_with(['"', '\'']) && prefix.contains("json!(") {
+        return true;
+    }
+    let name = |s: &str| s.rsplit('.').next().unwrap_or("").replace(['_', '-'], "").to_ascii_lowercase();
+    let after = rest.trim_start();
+    let typed_field = sep.trim_end().ends_with(':')
+        && is_common_type(value)
+        && (after.is_empty() || after.starts_with([',', ';', ')', '=', '>']));
+    rest.starts_with(['(', '[', '<'])
+        || rest.starts_with("::")
+        || name(value) == name(key.trim_start_matches('-'))
+        || typed_field
 }
 
+/// Type names a field is commonly declared with, in Rust, Python and TypeScript.
 fn is_common_type(token: &str) -> bool {
     matches!(
         token,
         "String"
             | "str"
+            | "string"
             | "bool"
+            | "boolean"
             | "char"
+            | "int"
+            | "float"
+            | "number"
             | "u8"
             | "u16"
             | "u32"
@@ -565,6 +587,25 @@ mod tests {
         assert_eq!(redact("password: Hunter2,").0, "password: [redacted],");
         assert_eq!(redact("password: SecretValue,").0, "password: [redacted],");
         assert_eq!(redact("password: SecretValue;").0, "password: [redacted];");
+        assert_eq!(redact("\"password\": hunter2").0, "\"password\": [redacted]");
+        assert_eq!(redact("  \"access_token\": fresh,").0, "  \"access_token\": [redacted],");
+        let json_macro = "let body = json!({\"access_token\": fresh,});";
+        assert_eq!(redact(json_macro), (json_macro.to_string(), 0));
+        for line in ["self.api_key = api_key", "password = args.password", "Client(api_key=api_key)", "password: str"] {
+            assert_eq!(redact(line), (line.to_string(), 0));
+        }
+        // Closing brackets and trailing commas end values in YAML, shells and
+        // connection strings. The value is assembled so no scanner takes the
+        // fixture for a credential.
+        let pw = ["hun", "ter2"].concat();
+        for (line, want) in [
+            ("db: {user: admin, password: PW}", "db: {user: admin, password: [redacted]}"),
+            ("x=$(mysql --password=PW)", "x=$(mysql --password=[redacted])"),
+            ("{user: a, password: PW, port: 5}", "{user: a, password: [redacted], port: 5}"),
+            ("Server=db; Password = PW; Port=1", "Server=db; Password = [redacted]; Port=1"),
+        ] {
+            assert_eq!(redact(&line.replace("PW", &pw)).0, want, "{line}");
+        }
     }
 
     #[test]

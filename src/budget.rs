@@ -132,6 +132,11 @@ impl Budget {
             eprintln!("warning: {e:#}");
         }
     }
+    /// Whether limits are set, so requests have a deadline to keep.
+    pub fn limited(&self) -> bool {
+        self.enabled
+    }
+
     /// Provider admission/response time; shell tools retain their own deadlines.
     pub fn remaining(&self) -> Result<Duration> {
         let s = self.state.lock().unwrap();

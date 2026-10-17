@@ -122,7 +122,7 @@ impl Provider {
             Self::OpenAi => OPENAI_MODEL.into(),
             Self::Anthropic => ANTHROPIC_MODEL.into(),
             // Whatever Codex itself is set to use, so both tools agree.
-            Self::Codex => crate::codex::configured_model().unwrap_or_else(|| crate::codex::DEFAULT_MODEL.into()),
+            Self::Codex => crate::codex::default_model(),
         }
     }
 

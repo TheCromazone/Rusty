@@ -83,6 +83,7 @@ impl Sandbox {
             .env_remove("RUSTY_AGENTS")
             .env_remove("RUSTY_PERMISSIONS")
             .env_remove("RUSTY_PROVIDER")
+            .env_remove("CODEX_HOME")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_BASE_URL")
             .env_remove("OPENAI_API_KEY")
@@ -262,6 +263,7 @@ fn sessions_get_ids_titles_listing_search_and_resume() {
     let all = list(&["--sessions"]);
     assert!(all.contains(full_id) && all.contains("make the parser faster") && all.contains("2 msgs"), "{all}");
     assert!(list(&["--sessions", "parser speed"]).contains(full_id));
+    assert!(list(&["--sessions", "kubernetes", "parser"]).contains(full_id), "every unquoted word is searched");
     assert!(!list(&["--sessions", "kubernetes"]).contains(full_id));
     let (out, _, requests) = scripted_run(&s, &["-c", &id[..4], "and the lexer?"], vec![text_reply("sure")]);
     assert!(out.contains("resumed") && out.contains(id) && out.contains("make the parser faster"), "{out}");
@@ -273,6 +275,157 @@ fn sessions_get_ids_titles_listing_search_and_resume() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no session deadbeef"));
     let repl = s.repl(&["/resume"]);
     assert!(repl.contains(id) && repl.contains("picks one up"), "{repl}");
+}
+
+/// `rusty --sessions [words]` as (id, "age  n msgs  title") pairs.
+fn sessions_listed(s: &Sandbox, words: &[&str]) -> Vec<(String, String)> {
+    let out = s.cmd().arg("--sessions").args(words).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = String::from_utf8_lossy(&out.stdout).to_string();
+    let lines: Vec<&str> = out.lines().collect();
+    lines
+        .windows(2)
+        .filter(|w| w[0].starts_with("  ") && !w[0].starts_with("   ") && w[1].starts_with("    "))
+        .map(|w| (w[0].trim().trim_end_matches('…').to_string(), w[1].trim().to_string()))
+        .collect()
+}
+
+/// Runs the REPL against a scripted endpoint that answers `answers` turns.
+fn scripted_repl(s: &Sandbox, lines: &[&str], answers: usize) -> String {
+    let (url, server) = scripted_endpoint((0..answers).map(|n| say(&format!("answer {n}"))).collect());
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    let out = s.repl_with(cmd, lines);
+    assert_eq!(server.join().unwrap().len(), answers, "{out}");
+    out
+}
+
+#[test]
+fn sessions_keep_their_own_title_and_count_across_clear_and_resume() {
+    let s = Sandbox::new("sessions-titles");
+    let out =
+        scripted_repl(&s, &["alpha topic about the zebra bug", "/clear", "beta question about the yak", "/quit"], 2);
+    let listed = sessions_listed(&s, &[]);
+    let alpha = listed.iter().find(|(_, rest)| rest.ends_with("alpha topic about the zebra bug")).expect("alpha");
+    let beta = listed.iter().find(|(_, rest)| rest.ends_with("beta question about the yak")).expect("beta");
+    assert!(alpha.1.contains(" 2 msgs") && beta.1.contains(" 2 msgs"), "{listed:?}");
+    let yak = sessions_listed(&s, &["yak"]);
+    assert_eq!(yak.len(), 1, "{yak:?}");
+    assert_eq!(yak[0].0, beta.0);
+    assert!(out.contains(&format!("resume with `rusty -c {}`", beta.0)), "the goodbye names the session: {out}");
+
+    let resume = format!("/resume {}", &alpha.0[..12]);
+    scripted_repl(&s, &["gamma question", "/clear", &resume, "delta question", "/quit"], 2);
+    let listed = sessions_listed(&s, &[]);
+    let alpha_now = listed.iter().find(|(id, _)| *id == alpha.0).expect("alpha kept");
+    assert!(alpha_now.1.ends_with(" 4 msgs  alpha topic about the zebra bug"), "{listed:?}");
+    let gamma = listed.iter().find(|(_, rest)| rest.ends_with("gamma question")).expect("gamma");
+    assert!(gamma.1.contains(" 2 msgs"), "{listed:?}");
+    assert_eq!(sessions_listed(&s, &["delta"])[0].0, alpha.0);
+    assert_eq!(listed.len(), 3, "the session left empty by /clear then /resume is not listed: {listed:?}");
+}
+
+#[test]
+fn an_empty_repl_leaves_no_session_and_continue_takes_the_last_spoken_one() {
+    let s = Sandbox::new("sessions-empty");
+    let (out, _, _) = scripted_run(&s, &["--memory", "off", "remember the walrus"], vec![text_reply("ok")]);
+    let id = out.split("rusty -c ").nth(1).and_then(|t| t.split_whitespace().next()).unwrap().trim_matches('`');
+    let out = s.repl_off(&["/help", "/clear", "/quit"]);
+    assert!(out.contains("link closed") && !out.contains("resume with"), "nothing to resume: {out}");
+    let listed = sessions_listed(&s, &[]);
+    assert_eq!(listed.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), [id], "{listed:?}");
+    let project = std::fs::read_dir(s.home.join("projects")).unwrap().next().unwrap().unwrap().path();
+    let files = std::fs::read_dir(project.join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|name| name.ends_with(".json") || name.ends_with(".lock") && name != "index.lock")
+        .count();
+    assert_eq!(files, 2, "only the spoken session's file and lock remain");
+    let (out, _, requests) = scripted_run(&s, &["--memory", "off", "-c", "what did I ask?"], vec![text_reply("ok")]);
+    assert!(out.contains(&format!("resumed {id}")), "{out}");
+    assert!(requests[0]["messages"].to_string().contains("remember the walrus"));
+}
+
+#[test]
+fn an_empty_parent_keeps_its_file_for_the_side_chats_opened_from_it() {
+    let s = Sandbox::new("sessions-empty-side");
+    let out = s.repl_off(&["/side new notes", "/back", "/quit"]);
+    assert!(out.contains("link closed") && !out.contains("resume with"), "{out}");
+    let parents = std::fs::read_dir(sessions_dir(&s))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|name| name.ends_with(".json"))
+        .count();
+    assert_eq!(parents, 1, "the side's parent transcript is kept");
+    assert!(sessions_listed(&s, &[]).is_empty(), "but it is not listed");
+}
+
+/// The sessions directory of the sandbox's project, after a first run made it.
+fn sessions_dir(s: &Sandbox) -> PathBuf {
+    std::fs::read_dir(s.home.join("projects")).unwrap().next().unwrap().unwrap().path().join("sessions")
+}
+
+/// Writes a saved session with one ask, as an older rusty or a copy would.
+fn write_session(s: &Sandbox, id: &str, ask: &str) {
+    let body =
+        serde_json::json!({"history": [{"role": "user", "content": ask}, {"role": "assistant", "content": "ok"}]});
+    std::fs::write(sessions_dir(s).join(format!("{id}.json")), body.to_string()).unwrap();
+}
+
+#[test]
+fn a_search_with_no_hit_and_a_shared_id_prefix_say_so() {
+    let s = Sandbox::new("sessions-messages");
+    scripted_run(&s, &["--memory", "off", "first ask"], vec![text_reply("ok")]);
+    std::fs::remove_file(sessions_dir(&s).join("index.sqlite")).unwrap();
+    write_session(&s, "aa110000aa110000aa110000aa110000", "first parser bug");
+    write_session(&s, "aa220000aa220000aa220000aa220000", "second parser rewrite");
+
+    let out = s.cmd().args(["--sessions", "kubernetes"]).stdin(Stdio::null()).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("no session matches `kubernetes`") && !out.contains("no sessions here"), "{out}");
+
+    let out = s.cmd().args(["-c", "aa", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("aa110000aa110000") && err.contains("aa220000aa220000"), "{err}");
+    assert!(err.contains("give more of the id"), "{err}");
+
+    let out = s.repl_off(&["/resume aa", "/resume nothingmatches", "/resume aa22"]);
+    assert!(out.contains("first parser bug") && out.contains("second parser rewrite"), "{out}");
+    assert!(out.contains("`aa` could be any of these; give more of the id"), "{out}");
+    assert!(out.contains("no session matches `nothingmatches`"), "{out}");
+    assert!(out.contains("resumed aa220000"), "{out}");
+}
+
+#[test]
+fn a_damaged_session_file_is_named_when_resumed() {
+    let s = Sandbox::new("sessions-damaged");
+    let (out, _, _) = scripted_run(&s, &["--memory", "off", "an ask long enough to cut"], vec![text_reply("ok")]);
+    let id = out.split("rusty -c ").nth(1).and_then(|t| t.split_whitespace().next()).unwrap().trim_matches('`');
+    let file = sessions_dir(&s).join(format!("{id}.json"));
+    let body = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &body[..40]).unwrap();
+    for args in [vec!["-c", id, "hello"], vec!["-c", "hello"]] {
+        let out = s.cmd().args(&args).stdin(Stdio::null()).output().unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(&format!("{id}.json")) && err.contains("damaged"), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn an_old_session_file_copied_in_after_the_index_is_listed_and_resumed() {
+    let s = Sandbox::new("sessions-late");
+    scripted_run(&s, &["--memory", "off", "first ask"], vec![text_reply("ok")]);
+    assert!(sessions_dir(&s).join("index.sqlite").exists());
+    write_session(&s, "1700000000", "fix the websocket reconnect");
+    let found = sessions_listed(&s, &["websocket"]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, "1700000000");
+    let (out, _, requests) =
+        scripted_run(&s, &["--memory", "off", "-c", "1700000000", "follow up"], vec![text_reply("ok")]);
+    assert!(out.contains("resumed 1700000000"), "{out}");
+    assert!(requests[0]["messages"].to_string().contains("fix the websocket reconnect"));
 }
 
 #[test]
@@ -2015,6 +2168,7 @@ fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
     assert!(headers.starts_with("post /v1/codex/responses"), "{headers}");
     assert!(headers.contains("chatgpt-account-id: acct_1"), "{headers}");
     assert!(headers.contains("openai-beta: responses=experimental"), "{headers}");
+    assert!(headers.contains("session_id: "), "the prompt cache is keyed on a session id: {headers}");
     assert!(!headers.contains("refresh-"), "the refresh token never travels as a header: {headers}");
     assert!(
         headers.contains("authorization: bearer ") && !headers.contains(&access.to_ascii_lowercase()),
@@ -2118,6 +2272,27 @@ fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     assert!(text.contains("model gpt-5-codex-test → codex"), "Codex's own model is the default: {text}");
     assert!(text.contains("not set up · add NVIDIA_API_KEY"), "{text}");
     assert!(!text.contains("acct_9"), "{text}");
+
+    // With no model configured, the catalog Codex saved picks the default and
+    // fills --list-models; hidden entries stay out.
+    std::fs::write(codex_home.join("config.toml"), "# nothing chosen\n").unwrap();
+    std::fs::write(
+        codex_home.join("models_cache.json"),
+        serde_json::json!({"models": [
+            {"slug": "gpt-6-beta", "visibility": "list", "priority": 2},
+            {"slug": "gpt-secret", "visibility": "hide", "priority": 1},
+            {"slug": "gpt-6-alpha", "visibility": "list", "priority": 1},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("model gpt-6-alpha → codex") && text.contains("2 models"), "{text}");
+    let out =
+        s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--list-models").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("gpt-6-alpha") && text.contains("gpt-6-beta") && !text.contains("gpt-secret"), "{text}");
 
     let out = s.cmd().env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2280,6 +2455,103 @@ fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("still working after idle limit"));
     assert!(started.elapsed() > Duration::from_secs(2));
     server.join().unwrap();
+}
+
+#[test]
+fn an_unbudgeted_stream_can_be_quiet_longer_than_the_blocking_default_timeout() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-quiet-over-30");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(30_500));
+        let event = serde_json::json!({"choices": [{"delta": {"content": "still alive"}, "finish_reason": "stop"}]});
+        let _ = write!(stream, "data: {event}\n\ndata: [DONE]\n\n");
+        let _ = stream.flush();
+    });
+    let child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "40")
+        .env("RUSTY_RETRY_SECS", "0")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait(child, Duration::from_secs(45));
+    server.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still alive"));
+}
+
+#[test]
+fn a_quiet_codex_stream_is_retried_too() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("codex-stall");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode": "chatgpt", "tokens": {"id_token": fake_jwt(serde_json::json!({"email": "dev@example.com"})),
+            "access_token": fake_jwt(serde_json::json!({"exp": now + 3600})), "refresh_token": "refresh-1", "account_id": "acct_1"}})
+        .to_string(),
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let answer = [
+            r#"{"type":"response.created","response":{}}"#,
+            r#"{"type":"response.output_text.delta","delta":"still signed in"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"still signed in"}]}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}"#,
+        ]
+        .iter()
+        .map(|e| format!("data: {e}\n\n"))
+        .collect::<String>();
+        // Headers then silence; then a stream that ends before response.completed; then the answer.
+        let cut = "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hm\"}\n\n";
+        let mut seen = 0;
+        for body in ["", cut, answer.as_str()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = stream.read(&mut buf);
+            seen += 1;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            if body.is_empty() {
+                std::thread::sleep(Duration::from_secs(3));
+            } else {
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        }
+        seen
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still signed in"));
+    assert_eq!(server.join().unwrap(), 3, "the quiet and the cut-off Codex streams were both retried");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("retrying in"), "a piped run still says what it waits for");
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[test]

@@ -17,12 +17,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::execution::ExecutionMode;
 use crate::llm::{Delta, Reply, ToolCall, Usage};
 
 pub const BASE_URL: &str = "https://chatgpt.com/backend-api";
-/// Used when `~/.codex/config.toml` names no model.
+/// Used when `~/.codex/config.toml` names no model and no catalog is saved.
 pub const DEFAULT_MODEL: &str = "gpt-5.3-codex";
 /// Key under which an assistant message keeps the backend's reasoning items.
 pub const ITEMS_KEY: &str = "_codex";
@@ -31,6 +32,9 @@ const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 /// Refresh this close to the access token's expiry, as Codex does.
 const REFRESH_WINDOW_SECS: u64 = 5 * 60;
+/// Never let a stalled OAuth refresh hold a request indefinitely. A root
+/// budget can shorten this further at the call site.
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The Codex home folder: `CODEX_HOME`, else `~/.codex`.
 pub fn home() -> Option<PathBuf> {
@@ -42,17 +46,59 @@ pub fn home() -> Option<PathBuf> {
 
 /// The model Codex itself is configured to use (`model = "…"` in config.toml).
 pub fn configured_model() -> Option<String> {
-    let text = std::fs::read_to_string(home()?.join("config.toml")).ok()?;
+    model_in(&std::fs::read_to_string(home()?.join("config.toml")).ok()?)
+}
+
+fn model_in(text: &str) -> Option<String> {
     // Top-level keys only: a `model` under `[profiles.x]` is not the default.
     text.lines().map(str::trim).take_while(|l| !l.starts_with('[')).filter(|l| !l.starts_with('#')).find_map(|l| {
         let (k, v) = l.split_once('=')?;
-        let v = v.split(" #").next().unwrap_or(v).trim().trim_matches(|c| c == '"' || c == '\'');
+        // A quoted value ends at its closing quote; a bare one at a comment.
+        let v = v.trim();
+        let v = match v.chars().next() {
+            Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or(""),
+            _ => v.split('#').next().unwrap_or("").trim(),
+        };
         (k.trim() == "model" && !v.is_empty()).then(|| v.to_string())
     })
 }
 
+/// The models the backend offers this account, from the catalog Codex saves
+/// as `models_cache.json` (the `list`-visible ones in Codex's own order).
+/// Empty when Codex has not been run here yet.
+pub fn listed_models() -> Vec<String> {
+    let Some(text) = home().and_then(|h| std::fs::read_to_string(h.join("models_cache.json")).ok()) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return Vec::new() };
+    let mut models: Vec<(i64, String)> = v["models"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .filter(|m| m["visibility"].as_str() == Some("list"))
+                .filter_map(|m| Some((m["priority"].as_i64().unwrap_or(i64::MAX), m["slug"].as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    models.sort();
+    models.into_iter().map(|(_, slug)| slug).collect()
+}
+
+/// The model to use: the one Codex is configured with, else the first the
+/// backend lists for this account, else a name that used to be safe.
+pub fn default_model() -> String {
+    configured_model().or_else(|| listed_models().into_iter().next()).unwrap_or_else(|| DEFAULT_MODEL.into())
+}
+
+/// A fresh id in UUID form for this process's requests, the shape Codex
+/// sends as its conversation id.
+pub fn session_id() -> String {
+    let r = |n: usize| crate::ui::rand(1 << n);
+    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:06x}{:06x}", r(32), r(16), r(12), 0x8000 | r(14), r(24), r(24))
+}
+
 /// The signed-in ChatGPT account's tokens.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Auth {
     path: PathBuf,
     access_token: String,
@@ -60,6 +106,13 @@ pub struct Auth {
     account_id: String,
     /// The account's email from the id token, for the doctor; never a secret.
     pub email: Option<String>,
+}
+
+impl std::fmt::Debug for Auth {
+    /// Never the tokens: an `{:?}` on an endpoint must not print a sign-in.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth").field("account_id", &self.account_id).field("email", &self.email).finish_non_exhaustive()
+    }
 }
 
 impl Auth {
@@ -112,10 +165,14 @@ impl Auth {
     /// Trades the refresh token for new tokens and saves them where Codex
     /// keeps them. A refresh token the auth service no longer accepts means
     /// signing in again; the error says so.
-    pub fn refresh(&mut self, http: &reqwest::blocking::Client) -> Result<()> {
+    pub fn refresh(&mut self, http: &reqwest::blocking::Client, timeout: Duration) -> Result<()> {
+        let url = std::env::var("RUSTY_CODEX_REFRESH_URL").ok().filter(|u| !u.is_empty());
+        self.refresh_at(http, timeout, url.as_deref().unwrap_or(REFRESH_URL))
+    }
+
+    fn refresh_at(&mut self, http: &reqwest::blocking::Client, timeout: Duration, url: &str) -> Result<()> {
         // Codex (or another rusty) may have refreshed already. Refresh tokens
-        // are single use, so spending ours again would be refused and could
-        // sign both tools out; take the newer tokens instead, as Codex does.
+        // are single use, so spending ours again could sign both tools out.
         if let Some(disk) = Self::load_from(self.path.clone()) {
             if disk.access_token != self.access_token && !disk.expiring() {
                 *self = disk;
@@ -123,16 +180,27 @@ impl Auth {
             }
             self.refresh_token = disk.refresh_token;
         }
-        let url = std::env::var("RUSTY_CODEX_REFRESH_URL").ok().filter(|u| !u.is_empty());
+        let deadline = std::time::Instant::now() + timeout;
         let body = json!({"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": self.refresh_token});
-        let resp = http
-            .post(url.as_deref().unwrap_or(REFRESH_URL))
-            .json(&body)
-            .send()
-            .context("codex token refresh failed")?;
+        let resp = http.post(url).json(&body).timeout(timeout).send().context("codex token refresh failed")?;
         let status = resp.status();
-        let text = resp.text().unwrap_or_default();
+        let text = resp.text().context("reading codex token refresh response")?;
         if !status.is_success() {
+            // Another process may have spent the same refresh token a moment
+            // earlier; its new tokens land on disk shortly after.
+            for _ in 0..6 {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                if let Some(disk) = Self::load_from(self.path.clone()) {
+                    if disk.refresh_token != self.refresh_token && !disk.expiring() {
+                        *self = disk;
+                        return Ok(());
+                    }
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(250)));
+            }
             let reason = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|v| v["error"].as_str().or_else(|| v["error"]["code"].as_str()).map(String::from))
@@ -433,9 +501,6 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     if !saw_terminal {
         bail!("stream interrupted: Codex Responses stream ended before a terminal event");
     }
-    if reply.finish_reason.is_none() {
-        reply.finish_reason = Some(if reply.tool_calls.is_empty() { "stop".into() } else { "tool_calls".into() });
-    }
     for (i, c) in reply.tool_calls.iter_mut().enumerate() {
         if c.id.is_empty() {
             c.id = format!("call_{i}");
@@ -576,8 +641,44 @@ mod tests {
         let newer = jwt(json!({"exp": rusty::unix_now() + 3600}));
         write(&newer, "r1");
         // No refresh server is reachable here: the newer tokens on disk are used without one.
-        auth.refresh(&reqwest::blocking::Client::new()).unwrap();
+        auth.refresh(&reqwest::blocking::Client::new(), REFRESH_TIMEOUT).unwrap();
         assert_eq!((auth.access_token(), auth.refresh_token.as_str()), (newer.as_str(), "r1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stalled_refresh_is_bounded_by_its_request_timeout() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let dir = auth_temp_dir();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            json!({"tokens": {"access_token": jwt(json!({"exp": rusty::unix_now() + 60})), "refresh_token": "offline-r0", "account_id": "a"}})
+                .to_string(),
+        )
+        .unwrap();
+        let mut auth = Auth::load_from(path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Simulate an OAuth server that accepts the refresh but never
+            // completes its body. The caller must not wait for the blocking
+            // client's former 30-second default (or indefinitely).
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        let http = reqwest::blocking::Client::builder().timeout(None).build().unwrap();
+        let started = std::time::Instant::now();
+        let result = auth.refresh_at(&http, Duration::from_millis(100), &url);
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(result.is_err(), "a refresh with no response must fail");
+        assert!(elapsed < Duration::from_millis(400), "refresh exceeded its 100ms cap: {elapsed:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -714,6 +815,19 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_reads_quoted_values_up_to_the_closing_quote() {
+        for (text, want) in [
+            ("model = \"gpt-x\"\n", Some("gpt-x")),
+            ("model = \"gpt-x\"# note\n", Some("gpt-x")),
+            ("model = 'gpt-x' # note\n", Some("gpt-x")),
+            ("model = gpt-x # note\n", Some("gpt-x")),
+            ("[profiles.a]\nmodel = \"gpt-y\"\n", None),
+        ] {
+            assert_eq!(model_in(text).as_deref(), want, "{text}");
+        }
+    }
+
+    #[test]
     fn helpers() {
         assert_eq!(base64url("aGVsbG8").unwrap(), b"hello");
         assert_eq!(base64url("aGVsbG8=").unwrap(), b"hello");
@@ -721,5 +835,9 @@ mod tests {
         let stamp = rfc3339_now();
         assert_eq!(stamp.len(), 20, "{stamp}");
         assert!(stamp.starts_with("20") && stamp.ends_with('Z'));
+        let (a, b) = (session_id(), session_id());
+        assert_eq!(a.len(), 36, "{a}");
+        assert_eq!(a.matches('-').count(), 4, "{a}");
+        assert_ne!(a, b);
     }
 }
