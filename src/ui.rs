@@ -28,7 +28,7 @@ pub const THEMES: &[Theme] = &[
         accent: (222, 64, 42),
         info: (176, 188, 200),
         warn: (240, 192, 92),
-        muted: (112, 110, 112),
+        muted: (158, 154, 150),
         from: (236, 122, 52),
         to: (160, 168, 178),
     },
@@ -38,7 +38,7 @@ pub const THEMES: &[Theme] = &[
         accent: (255, 46, 99),
         info: (0, 229, 255),
         warn: (255, 190, 11),
-        muted: (108, 117, 125),
+        muted: (142, 152, 160),
         from: (57, 255, 136),
         to: (255, 46, 99),
     },
@@ -48,7 +48,7 @@ pub const THEMES: &[Theme] = &[
         accent: (255, 59, 48),
         info: (140, 255, 170),
         warn: (210, 255, 0),
-        muted: (74, 120, 86),
+        muted: (104, 164, 120),
         from: (0, 110, 40),
         to: (170, 255, 190),
     },
@@ -58,7 +58,7 @@ pub const THEMES: &[Theme] = &[
         accent: (255, 69, 58),
         info: (255, 214, 140),
         warn: (255, 140, 0),
-        muted: (140, 112, 72),
+        muted: (178, 148, 104),
         from: (255, 110, 0),
         to: (255, 226, 140),
     },
@@ -68,7 +68,7 @@ pub const THEMES: &[Theme] = &[
         accent: (255, 85, 170),
         info: (180, 160, 255),
         warn: (255, 204, 102),
-        muted: (102, 120, 140),
+        muted: (138, 158, 180),
         from: (60, 140, 255),
         to: (230, 120, 255),
     },
@@ -78,7 +78,7 @@ pub const THEMES: &[Theme] = &[
         accent: (255, 255, 255),
         info: (200, 200, 200),
         warn: (220, 220, 220),
-        muted: (120, 120, 120),
+        muted: (164, 164, 164),
         from: (120, 120, 120),
         to: (255, 255, 255),
     },
@@ -129,7 +129,9 @@ fn fg((r, g, b): Rgb, s: &str, bold: bool) -> String {
     match level() {
         0 => s.to_string(),
         1 => {
-            let c = |v: u8| (v as u16 * 5 / 255) as u8;
+            // Round to the nearest cube step: truncating turned every mid grey
+            // into the darkest one the palette has.
+            let c = |v: u8| ((v as u16 * 5 + 127) / 255) as u8;
             format!("\x1b[{weight}38;5;{}m{s}\x1b[0m", 16 + 36 * c(r) + 6 * c(g) + c(b))
         }
         _ => format!("\x1b[{weight}38;2;{r};{g};{b}m{s}\x1b[0m"),
