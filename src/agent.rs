@@ -1490,11 +1490,6 @@ impl Agent {
             p.fetch_add(1, Ordering::Relaxed);
         }
         d.tool(&call.name, &args);
-        let observed = if self.side_meta.is_some() && matches!(call.name.as_str(), "read_file" | "outline") {
-            args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
-        } else {
-            None
-        };
         let result = match call.name.as_str() {
             "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
             "remember" => {
@@ -1560,17 +1555,6 @@ impl Agent {
                 (format!("error: {e:#}"), false, refusal)
             }
         };
-        if ok {
-            if let Some((path, hash)) = observed {
-                if let Some(meta) = &mut self.side_meta {
-                    if crate::inbox::file_version(&self.cwd, &path).as_ref().is_some_and(|(_, after)| after == &hash) {
-                        meta.observations.insert(path, hash);
-                    } else {
-                        meta.observations.remove(&path);
-                    }
-                }
-            }
-        }
         if ok && self.is_worker && self.board.is_some() {
             if let Ok(cwd) = self.cwd.canonicalize() {
                 self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
@@ -1608,7 +1592,24 @@ impl Agent {
         if name == "bash" {
             return self.run_bash(args, &approval, d);
         }
-        self.backend.execute(name, args, &self.policy, &approval)
+        let observed = if self.side_meta.is_some() && matches!(name, "read_file" | "outline") {
+            args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
+        } else {
+            None
+        };
+        let result = self.backend.execute(name, args, &self.policy, &approval);
+        if result.is_ok() {
+            if let Some((path, hash)) = observed {
+                if let Some(meta) = &mut self.side_meta {
+                    if crate::inbox::file_version(&self.cwd, &path).as_ref().is_some_and(|(_, after)| after == &hash) {
+                        meta.observations.insert(path, hash);
+                    } else {
+                        meta.observations.remove(&path);
+                    }
+                }
+            }
+        }
+        result
     }
 
     fn run_activity(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {

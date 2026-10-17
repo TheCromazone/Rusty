@@ -4520,6 +4520,42 @@ fn persistent_sides_read_files_but_cannot_write_or_pollute_the_parent() {
 }
 
 #[test]
+fn denied_side_reads_are_not_recorded_as_file_observations() {
+    let s = Sandbox::new("side-denied-read-observation");
+    std::fs::write(s.project.join("secret.txt"), "do not hash before permission").unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("read_file", serde_json::json!({"path":"secret.txt"})),
+        say("I could not inspect it"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    let shown = s.repl_with(
+        cmd,
+        &["/permissions deny read_file", "/side new restricted", "inspect secret.txt", "/back", "/quit"],
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2, "{shown}");
+    assert!(
+        requests[1]["messages"].to_string().contains("error: denied by permissions"),
+        "{}",
+        requests[1]["messages"]
+    );
+
+    let project = std::fs::read_dir(s.home.join("projects")).unwrap().next().unwrap().unwrap().path();
+    let side_dir = std::fs::read_dir(project.join("sessions").join("sides")).unwrap();
+    let side = side_dir
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(side).unwrap()).unwrap();
+    assert!(
+        saved["side"]["observations"].as_object().unwrap().is_empty(),
+        "denied reads must not be observed: {}",
+        saved["side"]["observations"]
+    );
+}
+
+#[test]
 fn a_saved_side_chat_reopens_after_restarting_the_parent() {
     let s = Sandbox::new("side-restart");
     let (url, server) = scripted_endpoint(vec![say("MAIN_SEED"), say("SAVED_SIDE_ANSWER")]);
