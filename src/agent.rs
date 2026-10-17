@@ -3020,17 +3020,39 @@ fn checker_gist(report: &str) -> Option<String> {
             && extension.chars().all(char::is_alphanumeric)
     }
 
+    /// "- ", "* ", "1. " or "1) " in front of a line; a bare "**" is bold, not a marker.
+    fn unmarked(line: &str) -> &str {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            return rest.trim();
+        }
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        match line[digits..].strip_prefix(['.', ')']) {
+            Some(rest) if digits > 0 && rest.starts_with(' ') => rest.trim(),
+            _ => line,
+        }
+    }
+
+    let mut in_code = false;
     report
         .lines()
-        // A list marker is "- " or "* "; a bare "**" is bold, not a marker.
-        .map(|l| l.trim().strip_prefix("- ").or_else(|| l.trim().strip_prefix("* ")).unwrap_or(l.trim()).trim())
-        .filter(|l| !l.starts_with('#') && !l.starts_with("```"))
+        .map(unmarked)
+        // Lines inside a fenced block are code the checker quoted, not its finding.
+        .filter(|l| {
+            if l.starts_with("```") {
+                in_code = !in_code;
+                return false;
+            }
+            !in_code && !l.starts_with('#')
+        })
         // A bold word or two on its own is a label, like "**Findings**" or "- **stats.py**".
         .filter(|l| !(l.starts_with("**") && l.ends_with("**") && l.split_whitespace().count() <= 3))
         .map(|l| l.replace("**", "").trim().to_string())
-        // "It is correct. The file now contains:" → "It is correct."
+        // "It is correct. The file now contains:" → "It is correct."; a finding
+        // that itself leads into a quote keeps its words without the colon.
         .map(|l| match (l.ends_with(':'), l.rfind(". ")) {
             (true, Some(i)) => l[..=i].to_string(),
+            (true, None) if l.split_whitespace().count() > 3 => l.trim_end_matches(':').trim_end().to_string(),
             _ => l,
         })
         // A bare file name says nothing; the finding is on the next line.
@@ -3050,6 +3072,12 @@ mod gist_tests {
         assert_eq!(checker_gist("Fail.").as_deref(), Some("Fail."));
         assert_eq!(checker_gist("e.g.").as_deref(), Some("e.g."));
         assert_eq!(checker_gist("Findings:\n"), None);
+        // A numbered report whose first item leads into a code block.
+        let numbered = "1. **stats.py** – the spread helper returns the wrong sign, lines 18-20:\n```py\n\"\"\"Return max minus min.\"\"\"\n```\n2. nothing else";
+        assert_eq!(
+            checker_gist(numbered).as_deref(),
+            Some("stats.py – the spread helper returns the wrong sign, lines 18-20")
+        );
         assert_eq!(
             checker_gist("## check\n- **stats.py**\n  - clamp returns lo instead of hi at line 8").as_deref(),
             Some("clamp returns lo instead of hi at line 8")
@@ -3061,7 +3089,7 @@ mod gist_tests {
         );
         assert_eq!(
             checker_gist("**Findings**\n\n1. note.txt:1 lacks a newline").as_deref(),
-            Some("1. note.txt:1 lacks a newline")
+            Some("note.txt:1 lacks a newline")
         );
     }
 }

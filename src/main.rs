@@ -607,6 +607,10 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
             side::wait(&parent);
         }
         agent.accept_side_summaries()?;
+        // Anything typed since the turn stopped reading keys, including an
+        // Enter that would otherwise reach the line editor as a bare newline
+        // and sit there unsent, joins the queue first.
+        signal::poll_keys();
         // Queued and freshly typed input go through the same slash router.
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::user("›"), ui::user(&queued));
