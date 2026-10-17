@@ -83,7 +83,45 @@ fn serve(stream: TcpStream) -> Result<()> {
 
     out.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")?;
     let mut sse = Sse(out);
-    if prompt.contains("Unix") {
+    let system = messages.first().map(text).unwrap_or_default();
+    let main_side_capture =
+        messages.iter().any(|m| role(m) == "user" && matches!(text(m).as_str(), "side-capture" | "summary-capture"))
+            && !system.contains("persistent read-only side discussion");
+    if system.starts_with("Summarize this read-only side discussion") {
+        sse.content("PTY_SIDE_SUMMARY: inspect idempotency before applying a retry.\n", Some("stop"))?;
+    } else if prompt == "aside-sentinel" {
+        sse.content("ASIDE_ANSWER: this is a context-only answer.\n", Some("stop"))?;
+    } else if prompt == "side-slow" {
+        pause(0.4);
+        sse.content("SIDE_SLOW_ANSWER\n", Some("stop"))?;
+    } else if prompt == "side-followup" {
+        sse.content("SIDE_FOLLOWUP_ANSWER\n", Some("stop"))?;
+    } else if prompt == "side-sentinel" {
+        if tools == 0 {
+            sse.call("read", "read_file", r#"{"path":"side-fact.txt"}"#)?;
+        } else {
+            sse.content("SIDE_ANSWER: inspected the local side fact.\n", Some("stop"))?;
+        }
+    } else if prompt == "side-cancel" {
+        for _ in 0..40 {
+            pause(0.15);
+            sse.content("side reasoning\n", None)?;
+        }
+    } else if prompt == "aside-capture" || main_side_capture {
+        if tools == 0 {
+            sse.call(
+                "running",
+                "bash",
+                r#"{"command":"printf started > main-started.txt; sleep 3; printf finished > main-finished.txt"}"#,
+            )?;
+        } else {
+            for i in 0..24 {
+                sse.content(&format!("Main line {i:02}: the side answer did not interrupt this task.\n"), None)?;
+                pause(0.03);
+            }
+            sse.content("CAPTURE_COMPLETE\n", Some("stop"))?;
+        }
+    } else if prompt.contains("Unix") {
         for _ in 0..60 {
             pause(0.15);
             sse.content("A long streamed reply for interruption.\n", None)?;

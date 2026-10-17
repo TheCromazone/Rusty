@@ -211,6 +211,27 @@ pub struct CompactionEvent {
     pub model: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStop {
+    Complete,
+    StepLimit,
+    OutputLimit,
+    Interrupted,
+    Failed,
+}
+
+impl TurnStop {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "done",
+            Self::StepLimit => "incomplete: step limit",
+            Self::OutputLimit => "incomplete: output limit",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 pub struct Agent {
     pub backend: crate::backend::Backend,
     client: Arc<Client>,
@@ -246,6 +267,10 @@ pub struct Agent {
     checker_owed: bool,
     pub cwd: PathBuf,
     pub history: Vec<Value>,
+    aside_memory: crate::aside::Shared,
+    pub(crate) side_book: crate::side::Shared,
+    pub(crate) side_meta: Option<crate::side::Meta>,
+    side_receipts: std::collections::BTreeSet<String>,
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
@@ -288,11 +313,14 @@ pub struct Agent {
     /// so a compaction can tell an undone edit from a change.
     pub start_blobs: Option<std::collections::HashMap<String, String>>,
     pub session_path: Option<PathBuf>,
+    session_lease: Option<crate::session::Lease>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
     /// MCP servers' tools, offered to the lead only.
     pub mcp: crate::mcp::Mcp,
     is_worker: bool,
+    turn_stop: TurnStop,
+    worker_constraints: String,
     request_role: &'static str,
     /// A swarm worker's board, its index, how many notes it has seen and its label.
     board: Option<(crate::swarm::Board, usize, usize, String)>,
@@ -346,6 +374,10 @@ impl Agent {
             checker_owed: false,
             cwd,
             history: Vec::new(),
+            aside_memory: Default::default(),
+            side_book: Default::default(),
+            side_meta: None,
+            side_receipts: Default::default(),
             archived: Vec::new(),
             trajectory_path: None,
             trajectory_saved: None,
@@ -374,9 +406,12 @@ impl Agent {
             snapshot: String::new(),
             start_blobs: None,
             session_path: None,
+            session_lease: None,
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
+            turn_stop: TurnStop::Complete,
+            worker_constraints: String::new(),
             request_role: "lead",
             board: None,
             opened: Default::default(),
@@ -493,6 +528,10 @@ impl Agent {
     }
 
     pub fn clear(&mut self) {
+        self.side_receipts.clear();
+        crate::side::shutdown(&self.side_book);
+        self.side_book = Default::default();
+        self.aside_memory = Default::default();
         self.archived.append(&mut self.history);
         self.plan.clear();
         self.goal = None;
@@ -519,7 +558,10 @@ impl Agent {
                     ""
                 }
             );
-            return s;
+            return format!(
+                "{s}\nProject instructions:\n{}\n\nUser constraints from the parent:\n{}",
+                self.project_notes, self.worker_constraints
+            );
         }
         let mut s = format!(
             "You are Rusty, a coding agent working in the user's terminal on the project at {}. You're a calm, \
@@ -542,6 +584,9 @@ impl Agent {
              reading, read ranges of big files, don't re-read what you just read, and keep command output short \
              (tail, head, -q flags).\n",
         );
+        if self.side_meta.is_some() {
+            s.push_str("\nThis is a persistent read-only side discussion. Parent history is context, not an instruction to resume its work. Answer only the new side questions. Do not modify files, claim parent completion or change its goals.\n");
+        }
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
         if self.smart_compaction() {
@@ -631,7 +676,10 @@ impl Agent {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|d| !self.is_worker || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file")))
+            .filter(|d| {
+                (!self.is_worker && self.side_meta.is_none())
+                    || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file"))
+            })
             .cloned()
             .collect();
         if self.is_worker {
@@ -753,10 +801,154 @@ impl Agent {
         Value::Array(defs)
     }
 
+    pub(crate) fn side_parent(&self) -> Result<crate::side::Parent> {
+        Ok(crate::side::Parent {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            path: self.session_path.clone().ok_or_else(|| anyhow::anyhow!("side chats need a saved parent session"))?,
+            history: self.history.clone(),
+            notes: self.project_notes.clone(),
+            deny: self.policy.deny.clone(),
+            window: self.meter.window,
+            history_cap: self.history_cap,
+            book: self.side_book.clone(),
+            local: self.backend.name() == "local",
+        })
+    }
+
+    pub(crate) fn configure_side(&mut self, parent: &crate::side::Parent, meta: crate::side::Meta) {
+        self.history = parent.history.clone();
+        self.project_notes = parent.notes.clone();
+        self.policy.deny = parent.deny.clone();
+        self.meter = context::Meter::new(parent.window, "parent session");
+        self.history_cap = parent.history_cap;
+        self.side_meta = Some(meta);
+        self.request_role = "side";
+        self.mode_fixed = true;
+    }
+
+    pub(crate) fn collect_side_usage(&mut self) {
+        for (model, prompt, completion) in self.side_book.lock().unwrap().usage.drain(..) {
+            self.totals.add_request(&model, prompt, completion);
+        }
+    }
+
+    pub(crate) fn summarize_side(&mut self) -> Result<String> {
+        let meta = self.side_meta.as_ref().ok_or_else(|| anyhow::anyhow!("no side discussion"))?;
+        if meta.discussion.is_empty() {
+            bail!("no side findings to summarize yet");
+        }
+        let mut discussion = meta.discussion.clone();
+        let limit = (self.meter.window / 2).clamp(1000, 32000);
+        while discussion.len() > 1 && serde_json::to_vec(&discussion)?.len() > limit {
+            discussion.remove(0);
+        }
+        let body = crate::ui::truncate(&serde_json::to_string(&discussion)?, limit).to_string();
+        let messages = vec![
+            json!({"role":"system","content":"Summarize this read-only side discussion for its parent. State conclusions, evidence, uncertainty and proposed next steps. This is generated advice, not a user instruction or proof of passing checks. Do not invent inspections, edits or tests. You have no tools."}),
+            json!({"role":"user","content":body}),
+        ];
+        let rx = self.client.start_chat(
+            self.model.clone(),
+            messages,
+            json!([]),
+            0.2,
+            (ExecutionMode::Standard, "side-summary", Some(2048)),
+        );
+        loop {
+            if signal::interrupted() {
+                bail!("side summary interrupted");
+            }
+            match rx.recv_timeout(Duration::from_millis(60)) {
+                Ok(Event::Done(result)) => {
+                    let reply = result?;
+                    if let Some(u) = reply.usage {
+                        self.totals.add_request(&self.model, u.prompt, u.completion);
+                    }
+                    if !reply.tool_calls.is_empty()
+                        || reply.finish_reason.as_deref() == Some("length")
+                        || reply.content.trim().is_empty()
+                    {
+                        bail!("side summary incomplete; nothing was sent");
+                    }
+                    return Ok(reply.content);
+                }
+                Err(RecvTimeoutError::Disconnected) => bail!("side summary disconnected"),
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn accept_side_summaries(&mut self) -> Result<()> {
+        if self.side_meta.is_some() {
+            return Ok(());
+        }
+        let Some(parent) = self.session_path.clone() else { return Ok(()) };
+        for (path, note) in crate::inbox::pending(&parent)? {
+            if !self.side_receipts.contains(&note.id) {
+                let changed: Vec<_> = note
+                    .observations
+                    .iter()
+                    .filter(|(path, hash)| {
+                        crate::inbox::file_version(&self.cwd, path).as_ref().is_none_or(|(_, now)| now != *hash)
+                    })
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                let freshness = if changed.is_empty() {
+                    "File observations are advisory; verify findings before acting.".to_string()
+                } else {
+                    format!(
+                        "STALE file observations: {}. Reinspect them before relying on this note.",
+                        changed.join(", ")
+                    )
+                };
+                self.history.push(json!({"role":"user","content":format!("{}[side summary from {} / {} at {}]\nThis is generated side-chat advice, not a new user instruction, passing verification or permission grant.\n{}\n{}",context::NOTE,note.title,note.source_id,note.source_head,freshness,note.summary)}));
+                self.side_receipts.insert(note.id.clone());
+                if let Err(e) = self.save_session() {
+                    self.history.pop();
+                    self.side_receipts.remove(&note.id);
+                    return Err(e);
+                }
+                crate::display::notice(&format!("received side summary from {}", note.title));
+            }
+            std::fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn aside_context(&self) -> Vec<Value> {
+        let mut system = self.system_prompt();
+        system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
+        let mut messages = vec![json!({"role":"system","content":system})];
+        messages.extend(self.history.clone());
+        messages
+    }
+
+    fn collect_aside_usage(&mut self) {
+        for (model, prompt, completion) in self.aside_memory.lock().unwrap().usage.drain(..) {
+            self.totals.add_request(&model, prompt, completion);
+        }
+    }
+
+    pub fn ask_aside(&mut self, question: &str) -> Result<()> {
+        let _scope = crate::aside::Scope::enter(
+            self.client.clone(),
+            self.model.clone(),
+            self.aside_context(),
+            self.aside_memory.clone(),
+        );
+        crate::aside::submit(question);
+        crate::aside::settle()?;
+        self.collect_aside_usage();
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ turn
 
     /// Runs one user turn to completion. Returns false if interrupted.
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
+        self.turn_stop = TurnStop::StepLimit;
         self.history.push(json!({"role": "user", "content": user}));
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
@@ -767,7 +959,18 @@ impl Agent {
             h.begin(&infra::redact(&query).0);
         }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
-        let mut d = Display::new(self.is_worker);
+        let mut d = Display::new(self.is_worker || self.side_meta.is_some());
+        let _aside_scope = (!self.is_worker && self.side_meta.is_none()).then(|| {
+            crate::aside::Scope::enter(
+                self.client.clone(),
+                self.model.clone(),
+                self.aside_context(),
+                self.aside_memory.clone(),
+            )
+        });
+        if self.side_meta.is_none() && !self.is_worker {
+            crate::aside::attach_side(self.side_parent().ok());
+        }
         let before = self.totals.clone();
         // Only consecutive unchanged results count: an edit, a different call,
         // or new output is progress. Retain one call rather than a turn-sized map.
@@ -799,6 +1002,9 @@ impl Agent {
         self.last_turn_stalled = false;
 
         for step in 0..max_steps {
+            if !self.is_worker {
+                self.accept_side_summaries()?;
+            }
             if signal::interrupted() {
                 outcome = Ok(false);
                 break;
@@ -831,6 +1037,10 @@ impl Agent {
             }
 
             let started = Instant::now();
+            if !self.is_worker && self.side_meta.is_none() {
+                crate::aside::refresh(self.aside_context());
+                crate::aside::attach_side(self.side_parent().ok());
+            }
             let tools = self.tool_defs();
             let sent = context::estimate(&messages) + tools.to_string().len() / 4;
             let mut reply = match self.ask(&mut d, messages, tools) {
@@ -910,6 +1120,11 @@ impl Agent {
                     }
                     continue;
                 }
+                self.turn_stop = if reply.finish_reason.as_deref() == Some("length") {
+                    TurnStop::OutputLimit
+                } else {
+                    TurnStop::Complete
+                };
                 break;
             }
             for call in &reply.tool_calls {
@@ -1026,7 +1241,11 @@ impl Agent {
             if reply.finish_reason.as_deref() == Some("length") {
                 self.discard_claim();
                 d.line(&ui::warn(TOKEN_LIMIT_NOTE));
+                self.turn_stop = TurnStop::OutputLimit;
                 break;
+            }
+            if !self.is_worker {
+                self.accept_side_summaries()?;
             }
             if let Some(args) = self.pending_goal.take() {
                 let blocked = args["blocked"].as_bool().unwrap_or(false);
@@ -1058,6 +1277,11 @@ impl Agent {
             }
         }
 
+        if !self.is_worker && self.side_meta.is_none() {
+            crate::aside::settle()?;
+            self.collect_aside_usage();
+            self.collect_side_usage();
+        }
         let cancelled = self.activities.cancel_all(signal::interrupted());
         if cancelled > 0 {
             let note = format!("cancelled {cancelled} owned command(s) at turn end; their work is unconfirmed");
@@ -1075,7 +1299,12 @@ impl Agent {
         for (tool, n) in &d.stats.tool_tokens {
             *self.totals.by_tool.entry(tool.clone()).or_default() += n;
         }
-        if self.is_worker {
+        if outcome.is_err() {
+            self.turn_stop = TurnStop::Failed;
+        } else if matches!(outcome, Ok(false)) || signal::interrupted() {
+            self.turn_stop = TurnStop::Interrupted;
+        }
+        if self.is_worker || self.side_meta.is_some() {
             return outcome;
         }
         let interrupted = matches!(outcome, Ok(false)) || signal::interrupted();
@@ -1154,6 +1383,24 @@ impl Agent {
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return format!("error: unknown tool `{}`; this run offers only bash", call.name);
         }
+        if self.side_meta.is_some()
+            && !matches!(
+                call.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "search"
+                    | "glob"
+                    | "outline"
+                    | "bash"
+                    | "bash_start"
+                    | "bash_wait"
+                    | "bash_cancel"
+                    | "plan"
+                    | "compact"
+            )
+        {
+            return "denied: a read-only side chat cannot delegate, change memory or call external tools".into();
+        }
         if self.is_worker
             && !matches!(
                 call.name.as_str(),
@@ -1169,15 +1416,15 @@ impl Agent {
                 return format!("error: arguments were not valid JSON ({e}). Call the tool again with valid JSON.")
             }
         };
-        if self.is_worker && self.board.is_some() {
-            if let Ok(cwd) = self.cwd.canonicalize() {
-                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
-            }
-        }
         if let Some(p) = &self.progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
         d.tool(&call.name, &args);
+        let observed = if self.side_meta.is_some() && matches!(call.name.as_str(), "read_file" | "outline") {
+            args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
+        } else {
+            None
+        };
         let result = match call.name.as_str() {
             "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
             "remember" => {
@@ -1240,6 +1487,22 @@ impl Agent {
             Ok(t) => (t, true),
             Err(e) => (format!("error: {e:#}"), false),
         };
+        if ok {
+            if let Some((path, hash)) = observed {
+                if let Some(meta) = &mut self.side_meta {
+                    if crate::inbox::file_version(&self.cwd, &path).as_ref().is_some_and(|(_, after)| after == &hash) {
+                        meta.observations.insert(path, hash);
+                    } else {
+                        meta.observations.remove(&path);
+                    }
+                }
+            }
+        }
+        if ok && self.is_worker && self.board.is_some() {
+            if let Ok(cwd) = self.cwd.canonicalize() {
+                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
+            }
+        }
         if ok && matches!(call.name.as_str(), "write_file" | "edit_file") {
             self.infra.invalidate(args["path"].as_str().unwrap_or(""));
         }
@@ -1524,6 +1787,8 @@ impl Agent {
         let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(jobs)));
         let counters: Arc<Vec<AtomicUsize>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        let constraints = context::user_messages(&self.history, self.carry_chars());
         for _ in 0..parallel {
             let (queue, counters, board, tx) = (queue.clone(), counters.clone(), board.clone(), tx.clone());
             let (client, cwd, deny, backend) =
@@ -1532,7 +1797,8 @@ impl Agent {
             let lead_window = (self.meter.window, self.meter.window_source);
             // Workers compact as the lead does; smart's own tool is the lead's alone.
             let (compaction, history_cap) = (self.compaction, self.history_cap);
-            std::thread::spawn(move || loop {
+            let (project_notes, constraints) = (self.project_notes.clone(), constraints.clone());
+            handles.push(std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
                 }
@@ -1546,6 +1812,8 @@ impl Agent {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let mut w = Agent::new(client.clone(), model.clone(), cwd.clone(), Policy::new(Mode::ReadOnly));
                 w.is_worker = true;
+                w.project_notes = project_notes.clone();
+                w.worker_constraints = constraints.clone();
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
@@ -1570,19 +1838,19 @@ impl Agent {
                     .and_then(|m| m["content"].as_str())
                     .unwrap_or("")
                     .to_string();
-                let report = match result {
-                    Err(_) => "failed: the worker crashed".to_string(),
-                    Ok(Err(e)) => format!("failed: {e:#}"),
-                    Ok(Ok(_)) if answer.is_empty() => "returned nothing".to_string(),
-                    Ok(Ok(_)) => answer,
+                let (stop, report) = match result {
+                    Err(_) => (TurnStop::Failed, "the worker crashed".to_string()),
+                    Ok(Err(e)) => (TurnStop::Failed, format!("{e:#}")),
+                    Ok(Ok(_)) if answer.is_empty() => (TurnStop::Failed, "returned nothing".to_string()),
+                    Ok(Ok(_)) => (w.turn_stop, answer),
                 };
                 if tx
-                    .send((i, desc, model, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
+                    .send((i, desc, model, stop, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
                     .is_err()
                 {
                     break;
                 }
-            });
+            }));
         }
         drop(tx);
 
@@ -1591,12 +1859,12 @@ impl Agent {
         let mut done = 0;
         while done < n {
             match rx.recv_timeout(Duration::from_millis(60)) {
-                Ok((i, desc, model, report, totals, took, files)) => {
+                Ok((i, desc, model, stop, report, totals, took, files)) => {
                     done += 1;
                     opened.extend(files);
                     self.totals.merge(&totals);
                     let calls = counters[i].load(Ordering::Relaxed);
-                    let failed = report.starts_with("failed:");
+                    let failed = stop != TurnStop::Complete;
                     if display::view() != View::Adhd {
                         let mark = if failed { ui::err("✗") } else { ui::ok("✓") };
                         let short_model = model.rsplit('/').next().unwrap_or(&model).to_string();
@@ -1610,18 +1878,23 @@ impl Agent {
                             ))
                         ));
                     }
-                    reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
+                    reports[i] = format!("## {} ({})\n{}", desc, stop.label(), report);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     signal::poll_keys();
                     if signal::interrupted() {
-                        break;
+                        d.set_status("waiting for interrupted workers to settle".into());
+                    } else {
+                        d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     }
-                    d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     d.tick();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // Do not let a previous worker resume when the next turn resets Ctrl-C.
+        for handle in handles {
+            let _ = handle.join();
         }
         d.set_status(String::new());
         let shared = board.map(|b| b.summary()).filter(|s| !s.is_empty());
@@ -1655,8 +1928,8 @@ impl Agent {
             }
             let more = if total > missed.len() { format!(" (+{} more)", total - missed.len()) } else { String::new() };
             out.push(format!(
-                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. If the task needs \
-                 full coverage, check them yourself or give them to another worker.",
+                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. Only successful read_file/outline calls are tracked; shell and search \
+                 coverage is not measured. If the task needs full coverage, check them yourself or give them to another worker.",
                 missed.join(", ")
             ));
         }
@@ -1781,7 +2054,7 @@ impl Agent {
         let mut stalls_in_a_row = 0;
         loop {
             let finished = self.run_turn(&prompt)?;
-            self.save_session();
+            self.save_session()?;
             stalls_in_a_row = if self.last_turn_stalled { stalls_in_a_row + 1 } else { 0 };
             if stalls_in_a_row == 3 {
                 // An unfinished goal, not an error: the harness contract
@@ -1910,7 +2183,7 @@ impl Agent {
             if let Err(e) = self.run_turn(&text) {
                 break Err(e);
             }
-            self.save_session();
+            self.save_session()?;
             let ctl = self.loop_ctl.as_ref().unwrap();
             if signal::interrupted() || ctl.stop || max_runs.is_some_and(|m| run >= m) {
                 break Ok(());
@@ -2359,13 +2632,21 @@ impl Agent {
         self.client.budget.snapshot()
     }
 
-    pub fn save_session(&mut self) {
-        let Some(path) = &self.session_path else { return };
+    pub fn new_session(&mut self, dir: &std::path::Path) -> Result<()> {
+        let path = crate::session::create(dir)?;
+        let lease = crate::session::Lease::acquire(&path)?;
+        self.session_path = Some(path);
+        self.session_lease = Some(lease);
+        self.save_session()
+    }
+
+    pub fn save_session(&mut self) -> Result<()> {
+        let Some(path) = &self.session_path else { return Ok(()) };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
-        let _ = rusty::privacy::write_json(path, body);
+        let body = json!({"side_receipts":self.side_receipts,"side":self.side_meta,"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
+        crate::session::save(path, body)?;
         let changes = self.infra.change_record();
         if !changes.is_empty() {
             use std::io::Write;
@@ -2373,10 +2654,14 @@ impl Agent {
                 let _ = f.write_all(infra::redact(&changes).0.as_bytes());
             }
         }
+        Ok(())
     }
 
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
+        let lease = crate::session::Lease::acquire(path)?;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        self.side_meta = serde_json::from_value(v["side"].clone()).ok();
+        self.side_receipts = serde_json::from_value(v["side_receipts"].clone()).unwrap_or_default();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
@@ -2386,6 +2671,8 @@ impl Agent {
             self.history.push(json!({"role":"user","content":format!("{}Saved shell activity receipts are diagnostic only. No live handles are restored and no command is replayed. Inspect prior effects before explicitly starting new work.", context::NOTE)}));
         }
         self.session_path = Some(path.to_path_buf());
+        self.session_lease = Some(lease);
+        self.aside_memory = Default::default();
         Ok(())
     }
 
