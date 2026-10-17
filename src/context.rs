@@ -653,9 +653,33 @@ pub fn parse_compaction(reply: &str) -> (String, Vec<(String, String)>) {
     (summary.trim().to_string(), memories)
 }
 
+/// The memory part of the "compacted" line: `offered` lessons the summary
+/// proposed, `saved` the ones the service confirmed, `kept` whether the memory
+/// level keeps compaction lessons at all.
+pub fn memory_note(offered: usize, saved: usize, kept: bool) -> String {
+    if saved > 0 {
+        format!(", {saved} memories saved")
+    } else if offered > 0 && !kept {
+        format!(", {offered} lessons offered, memory level keeps none")
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_compacted_line_counts_only_memories_the_service_kept() {
+        assert_eq!(memory_note(0, 0, true), "");
+        assert_eq!(memory_note(3, 3, true), ", 3 memories saved");
+        // One of three refused (duplicate, forgotten, bad kind): report two.
+        assert_eq!(memory_note(3, 2, true), ", 2 memories saved");
+        // Proposed at a level that keeps none: say so instead of claiming a save.
+        assert_eq!(memory_note(3, 0, false), ", 3 lessons offered, memory level keeps none");
+        assert_eq!(memory_note(3, 0, true), "");
+    }
 
     fn usage(prompt: u64) -> crate::llm::Usage {
         crate::llm::Usage { prompt, completion: 1, ..Default::default() }

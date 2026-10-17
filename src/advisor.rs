@@ -209,6 +209,8 @@ pub struct Response {
     pub data: Value,
 }
 
+/// How a successful `remember` reply starts; anything else is a refusal.
+pub const SAVED_PREFIX: &str = "saved memory ";
 pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
     // Hooks still return after HOOK_MS. Explicit management may flush SQLite
@@ -837,7 +839,7 @@ impl Engine {
             }
         };
         self.cache.clear();
-        Ok(Response { text: format!("saved memory {reply_id}"), id: reply_id, ..Response::default() })
+        Ok(Response { text: format!("{SAVED_PREFIX}{reply_id}"), id: reply_id, ..Response::default() })
     }
     /// The best lesson for this session right now, if any clears the bar.
     fn advise(&mut self, r: &Request, key: &str) -> Result<Response> {
@@ -985,7 +987,14 @@ impl Engine {
                         )
                     })
                     .collect();
-                reply.text = clip(&lines.join("\n"), if r.op == "recall" { 4096 } else { 24_576 });
+                // An empty reply reads as "memory is empty"; say what is there.
+                reply.text = if lessons.is_empty() {
+                    "no memories saved yet".into()
+                } else if lines.is_empty() {
+                    format!("no memories match; {} saved in total", lessons.len())
+                } else {
+                    clip(&lines.join("\n"), if r.op == "recall" { 4096 } else { 24_576 })
+                };
             }
             "forget" => {
                 let id = r.data["id"].as_str().unwrap_or("");
