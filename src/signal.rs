@@ -70,12 +70,26 @@ pub fn poll_keys() {
     }
 }
 
-/// A message typed while the last turn was running, if any.
+/// What was typed while the last turn ran, one entry at a time, as if
+/// typed at the prompt: each `/command` line on its own, and the lines
+/// between commands together as one message (a pasted block stays whole).
+/// So `/compact` then `/exit` run as commands instead of reaching the
+/// model inside one message.
 pub fn take_queued() -> Option<String> {
     let mut q = QUEUED.lock().ok()?;
     let text = std::mem::take(&mut *q);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+    let mut lines = text.split(['\n', '\r']).map(str::trim_end).skip_while(|l| l.trim().is_empty()).peekable();
+    let command = |l: &str| l.trim_start().starts_with('/');
+    let first = lines.next()?;
+    let mut taken = vec![first];
+    if !command(first) {
+        while let Some(l) = lines.next_if(|l| !command(l)) {
+            taken.push(l);
+        }
+    }
+    *q = lines.collect::<Vec<_>>().join("\n");
+    let entry = taken.join("\n").trim().to_string();
+    (!entry.is_empty()).then_some(entry)
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).
@@ -130,5 +144,15 @@ pub fn approval_line(prompt: &str) -> std::io::Result<String> {
             }
             return Ok(line);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn queued_lines_come_back_one_at_a_time() {
+        super::QUEUED.lock().unwrap().push_str("second message\nwith a pasted line\n/compact\r\n\n/exit\n");
+        let lines: Vec<String> = std::iter::from_fn(super::take_queued).collect();
+        assert_eq!(lines, ["second message\nwith a pasted line", "/compact", "/exit"]);
     }
 }
