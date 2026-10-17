@@ -535,6 +535,8 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut rl: rustyline::Editor<slash::SlashHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(config)?;
     rl.set_helper(Some(slash::SlashHelper { menu: menu.clone(), skills: skill_list.clone() }));
+    // Keep the advertised newline key distinct from Enter's submit binding.
+    rl.bind_sequence(rustyline::KeyEvent::ctrl('J'), rustyline::Cmd::Newline);
     {
         use rustyline::{EventHandler, KeyCode, KeyEvent, Modifiers};
         let on = |h: Box<dyn rustyline::ConditionalEventHandler>| EventHandler::Conditional(h);
@@ -555,7 +557,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     if let Some(h) = &history_file {
         let _ = rl.load_history(h);
     }
-    let prompt = format!("{} ", ui::primary("›"));
+    let prompt = "› ";
     let mut armed_quit = false;
 
     loop {
@@ -567,11 +569,11 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         agent.accept_side_summaries()?;
         // Queued and freshly typed input go through the same slash router.
         let mut input = if let Some(queued) = signal::take_queued() {
-            println!("{} {}", ui::primary("›"), queued);
+            println!("{} {}", ui::user("›"), ui::user(&queued));
             println!("{}", ui::dim("  (typed while rusty was working)"));
             queued
         } else {
-            match rl.readline(&prompt) {
+            match rl.readline(prompt) {
                 Ok(l) => {
                     armed_quit = false;
                     l
