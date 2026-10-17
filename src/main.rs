@@ -1,6 +1,7 @@
 mod activity;
 mod agent;
 mod anthropic;
+mod aside;
 mod backend;
 mod budget;
 mod codex;
@@ -674,6 +675,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
             println!("{}", ui::dim("  fresh context. memories kept."));
         }
+        "/btw" => agent.ask_aside(rest)?,
         "/model" => {
             if !rest.is_empty() {
                 agent.model = rest.to_string();

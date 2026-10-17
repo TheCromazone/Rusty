@@ -60,6 +60,7 @@ pub const COMMANDS: &[Command] = &[
         "memory & context",
         &[("settings", "when to compact: aggressive · standard · passive · smart")],
     ),
+    cmd("/btw", "[question]", "ask from existing context without changing the main chat", "memory & context"),
     cmd("/context", "", "where the window is going", "memory & context"),
     cmd("/model", "[id]", "switch models, any provider", "setup"),
     with(

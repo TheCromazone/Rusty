@@ -43,6 +43,11 @@ static QUEUED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// terminal ever hands it over as a raw byte this catches it too. Anything
 /// else typed during a turn is queued and becomes the next message.
 pub fn poll_keys() {
+    read_keys();
+    crate::aside::poll();
+}
+
+fn read_keys() {
     unsafe {
         if libc::isatty(0) != 1 {
             return;
@@ -74,6 +79,23 @@ pub fn poll_keys() {
 pub fn take_queued() -> Option<String> {
     let mut q = QUEUED.lock().ok()?;
     pop_queued(&mut q)
+}
+
+/// Remove one runtime command while preserving all other type-ahead input.
+pub fn take_command(command: &str) -> Option<String> {
+    let mut q = QUEUED.lock().ok()?;
+    let mut offset = 0;
+    for line in q.split_inclusive('\n') {
+        let text = line.trim();
+        if text == command || text.strip_prefix(command).is_some_and(|rest| rest.starts_with(char::is_whitespace)) {
+            let result = text.to_string();
+            let end = offset + line.len();
+            q.drain(offset..end);
+            return Some(result);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn pop_queued(q: &mut String) -> Option<String> {
