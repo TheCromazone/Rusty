@@ -73,9 +73,18 @@ pub fn poll_keys() {
 /// A message typed while the last turn was running, if any.
 pub fn take_queued() -> Option<String> {
     let mut q = QUEUED.lock().ok()?;
-    let text = std::mem::take(&mut *q);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+    pop_queued(&mut q)
+}
+
+fn pop_queued(q: &mut String) -> Option<String> {
+    while !q.is_empty() {
+        let n = q.find('\n').map(|i| i + 1).unwrap_or(q.len());
+        let text = q.drain(..n).collect::<String>().trim().to_string();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).
@@ -130,5 +139,17 @@ pub fn approval_line(prompt: &str) -> std::io::Result<String> {
             }
             return Ok(line);
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    #[test]
+    fn queued_commands_keep_their_message_boundaries() {
+        let mut q = "\n/context\n/permissions read-only\nnext question\n".to_string();
+        for want in ["/context", "/permissions read-only", "next question"] {
+            assert_eq!(super::pop_queued(&mut q).as_deref(), Some(want));
+        }
+        assert!(super::pop_queued(&mut q).is_none());
     }
 }
