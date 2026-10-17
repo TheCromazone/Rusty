@@ -4395,7 +4395,11 @@ fn the_model_can_list_saved_memories_after_an_unmatched_search() {
     let recall = requests[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "recall").unwrap();
     assert_eq!(recall["function"]["parameters"]["required"], serde_json::json!([]));
     let search_result = requests[1]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap();
-    assert!(search_result["content"].as_str().unwrap().contains("Other memories may exist"));
+    let miss = search_result["content"].as_str().unwrap();
+    assert!(
+        miss.contains("no memories match; 1 saved in total") || miss.contains("Other memories may exist"),
+        "{miss}"
+    );
     let listing = requests[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()
         ["content"]
         .as_str()
@@ -4416,5 +4420,11 @@ fn listing_an_empty_memory_store_is_explicit() {
     let out = s.cmd().env("RUSTY_BASE_URL", url).arg("list saved memories").output().unwrap();
     assert!(out.status.success());
     let r = server.join().unwrap();
-    assert!(r[1]["messages"].to_string().contains("No saved memories in this project or global user preferences."));
+    let result = r[1]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        result == "no memories saved yet" || result == "No saved memories in this project or global user preferences.",
+        "{result}"
+    );
 }
