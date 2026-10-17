@@ -1325,7 +1325,7 @@ impl Agent {
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
-            Authorization::Refused(why) => return Ok(why),
+            Authorization::Refused(why) => bail!("{why}"),
         };
         if name == "bash" {
             return self.run_bash(args, &approval, d);

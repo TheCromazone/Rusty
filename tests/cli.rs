@@ -4398,6 +4398,45 @@ fn workers_inherit_project_rules_and_parent_user_constraints() {
 }
 
 #[test]
+fn denied_worker_reads_do_not_count_as_opened_for_coverage() {
+    let s = Sandbox::new("worker-denied-read-coverage");
+    std::fs::write(s.project.join("a.txt"), "private a").unwrap();
+    std::fs::write(s.project.join("b.txt"), "private b").unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        swarm_call(2),
+        tool_reply("outline", serde_json::json!({"path":"b.txt"})),
+        say("report complete"),
+        tool_reply("read_file", serde_json::json!({"path":"a.txt"})),
+        say("report complete"),
+        say("lead complete"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args([
+        "--mode",
+        "standard",
+        "--memory",
+        "off",
+        "--agents",
+        "swarm",
+        "--swarm-max",
+        "1",
+    ]);
+    let shown = s.repl_with(cmd, &["/permissions deny read_file", "inspect files", "/quit"]);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 6, "{shown}");
+    let lead = requests[5]["messages"].to_string();
+    assert!(lead.contains("## Not opened by any worker"), "{lead}");
+    let coverage = lead.split("## Not opened by any worker").nth(1).unwrap();
+    assert!(coverage.contains("a.txt"), "denied a.txt read must not be counted as opened: {coverage}");
+    assert!(!coverage.contains("b.txt"), "successful outline of b.txt must count as opened: {coverage}");
+    assert!(
+        requests[4]["messages"].to_string().contains("error: denied by permissions"),
+        "{:?}",
+        requests[4]["messages"]
+    );
+}
+
+#[test]
 fn worker_terminal_state_does_not_come_from_its_prose() {
     for (name, worker_replies, label) in [
         ("prefix", vec![say("failed: the parser rejects valid input")], "done"),
