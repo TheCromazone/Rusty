@@ -4254,6 +4254,39 @@ fn side_summaries_are_explicit_private_to_the_child_and_delivered_once() {
 }
 
 #[test]
+fn incomplete_side_summaries_are_not_sent_and_can_be_retried() {
+    let mut truncated = say("INCOMPLETE_SIDE_SUMMARY");
+    truncated["choices"][0]["finish_reason"] = serde_json::json!("length");
+    for (name, rejected) in [
+        ("empty", say("")),
+        ("truncated", truncated),
+        ("tool", tool_reply("write_file", serde_json::json!({"path":"forbidden.txt","content":"no"}))),
+    ] {
+        let s = Sandbox::new(&format!("side-summary-rejected-{name}"));
+        let (url, server) = scripted_endpoint(vec![
+            say("main"),
+            say("finding"),
+            rejected,
+            say("VALID_RETRY_SUMMARY"),
+            say("continued"),
+        ]);
+        let mut cmd = s.cmd();
+        cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off", "--max-requests", "5"]);
+        let shown = s.repl_with(
+            cmd,
+            &["start", "/side new research", "inspect", "/send main", "/send main", "/back", "continue", "/quit"],
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5, "{shown}");
+        assert!(shown.contains("nothing was sent"), "{shown}");
+        let parent = requests[4]["messages"].to_string();
+        assert_eq!(parent.matches("VALID_RETRY_SUMMARY").count(), 1, "{parent}");
+        assert!(!parent.contains("INCOMPLETE_SIDE_SUMMARY"), "{parent}");
+        assert!(!s.project.join("forbidden.txt").exists());
+    }
+}
+
+#[test]
 fn queued_side_summaries_survive_restart_check_file_versions_and_replay_idempotently() {
     use serde_json::json;
     let s = Sandbox::new("side-inbox-recovery");
