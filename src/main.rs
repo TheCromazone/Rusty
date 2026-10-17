@@ -109,9 +109,13 @@ struct Cli {
     #[arg(long)]
     view: Option<String>,
 
-    /// Resume the most recent session in this directory
-    #[arg(short = 'c', long = "continue")]
-    resume: bool,
+    /// Resume a session here: the most recent one, or the one with this id
+    #[arg(short = 'c', long = "continue", value_name = "ID", num_args = 0..=1, default_missing_value = "latest")]
+    resume: Option<String>,
+
+    /// List the sessions saved here, or those matching a search, then exit
+    #[arg(long, value_name = "QUERY", num_args = 0..=1, default_missing_value = "")]
+    sessions: Option<String>,
 
     /// Work on this goal until it's done, then exit
     #[arg(long)]
@@ -193,7 +197,7 @@ fn run() -> Result<i32> {
         return backend::serve_rpc();
     }
     config::load_env();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     if let Some(d) = &cli.dir {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
@@ -211,6 +215,14 @@ fn run() -> Result<i32> {
 
     let mut settings = Settings::load();
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
+    if let Some(query) = &cli.sessions {
+        let project = project_dir(&PathBuf::from(backend.identity(&cwd)));
+        let sessions = project.join("sessions");
+        let found =
+            if query.trim().is_empty() { session::list(&sessions)? } else { session::search(&sessions, query)? };
+        print!("{}", session::render(&found, rusty::unix_now()));
+        return Ok(0);
+    }
     ui::set_theme(&settings.theme);
     ui::set_font(&settings.font);
     display::set_view(&settings.view);
@@ -388,13 +400,28 @@ fn run() -> Result<i32> {
     }
 
     let sessions = pdir.join("sessions");
-    if cli.resume {
-        match session::latest(&sessions) {
-            Some(p) => {
-                agent.load_session(&p)?;
-                println!("{}", ui::dim(&format!("resumed {} messages", agent.history.len())));
+    if let Some(key) = cli.resume.clone() {
+        // Try IDs before treating an optional -c value as prompt text. This
+        // keeps legacy timestamp-hyphen IDs resumable while retaining `-c prompt`.
+        let (entry, key) = if key == "latest" {
+            (session::latest(&sessions)?, key)
+        } else if let Some(entry) = session::find(&sessions, &key)? {
+            (Some(entry), key)
+        } else {
+            let hex = key.bytes().all(|byte| byte.is_ascii_hexdigit());
+            let legacy = key.len() >= 8
+                && key.as_bytes()[0].is_ascii_digit()
+                && key.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
+            if hex || legacy {
+                return Err(anyhow!("no session {key} here; `rusty --sessions` lists them"));
             }
-            None => println!("{}", ui::dim("no previous session here; starting fresh")),
+            cli.prompt.insert(0, key);
+            (session::latest(&sessions)?, "latest".to_string())
+        };
+        match entry {
+            Some(entry) => resume_session(&mut agent, &sessions, &entry)?,
+            None if key == "latest" => println!("{}", ui::dim("no previous session here; starting fresh")),
+            None => return Err(anyhow!("no session {key} here; `rusty --sessions` lists them")),
         }
     }
     if agent.session_path.is_none() {
@@ -425,6 +452,9 @@ fn run() -> Result<i32> {
             }
         };
         agent.save_session()?;
+        if let Some(path) = &agent.session_path {
+            println!("{}", ui::dim(&format!("resume this session with `rusty -c {}`", session::id_of(path))));
+        }
         print_changes(&agent);
         if cli.stats {
             print_stats(&agent, started);
@@ -707,6 +737,27 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 }
             }
             println!("{}", ui::dim("  fresh context. memories kept."));
+        }
+        "/resume" | "/sessions" => {
+            let Some(dir) = agent.session_path.as_ref().and_then(|path| path.parent().map(Path::to_path_buf)) else {
+                return Ok(false);
+            };
+            let now = rusty::unix_now();
+            if rest.is_empty() {
+                let entries = session::list(&dir)?;
+                print!("{}", session::render(&entries, now));
+                println!("{}", ui::dim("  /resume <id> picks one up · /resume <words> searches"));
+            } else if let Some(entry) = session::find(&dir, rest)? {
+                agent.save_session()?;
+                resume_session(agent, &dir, &entry)?;
+            } else {
+                let hits = session::search(&dir, rest)?;
+                if hits.is_empty() {
+                    println!("{}", ui::dim("  no session matches"));
+                } else {
+                    print!("{}", session::render(&hits, now));
+                }
+            }
         }
         "/btw" => agent.ask_aside(rest)?,
         "/model" => {
@@ -1293,6 +1344,16 @@ fn project_dir(cwd: &Path) -> PathBuf {
     let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "root".into());
     let id = format!("{name}-{:08x}", rusty::fnv(&cwd.display().to_string()) as u32);
     config::config_dir().unwrap_or_else(|| PathBuf::from(".rusty")).join("projects").join(id)
+}
+
+fn resume_session(agent: &mut Agent, dir: &Path, entry: &session::Entry) -> Result<()> {
+    let path = session::path(dir, &entry.id);
+    if agent.session_path.as_deref() != Some(path.as_path()) {
+        agent.load_session(&path)?;
+    }
+    let title = if entry.title.is_empty() { String::new() } else { format!(" · {}", entry.title) };
+    println!("{}", ui::dim(&format!("  resumed {}{title} · {} messages", entry.id, agent.history.len())));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -230,10 +230,82 @@ fn banner_and_help_list_every_command() {
         "/triage",
         "/change",
         "/postmortem",
+        "/resume",
     ] {
         assert!(out.contains(cmd), "/help is missing {cmd}");
     }
     assert!(out.contains("link closed"), "no goodbye on EOF");
+}
+
+#[test]
+fn sessions_get_ids_titles_listing_search_and_resume() {
+    let s = Sandbox::new("sessions-browser");
+    let (out, _, _) = scripted_run(&s, &["make the parser faster"], vec![text_reply("done")]);
+    let full_id = out
+        .split("rusty -c ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .map(|id| id.trim_matches('`'))
+        .unwrap_or_default();
+    assert_eq!(full_id.len(), 32, "resume hint should retain the full random ID:\n{out}");
+    let id = &full_id[..8];
+    let list = |args: &[&str]| {
+        let mut command = s.cmd();
+        command.env_remove("RUSTY_API_KEY").env_remove("NVIDIA_API_KEY").env_remove("OPENAI_API_KEY");
+        for n in 2..=9 {
+            command.env_remove(format!("NVIDIA_API_KEY_{n}"));
+        }
+        let out = command.args(args).stdin(Stdio::null()).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let all = list(&["--sessions"]);
+    assert!(all.contains(full_id) && all.contains("make the parser faster") && all.contains("2 msgs"), "{all}");
+    assert!(list(&["--sessions", "parser speed"]).contains(full_id));
+    assert!(!list(&["--sessions", "kubernetes"]).contains(full_id));
+    let (out, _, requests) = scripted_run(&s, &["-c", &id[..4], "and the lexer?"], vec![text_reply("sure")]);
+    assert!(out.contains("resumed") && out.contains(id) && out.contains("make the parser faster"), "{out}");
+    assert!(requests[0]["messages"].to_string().contains("make the parser faster"), "history was not carried over");
+    let (out, _, _) = scripted_run(&s, &["-c", "and now?"], vec![text_reply("ok")]);
+    assert!(out.contains("resumed") && out.contains("4 messages"), "{out}");
+    let missing = s.cmd().args(["-c", "deadbeef", "hi"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no session deadbeef"));
+    let repl = s.repl(&["/resume"]);
+    assert!(repl.contains(id) && repl.contains("picks one up"), "{repl}");
+}
+
+#[test]
+fn browser_backfills_legacy_transcripts_but_never_lists_side_children() {
+    let s = Sandbox::new("sessions-migration");
+    let (out, _, _) = scripted_run(&s, &["make the parser faster"], vec![text_reply("done")]);
+    let project = std::fs::read_dir(s.home.join("projects")).unwrap().next().unwrap().unwrap().path();
+    let sessions = project.join("sessions");
+    let main_session = std::fs::read_dir(&sessions)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "json") && !p.to_string_lossy().ends_with(".trace.jsonl"))
+        .unwrap();
+    let body = std::fs::read(&main_session).unwrap();
+    let legacy = sessions.join("1700000000-abcdef.json");
+    std::fs::write(&legacy, body).unwrap();
+    let side_dir = sessions.join("sides");
+    std::fs::create_dir_all(&side_dir).unwrap();
+    std::fs::write(side_dir.join("side0001.json"), r#"{"side":{"title":"private child","parent_id":"parent"},"history":[{"role":"user","content":"side-only-searchword"}]}"#).unwrap();
+    // Simulate the first browser access during an upgrade: legacy transcripts
+    // must be indexed even though the active run initialized the new catalog.
+    std::fs::remove_file(sessions.join("index.sqlite")).unwrap();
+    let listed = s.cmd().args(["--sessions"]).stdin(Stdio::null()).output().unwrap();
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("1700000000-abcdef") && listed.contains("make the parser faster"), "{listed}");
+    assert!(!listed.contains("side0001") && !listed.contains("private child"), "{listed}");
+    let search = s.cmd().args(["--sessions", "side-only-searchword"]).stdin(Stdio::null()).output().unwrap();
+    assert!(!String::from_utf8_lossy(&search.stdout).contains("side0001"));
+    let resumed = s.cmd().args(["-c", "1700000000-abcdef"]).stdin(Stdio::null()).output().unwrap();
+    assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("resumed 1700000000-abcdef"));
+    assert!(out.contains("rusty -c "));
 }
 
 #[test]
@@ -4823,6 +4895,7 @@ fn side_capabilities_are_enforced_even_for_unadvertised_control_calls() {
     assert!(r[1]["messages"].to_string().contains("a read-only side chat cannot delegate"));
     assert!(!r[1]["messages"][0]["content"].as_str().unwrap().starts_with("You are a research worker"));
 }
+
 #[test]
 fn the_model_can_list_saved_memories_after_an_unmatched_search() {
     let s = Sandbox::new("memory-discovery");

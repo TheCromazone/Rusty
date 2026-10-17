@@ -2751,7 +2751,15 @@ impl Agent {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = json!({"side_receipts":self.side_receipts,"side":self.side_meta,"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
-        crate::session::save(path, body)?;
+        // Side transcripts have their own directory and browsing lifecycle.
+        // Keep them out of the parent project's searchable session catalog.
+        if self.side_meta.is_none() {
+            if let Some(dir) = path.parent() {
+                crate::session::publish_and_record(dir, path, body, &self.history, &self.archived)?;
+            }
+        } else {
+            crate::session::save(path, body)?;
+        }
         let changes = self.infra.change_record();
         if !changes.is_empty() {
             use std::io::Write;
