@@ -122,6 +122,66 @@ fn offline(cmd: &mut Command, endpoint: &str, home: &Path) {
         .env_remove("NO_COLOR");
 }
 
+/// Check the actual cells after soft wraps and an explicit Ctrl-J newline.
+fn inspect_input(text: &str, cols: u16, plain: bool, indexed: bool) -> Result<()> {
+    let mut screen = Screen::new(ROWS as usize, cols as usize);
+    screen.feed(text, |_, _| {});
+    let lines = screen.lines();
+    let first = lines.iter().position(|l| l.contains("USER_PROMPT_START")).context("input start missing")?;
+    let last = lines.iter().rposition(|l| l.contains("USER_PROMPT_END")).context("input end missing")?;
+    if last <= first {
+        bail!("input did not wrap");
+    }
+    let wanted = if plain {
+        Color::Default
+    } else if indexed {
+        Color::Indexed(68)
+    } else {
+        Color::Rgb(64, 124, 208)
+    };
+    for row in first..=last {
+        for col in 0..cols as usize {
+            let cell = screen.cell(row, col);
+            if !cell.ch.is_whitespace()
+                && cell.ch != '\0'
+                && (cell.pen.fg != wanted || cell.pen.bold == plain || cell.pen.dim)
+            {
+                bail!("input colour changed at {row}:{col}: {:?}", cell.pen);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: bool, indexed: bool) -> Result<()> {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &dest.join("home"));
+    cmd.env("COLORTERM", if indexed { "" } else { "truecolor" }).env("RUSTY_CONTEXT_TOKENS", "128000");
+    if plain {
+        cmd.env("NO_COLOR", "1");
+    }
+    let log = File::create(dest.join("input.ansi"))?;
+    let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(20))?;
+    s.wait_for(&[Lit("?2004h")], "input prompt missing")?;
+    s.drain(0.2)?;
+    let wrapped = format!("USER_PROMPT_START {}pong", "wrapped input ".repeat(16));
+    s.send(&wrapped)?;
+    s.send("\x0aUSER_PROMPT_END")?;
+    s.drain(0.3)?;
+    inspect_input(&s.text, cols, plain, indexed)?;
+    std::fs::write(dest.join("input-live.ansi"), &s.text)?;
+    s.send("\r")?;
+    s.wait_for(&[Lit("pong"), Space], "submitted input did not run")?;
+    s.wait_for(&[Lit("?2004h")], "next prompt missing")?;
+    s.drain(0.2)?;
+    inspect_input(&s.text, cols, plain, indexed)?;
+    s.send("/quit\r")?;
+    s.finish()?;
+    println!("PASS: input keeps its colour across wraps, Ctrl-J and submission at {cols} columns (NO_COLOR={plain}, indexed={indexed})");
+    Ok(())
+}
+
 /// One run at `cols` columns: twelve real tool calls, then a streamed reply.
 fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: &str) -> Result<()> {
     let mut cmd = Command::new(binary);
@@ -356,6 +416,7 @@ enum Check {
     Approval,
     Steady,
     Owned,
+    Input,
     Aside,
     Side,
     Summary,
@@ -391,6 +452,19 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
             };
             tools_capture(&binary, &provider.endpoint, cols, &dest, prompt).map_err(fail(format!("{cols} columns")))?;
         }
+    }
+    if checks.contains(&Check::Input) {
+        for cols in WIDTHS {
+            let dest = out.join(format!("input-{cols}"));
+            std::fs::create_dir_all(&dest)?;
+            input_capture(&binary, &provider.endpoint, cols, &dest, false, false)?;
+        }
+        let dest = out.join("input-plain");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, true, false)?;
+        let dest = out.join("input-indexed");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
     }
     if checks.contains(&Check::Approval) {
         let dest = out.join("approval");
@@ -430,6 +504,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "approval" => checks.push(Check::Approval),
             "steady" => checks.push(Check::Steady),
             "owned" => checks.push(Check::Owned),
+            "input" => checks.push(Check::Input),
             "aside" => checks.push(Check::Aside),
             "side" => checks.push(Check::Side),
             "summary" => checks.push(Check::Summary),
@@ -472,7 +547,7 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     } else {
         Check::Steady
     };
-    if !run(&binary, &output, &[width, Check::Approval, Check::CtrlC], false)? {
+    if !run(&binary, &output, &[width, Check::Input, Check::Approval, Check::CtrlC], false)? {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)

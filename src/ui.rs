@@ -138,6 +138,16 @@ fn fg((r, g, b): Rgb, s: &str, bold: bool) -> String {
     }
 }
 
+/// User input has one semantic colour, independent of the rust/error accents.
+/// Reset first so a redraw cannot inherit a footer's dim or warning style.
+pub fn user(s: &str) -> String {
+    if level() == 0 {
+        s.to_string()
+    } else {
+        format!("\x1b[0m{}", fg((64, 124, 208), s, true))
+    }
+}
+
 pub fn primary(s: &str) -> String {
     fg(theme().primary, s, false)
 }
