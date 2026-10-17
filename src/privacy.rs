@@ -357,10 +357,43 @@ fn code_expression(token: &str, sep: &str, rest: &str) -> bool {
     if sep.ends_with(['"', '\'']) {
         return false;
     }
-    let typed_field = sep.trim_end().ends_with(':')
-        && token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && rest.starts_with([',', ';']);
+    // A bare type name in a struct field is token-shaped just like a secret.
+    // Only exempt common Rust type names, and only with the field's comma
+    // terminator; arbitrary capitalized values and semicolon-delimited
+    // credentials still need redaction.
+    let typed_field = sep.trim_end().ends_with(':') && rest.starts_with(',') && is_common_type(token);
     rest.starts_with(['(', '[', '<', ')', '}']) || rest.starts_with("::") || typed_field
+}
+
+fn is_common_type(token: &str) -> bool {
+    matches!(
+        token,
+        "String"
+            | "str"
+            | "bool"
+            | "char"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "Vec"
+            | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "PathBuf"
+            | "Duration"
+    )
 }
 
 fn is_token_char(c: char) -> bool {
@@ -529,6 +562,9 @@ mod tests {
         assert_eq!(redact("Cookie: session_token=abc123; path=/").0, "Cookie: session_token=[redacted]; path=/");
         assert_eq!(redact("password = hunter2,").0, "password = [redacted],");
         assert_eq!(redact("password = hunter2;").0, "password = [redacted];");
+        assert_eq!(redact("password: Hunter2,").0, "password: [redacted],");
+        assert_eq!(redact("password: SecretValue,").0, "password: [redacted],");
+        assert_eq!(redact("password: SecretValue;").0, "password: [redacted];");
     }
 
     #[test]
