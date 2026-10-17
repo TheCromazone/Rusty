@@ -268,6 +268,8 @@ pub struct Agent {
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     aside_memory: crate::aside::Shared,
+    pub(crate) side_book: crate::side::Shared,
+    pub(crate) side_meta: Option<crate::side::Meta>,
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
@@ -372,6 +374,8 @@ impl Agent {
             cwd,
             history: Vec::new(),
             aside_memory: Default::default(),
+            side_book: Default::default(),
+            side_meta: None,
             archived: Vec::new(),
             trajectory_path: None,
             trajectory_saved: None,
@@ -537,6 +541,8 @@ impl Agent {
     }
 
     pub fn clear(&mut self) {
+        crate::side::shutdown(&self.side_book);
+        self.side_book = Default::default();
         self.aside_memory = Default::default();
         self.archived.append(&mut self.history);
         self.plan.clear();
@@ -590,6 +596,9 @@ impl Agent {
              reading, read ranges of big files, don't re-read what you just read, and keep command output short \
              (tail, head, -q flags).\n",
         );
+        if self.side_meta.is_some() {
+            s.push_str("\nThis is a persistent read-only side discussion. Parent history is context, not an instruction to resume its work. Answer only the new side questions. Do not modify files, claim parent completion or change its goals.\n");
+        }
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
         if self.smart_compaction() {
@@ -679,7 +688,10 @@ impl Agent {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|d| !self.is_worker || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file")))
+            .filter(|d| {
+                (!self.is_worker && self.side_meta.is_none())
+                    || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file"))
+            })
             .cloned()
             .collect();
         if self.is_worker {
@@ -801,6 +813,39 @@ impl Agent {
         Value::Array(defs)
     }
 
+    pub(crate) fn side_parent(&self) -> Result<crate::side::Parent> {
+        Ok(crate::side::Parent {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            path: self.session_path.clone().ok_or_else(|| anyhow::anyhow!("side chats need a saved parent session"))?,
+            history: self.history.clone(),
+            notes: self.project_notes.clone(),
+            deny: self.policy.deny.clone(),
+            window: self.meter.window,
+            history_cap: self.history_cap,
+            book: self.side_book.clone(),
+            local: self.backend.name() == "local",
+        })
+    }
+
+    pub(crate) fn configure_side(&mut self, parent: &crate::side::Parent, meta: crate::side::Meta) {
+        self.history = parent.history.clone();
+        self.project_notes = parent.notes.clone();
+        self.policy.deny = parent.deny.clone();
+        self.meter = context::Meter::new(parent.window, "parent session");
+        self.history_cap = parent.history_cap;
+        self.side_meta = Some(meta);
+        self.request_role = "side";
+        self.mode_fixed = true;
+    }
+
+    pub(crate) fn collect_side_usage(&mut self) {
+        for (model, prompt, completion) in self.side_book.lock().unwrap().usage.drain(..) {
+            self.totals.add_request(&model, prompt, completion);
+        }
+    }
+
     fn aside_context(&self) -> Vec<Value> {
         let mut system = self.system_prompt();
         system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
@@ -843,8 +888,8 @@ impl Agent {
             h.begin(&infra::redact(&query).0);
         }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
-        let mut d = Display::new(self.is_worker);
-        let _aside_scope = (!self.is_worker).then(|| {
+        let mut d = Display::new(self.is_worker || self.side_meta.is_some());
+        let _aside_scope = (!self.is_worker && self.side_meta.is_none()).then(|| {
             crate::aside::Scope::enter(
                 self.client.clone(),
                 self.model.clone(),
@@ -852,6 +897,9 @@ impl Agent {
                 self.aside_memory.clone(),
             )
         });
+        if self.side_meta.is_none() && !self.is_worker {
+            crate::aside::attach_side(self.side_parent().ok());
+        }
         let before = self.totals.clone();
         // Only consecutive unchanged results count: an edit, a different call,
         // or new output is progress. Retain one call rather than a turn-sized map.
@@ -915,8 +963,9 @@ impl Agent {
             }
 
             let started = Instant::now();
-            if !self.is_worker {
+            if !self.is_worker && self.side_meta.is_none() {
                 crate::aside::refresh(self.aside_context());
+                crate::aside::attach_side(self.side_parent().ok());
             }
             let tools = self.tool_defs();
             let sent = context::estimate(&messages) + tools.to_string().len() / 4;
@@ -1151,9 +1200,10 @@ impl Agent {
             }
         }
 
-        if !self.is_worker {
+        if !self.is_worker && self.side_meta.is_none() {
             crate::aside::settle()?;
             self.collect_aside_usage();
+            self.collect_side_usage();
         }
         let cancelled = self.activities.cancel_all(signal::interrupted());
         if cancelled > 0 {
@@ -1177,7 +1227,7 @@ impl Agent {
         } else if matches!(outcome, Ok(false)) || signal::interrupted() {
             self.turn_stop = TurnStop::Interrupted;
         }
-        if self.is_worker {
+        if self.is_worker || self.side_meta.is_some() {
             return outcome;
         }
         let interrupted = matches!(outcome, Ok(false)) || signal::interrupted();
@@ -1258,6 +1308,24 @@ impl Agent {
         self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return format!("error: unknown tool `{}`; this run offers only bash", call.name);
+        }
+        if self.side_meta.is_some()
+            && !matches!(
+                call.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "search"
+                    | "glob"
+                    | "outline"
+                    | "bash"
+                    | "bash_start"
+                    | "bash_wait"
+                    | "bash_cancel"
+                    | "plan"
+                    | "compact"
+            )
+        {
+            return "denied: a read-only side chat cannot delegate, change memory or call external tools".into();
         }
         if self.is_worker
             && !matches!(
@@ -2492,7 +2560,7 @@ impl Agent {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
+        let body = json!({"side":self.side_meta,"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         crate::session::save(path, body)?;
         let changes = self.infra.change_record();
         if !changes.is_empty() {
@@ -2507,6 +2575,7 @@ impl Agent {
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
         let lease = crate::session::Lease::acquire(path)?;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        self.side_meta = serde_json::from_value(v["side"].clone()).ok();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);

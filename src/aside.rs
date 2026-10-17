@@ -25,12 +25,13 @@ struct Context {
     snapshot: Vec<Value>,
     memory: Shared,
     pending: Option<Pending>,
+    side: Option<crate::side::Parent>,
 }
 thread_local! { static ACTIVE: RefCell<Option<Context>> = const { RefCell::new(None) }; }
 pub struct Scope;
 impl Scope {
     pub fn enter(client: Arc<Client>, model: String, snapshot: Vec<Value>, memory: Shared) -> Self {
-        ACTIVE.with(|a| *a.borrow_mut() = Some(Context { client, model, snapshot, memory, pending: None }));
+        ACTIVE.with(|a| *a.borrow_mut() = Some(Context { client, model, snapshot, memory, pending: None, side: None }));
         Self
     }
 }
@@ -48,6 +49,13 @@ pub fn refresh(snapshot: Vec<Value>) {
         }
     });
 }
+pub fn attach_side(parent: Option<crate::side::Parent>) {
+    ACTIVE.with(|a| {
+        if let Some(c) = a.borrow_mut().as_mut() {
+            c.side = parent;
+        }
+    });
+}
 pub fn submit(question: &str) {
     ACTIVE.with(|a| {
         if let Some(c) = a.borrow_mut().as_mut() {
@@ -57,6 +65,10 @@ pub fn submit(question: &str) {
 }
 impl Context {
     fn start(&mut self, question: &str) {
+        if self.side.as_ref().is_some_and(|p| crate::side::focused(&p.book)) {
+            display::notice("use /back before asking a main-chat /btw question");
+            return;
+        }
         if self.pending.is_some() {
             display::notice("btw: a side answer is still running; try again when it finishes");
             return;
@@ -85,6 +97,9 @@ impl Context {
         display::notice("btw: answering separately; main work continues");
     }
     fn poll(&mut self) {
+        if let Some(parent) = &self.side {
+            crate::side::poll(parent);
+        }
         if let Some(input) = crate::signal::take_command("/btw") {
             self.start(input.strip_prefix("/btw").unwrap_or("").trim());
         }
