@@ -467,6 +467,23 @@ fn reasoning_item(item: &Value) -> Value {
 mod tests {
     use super::*;
 
+    fn auth_temp_dir() -> PathBuf {
+        use ring::rand::{SecureRandom, SystemRandom};
+
+        for _ in 0..64 {
+            let mut bytes = [0; 16];
+            SystemRandom::new().fill(&mut bytes).unwrap();
+            let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("rusty-codex-{}-{suffix}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create auth fixture directory {}: {error}", dir.display()),
+            }
+        }
+        panic!("could not allocate a unique auth fixture directory")
+    }
+
     fn jwt(claims: Value) -> String {
         let b64 = |b: &[u8]| {
             const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -484,8 +501,7 @@ mod tests {
 
     #[test]
     fn reads_tokens_and_expiry_from_auth_json() {
-        let dir = std::env::temp_dir().join(format!("rusty-codex-{}", crate::ui::rand(1 << 30)));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = auth_temp_dir();
         let path = dir.join("auth.json");
         let fresh = jwt(json!({"exp": rusty::unix_now() + 3600}));
         let id =
@@ -516,8 +532,7 @@ mod tests {
 
     #[test]
     fn saving_keeps_codex_fields_and_updates_tokens() {
-        let dir = std::env::temp_dir().join(format!("rusty-codex-{}", crate::ui::rand(1 << 30)));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = auth_temp_dir();
         let path = dir.join("auth.json");
         std::fs::write(
             &path,
@@ -543,8 +558,7 @@ mod tests {
 
     #[test]
     fn refresh_takes_tokens_another_process_already_refreshed() {
-        let dir = std::env::temp_dir().join(format!("rusty-codex-{}", crate::ui::rand(1 << 30)));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = auth_temp_dir();
         let path = dir.join("auth.json");
         let write = |access: &str, refresh: &str| {
             std::fs::write(
