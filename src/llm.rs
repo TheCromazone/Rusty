@@ -497,6 +497,10 @@ impl Client {
                         last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
                         match status {
                             401 | 403 => refused[idx] += 1,
+                            // A ChatGPT plan's usage limit lasts hours; waiting it out here only stalls.
+                            429 if text.contains("usage_limit_reached") || text.contains("usage_not_included") => {
+                                bail!(last_err)
+                            }
                             429 => {
                                 if let Some(r) = reservation.take() {
                                     r.refund_rate_limited();
@@ -606,8 +610,6 @@ fn r_status(code: u16) -> String {
     reqwest::StatusCode::from_u16(code).map(|s| s.to_string()).unwrap_or_else(|_| code.to_string())
 }
 
-/// OpenAI's own API: reasoning models (gpt-5, o-series) take
-/// `max_completion_tokens` and `reasoning_effort` and reject a temperature.
 /// What the Codex backend is told is calling it. It serves the Codex CLI,
 /// so that is the default; `RUSTY_CODEX_ORIGINATOR` names rusty instead.
 fn codex_originator() -> String {
@@ -617,6 +619,8 @@ fn codex_originator() -> String {
         .unwrap_or_else(|| "codex_cli_rs".into())
 }
 
+/// OpenAI's own API: reasoning models (gpt-5, o-series) take
+/// `max_completion_tokens` and `reasoning_effort` and reject a temperature.
 fn openai_inference(body: &mut Value, model: &str, mode: ExecutionMode) {
     let m = model.to_ascii_lowercase();
     let reasoning = m.starts_with("gpt-5")

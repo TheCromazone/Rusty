@@ -44,9 +44,11 @@ pub fn home() -> Option<PathBuf> {
 /// The model Codex itself is configured to use (`model = "…"` in config.toml).
 pub fn configured_model() -> Option<String> {
     let text = std::fs::read_to_string(home()?.join("config.toml")).ok()?;
-    text.lines().map(str::trim).filter(|l| !l.starts_with('#')).find_map(|l| {
+    // Top-level keys only: a `model` under `[profiles.x]` is not the default.
+    text.lines().map(str::trim).take_while(|l| !l.starts_with('[')).filter(|l| !l.starts_with('#')).find_map(|l| {
         let (k, v) = l.split_once('=')?;
-        (k.trim() == "model").then(|| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+        let v = v.split(" #").next().unwrap_or(v).trim().trim_matches(|c| c == '"' || c == '\'');
+        (k.trim() == "model" && !v.is_empty()).then(|| v.to_string())
     })
 }
 
@@ -112,6 +114,16 @@ impl Auth {
     /// keeps them. A refresh token the auth service no longer accepts means
     /// signing in again; the error says so.
     pub fn refresh(&mut self, http: &reqwest::blocking::Client) -> Result<()> {
+        // Codex (or another rusty) may have refreshed already. Refresh tokens
+        // are single use, so spending ours again would be refused and could
+        // sign both tools out; take the newer tokens instead, as Codex does.
+        if let Some(disk) = Self::load_from(self.path.clone()) {
+            if disk.access_token != self.access_token && !disk.expiring() {
+                *self = disk;
+                return Ok(());
+            }
+            self.refresh_token = disk.refresh_token;
+        }
         let url = std::env::var("RUSTY_CODEX_REFRESH_URL").ok().filter(|u| !u.is_empty());
         let body = json!({"client_id": CLIENT_ID, "grant_type": "refresh_token", "refresh_token": self.refresh_token});
         let resp = http
@@ -162,8 +174,12 @@ impl Auth {
         }
         v["tokens"] = Value::Object(t);
         v["last_refresh"] = json!(rfc3339_now());
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
+        // Private like the file Codex writes, and unique so two processes never share it.
+        let tmp = self.path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::io::Write::write_all(
+            &mut rusty::privacy::private_file(&tmp, false)?,
+            serde_json::to_string_pretty(&v)?.as_bytes(),
+        )?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
@@ -337,8 +353,13 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
         match v["type"].as_str().unwrap_or("") {
             "error" => bail!("API error: {}", v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string())),
             "response.failed" => {
+                // The code (rate_limit_exceeded, server_is_overloaded) is what marks it worth retrying.
                 let e = &v["response"]["error"];
-                bail!("API error: {}", e["message"].as_str().map(String::from).unwrap_or_else(|| e.to_string()))
+                let msg = e["message"].as_str().map(String::from).unwrap_or_else(|| e.to_string());
+                match e["code"].as_str() {
+                    Some(code) => bail!("API error: {code}: {msg}"),
+                    None => bail!("API error: {msg}"),
+                }
             }
             "response.output_text.delta" => {
                 if let Some(s) = v["delta"].as_str().filter(|s| !s.is_empty()) {
@@ -511,7 +532,31 @@ mod tests {
         assert_eq!(v["tokens"]["id_token"], "i0", "an untouched field stays");
         assert_eq!(v["auth_mode"], "chatgpt");
         assert!(v["last_refresh"].as_str().unwrap().ends_with('Z'));
-        assert!(!dir.join("auth.json.tmp").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp file left behind");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "tokens stay private");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn refresh_takes_tokens_another_process_already_refreshed() {
+        let dir = std::env::temp_dir().join(format!("rusty-codex-{}", crate::ui::rand(1 << 30)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let write = |access: &str, refresh: &str| {
+            std::fs::write(
+                &path,
+                json!({"tokens": {"access_token": access, "refresh_token": refresh, "account_id": "a"}}).to_string(),
+            )
+            .unwrap()
+        };
+        write(&jwt(json!({"exp": rusty::unix_now() + 60})), "r0");
+        let mut auth = Auth::load_from(path.clone()).unwrap();
+        let newer = jwt(json!({"exp": rusty::unix_now() + 3600}));
+        write(&newer, "r1");
+        // No refresh server is reachable here: the newer tokens on disk are used without one.
+        auth.refresh(&reqwest::blocking::Client::new()).unwrap();
+        assert_eq!((auth.access_token(), auth.refresh_token.as_str()), (newer.as_str(), "r1"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -603,7 +648,7 @@ mod tests {
             json!({"type": "response.failed", "response": {"error": {"code": "rate_limit_exceeded", "message": "slow down"}}}),
         ]);
         let err = parse_stream(resp, &mut |_| true).unwrap_err().to_string();
-        assert!(err.contains("slow down"), "{err}");
+        assert!(err.contains("slow down") && err.contains("rate_limit_exceeded"), "{err}");
 
         let resp = stream(&[
             json!({"type": "response.output_text.delta", "delta": "partial"}),
