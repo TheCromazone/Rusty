@@ -330,7 +330,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
         };
-        if (wanted && secret_value(token)) || secret_shape(token) {
+        if (wanted && secret_value(token) && !code_expression(sep, rest)) || secret_shape(token) {
             let padded = rest.trim_start_matches('='); // base64 padding
             let value = &line[line.len() - rest.len() - token.len()..line.len() - padded.len()];
             out.push_str(&mark(value));
@@ -348,6 +348,17 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
         };
     }
     (out, count)
+}
+
+/// `token = self.token.clone()`, `access_token: String,`: an unquoted value
+/// that continues as source code is an expression, not a secret. A bare
+/// `key=value;` or `key=value,` (connection strings, cookies) still counts.
+fn code_expression(sep: &str, rest: &str) -> bool {
+    if sep.ends_with(['"', '\'']) {
+        return false;
+    }
+    let spaced = sep.contains(char::is_whitespace);
+    rest.starts_with(['(', '[', '<', ')', '}']) || rest.starts_with("::") || (spaced && rest.starts_with([',', ';']))
 }
 
 fn is_token_char(c: char) -> bool {
@@ -494,6 +505,26 @@ mod tests {
         assert!(out.starts_with("password: ${RUSTY_SECRET_"), "{out}");
         let later = format!("t{short} and {short}");
         assert_eq!(redact_with_handles(&later).0, later);
+    }
+
+    #[test]
+    fn code_expressions_after_a_secret_key_are_not_secrets() {
+        for line in [
+            "access_token: String,",
+            "let token = std::env::var(\"X\").ok();",
+            "let token = self.token.clone();",
+            "self.access_token = access.to_string();",
+            "let access_token = t[\"access_token\"].as_str();",
+            "fn save(&self, id_token: Option<&str>)",
+        ] {
+            assert_eq!(redact(line), (line.to_string(), 0));
+        }
+        assert_eq!(redact("\"token\": \"abc123\",").0, "\"token\": \"[redacted]\",");
+        assert_eq!(redact("TOKEN=abc123").0, "TOKEN=[redacted]");
+        assert_eq!(redact("token: abc123").0, "token: [redacted]");
+        assert_eq!(redact("--password hunter2").0, "--password [redacted]");
+        assert_eq!(redact("Server=db;Password=hunter2;Port=1").0, "Server=db;Password=[redacted];Port=1");
+        assert_eq!(redact("Cookie: session_token=abc123; path=/").0, "Cookie: session_token=[redacted]; path=/");
     }
 
     #[test]
