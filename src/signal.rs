@@ -6,8 +6,34 @@ use std::sync::OnceLock;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+thread_local! { static RUN_CANCEL: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> = const {std::cell::RefCell::new(None)}; }
+static FOCUSED_CANCEL: std::sync::Mutex<Option<std::sync::Weak<AtomicBool>>> = std::sync::Mutex::new(None);
+pub fn focus_cancel(token: Option<std::sync::Arc<AtomicBool>>) {
+    *FOCUSED_CANCEL.lock().unwrap() = token.as_ref().map(std::sync::Arc::downgrade);
+}
+fn cancel_focused() -> bool {
+    let token = FOCUSED_CANCEL.lock().ok().and_then(|v| v.as_ref().and_then(std::sync::Weak::upgrade));
+    if let Some(token) = token {
+        !token.swap(true, Ordering::SeqCst)
+    } else {
+        false
+    }
+}
+pub struct CancelScope(Option<std::sync::Arc<AtomicBool>>);
+pub fn cancel_scope(token: std::sync::Arc<AtomicBool>) -> CancelScope {
+    CancelScope(RUN_CANCEL.with(|c| c.replace(Some(token))))
+}
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        RUN_CANCEL.with(|c| c.replace(self.0.take()));
+    }
+}
+
 pub fn install() {
     let _ = ctrlc::set_handler(|| {
+        if cancel_focused() {
+            return;
+        }
         if INTERRUPTED.swap(true, Ordering::SeqCst) {
             eprintln!("\nbye");
             std::process::exit(130);
@@ -16,7 +42,9 @@ pub fn install() {
 }
 
 pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    RUN_CANCEL
+        .with(|c| c.borrow().as_ref().map(|v| v.load(Ordering::SeqCst)))
+        .unwrap_or_else(|| INTERRUPTED.load(Ordering::SeqCst))
 }
 
 pub fn reset() {
@@ -43,6 +71,11 @@ static QUEUED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// terminal ever hands it over as a raw byte this catches it too. Anything
 /// else typed during a turn is queued and becomes the next message.
 pub fn poll_keys() {
+    read_keys();
+    crate::aside::poll();
+}
+
+fn read_keys() {
     unsafe {
         if libc::isatty(0) != 1 {
             return;
@@ -58,6 +91,9 @@ pub fn poll_keys() {
         }
         let bytes = &buf[..n as usize];
         if bytes.contains(&3) {
+            if cancel_focused() {
+                return;
+            }
             if INTERRUPTED.swap(true, Ordering::SeqCst) {
                 eprintln!("\nbye");
                 std::process::exit(130);
@@ -73,9 +109,39 @@ pub fn poll_keys() {
 /// A message typed while the last turn was running, if any.
 pub fn take_queued() -> Option<String> {
     let mut q = QUEUED.lock().ok()?;
-    let text = std::mem::take(&mut *q);
-    let text = text.trim().to_string();
-    (!text.is_empty()).then_some(text)
+    pop_queued(&mut q)
+}
+
+/// Remove one runtime command while preserving all other type-ahead input.
+pub fn take_command(command: &str) -> Option<String> {
+    let mut q = QUEUED.lock().ok()?;
+    let mut offset = 0;
+    for line in q.split_inclusive('\n') {
+        let text = line.trim();
+        if text == command || text.strip_prefix(command).is_some_and(|rest| rest.starts_with(char::is_whitespace)) {
+            let result = text.to_string();
+            let end = offset + line.len();
+            q.drain(offset..end);
+            return Some(result);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+pub fn peek_queued() -> Option<String> {
+    QUEUED.lock().ok()?.lines().find(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
+}
+
+fn pop_queued(q: &mut String) -> Option<String> {
+    while !q.is_empty() {
+        let n = q.find('\n').map(|i| i + 1).unwrap_or(q.len());
+        let text = q.drain(..n).collect::<String>().trim().to_string();
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// The terminal mode at startup (cooked, with Ctrl-C generating SIGINT).
@@ -130,5 +196,17 @@ pub fn approval_line(prompt: &str) -> std::io::Result<String> {
             }
             return Ok(line);
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    #[test]
+    fn queued_commands_keep_their_message_boundaries() {
+        let mut q = "\n/context\n/permissions read-only\nnext question\n".to_string();
+        for want in ["/context", "/permissions read-only", "next question"] {
+            assert_eq!(super::pop_queued(&mut q).as_deref(), Some(want));
+        }
+        assert!(super::pop_queued(&mut q).is_none());
     }
 }

@@ -130,8 +130,52 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
     offline(&mut cmd, endpoint, &dest.join("home"));
     let log = File::create(dest.join(format!("terminal-{cols}.ansi")))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
+    if matches!(prompt, "aside-capture" | "side-capture" | "summary-capture") {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !dest.join("main-started.txt").exists() && Instant::now() < end {
+            s.pump(Duration::from_millis(20))?;
+        }
+        if !dest.join("main-started.txt").exists() {
+            bail!("main command did not start");
+        }
+        if prompt == "side-capture" || prompt == "summary-capture" {
+            std::fs::write(dest.join("side-fact.txt"), "SIDE_FACT")?;
+            s.send("/side new terminal\r")?;
+            s.wait_for(&[Lit("read-only, live workspace")], "no persistent side selected")?;
+            s.send("side-sentinel\r")?;
+            s.wait_for(&[Lit("SIDE_ANSWER")], "no persistent side answer")?;
+            if prompt == "summary-capture" {
+                s.send("/send main\r")?;
+                s.wait_for(&[Lit("summary queued for main")], "summary was not queued while main ran")?;
+                s.send("/send main\r")?;
+                s.wait_for(&[Lit("already sent")], "summary revision was not deduplicated")?;
+            } else {
+                s.send("side-slow\rside-followup\r")?;
+                s.wait_for(&[Lit("SIDE_SLOW_ANSWER")], "slow side response missing")?;
+                s.wait_for(&[Lit("SIDE_FOLLOWUP_ANSWER")], "busy side dropped its queued follow-up")?;
+                s.send("side-cancel\r")?;
+                s.wait_for(&[Lit("side question running")], "second side did not start")?;
+                s.send("\x03")?;
+                s.wait_for(&[Lit("side turn interrupted")], "Ctrl-C did not stop only the selected side")?;
+            }
+            s.send("/back\r")?;
+            s.wait_for(&[Lit("main chat selected")], "could not return to main")?;
+        } else {
+            s.send("/btw aside-sentinel\r")?;
+            s.wait_for(&[Lit("ASIDE_ANSWER")], "no side answer during the command")?;
+        }
+        if dest.join("main-finished.txt").exists() {
+            bail!("side question waited for the main command to finish");
+        }
+    }
     s.wait_for(&[Lit("CAPTURE_COMPLETE")], "capture timed out")?;
     s.finish()?;
+    if prompt == "summary-capture" {
+        let trace = std::fs::read_to_string(dest.join(format!("trajectory-{cols}.json")))?;
+        if trace.matches("PTY_SIDE_SUMMARY").count() != 1 {
+            bail!("main did not receive the side summary exactly once");
+        }
+    }
     if prompt == "owned-capture" && std::fs::read_to_string(dest.join("owned-result.txt"))? != "ready" {
         bail!("owned command result missing");
     }
@@ -240,7 +284,61 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     ready(&mut s)?;
     s.send("\x03")?;
     s.finish().context("a second ctrl-c did not quit")?;
+    if let Some((endpoint, home)) = endpoint {
+        side_ctrl_c(binary, cwd, endpoint, home)?;
+    }
     Ok(Interrupt::Stopped(ms))
+}
+
+/// Checks focused side cancellation and prompt-level Ctrl-C on a controlling
+/// PTY. A side task consumes the first Ctrl-C; the parent must remain usable,
+/// and the usual prompt double-Ctrl-C quit must still work afterwards.
+fn side_ctrl_c(binary: &Path, cwd: &Path, endpoint: &str, home: &Path) -> Result<()> {
+    let command = |name: &str| {
+        let mut cmd = Command::new(binary);
+        cmd.current_dir(cwd).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+        offline(&mut cmd, endpoint, &home.join(name));
+        cmd
+    };
+    let prompt = &[Lit("?2004h")];
+
+    let mut idle = Session::spawn(command("side-idle-home"), 80, Box::new(std::io::sink()), Duration::from_secs(4))?;
+    idle.wait_for(prompt, "idle-side check had no prompt")?;
+    idle.send("/side new idle\r")?;
+    idle.wait_for(&[Lit("read-only, live workspace")], "idle-side check could not select a side")?;
+    idle.wait_for(prompt, "idle side prompt did not return")?;
+    idle.send("\x03")?;
+    idle.wait_for(
+        &[Lit("again to quit")],
+        "Ctrl-C with an idle selected side did not reach the normal prompt handler",
+    )?;
+    idle.wait_for(prompt, "idle side prompt did not recover after the first Ctrl-C")?;
+    idle.drain(0.2)?;
+    idle.send("\x03")?;
+    idle.finish().context("double Ctrl-C with an idle selected side did not quit")?;
+
+    let mut busy = Session::spawn(command("side-busy-home"), 80, Box::new(std::io::sink()), Duration::from_secs(12))?;
+    busy.wait_for(prompt, "busy-side check had no prompt")?;
+    busy.send("/side new busy\r")?;
+    busy.wait_for(&[Lit("read-only, live workspace")], "busy-side check could not select a side")?;
+    busy.wait_for(prompt, "busy side prompt did not return")?;
+    busy.send("side-cancel\r")?;
+    busy.wait_for(&[Lit("side question running")], "busy side task did not start")?;
+    busy.send("\x03")?;
+    busy.wait_for(&[Lit("side turn interrupted")], "first Ctrl-C did not cancel the selected child")?;
+    busy.send("/back\r")?;
+    busy.wait_for(&[Lit("main chat selected")], "parent did not survive child cancellation")?;
+    busy.wait_for(prompt, "parent prompt did not return after child cancellation")?;
+    busy.send("reply with just the word pong\r")?;
+    busy.wait_for(&[Lit("pong")], "parent could not run a turn after cancelling its child")?;
+    busy.wait_for(prompt, "parent prompt did not return after its turn")?;
+    busy.send("\x03")?;
+    busy.wait_for(&[Lit("again to quit")], "first prompt Ctrl-C after child cancellation did not offer to quit")?;
+    busy.wait_for(prompt, "parent prompt did not recover after the first prompt Ctrl-C")?;
+    busy.drain(0.2)?;
+    busy.send("\x03")?;
+    busy.finish().context("double Ctrl-C after child cancellation did not quit")?;
+    Ok(())
 }
 
 /// The line the expect script printed for an outcome.
@@ -258,6 +356,9 @@ enum Check {
     Approval,
     Steady,
     Owned,
+    Aside,
+    Side,
+    Summary,
 }
 
 /// Runs the checks into `out`, keeping every capture there. False when the
@@ -268,11 +369,26 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
     let out = std::fs::canonicalize(out)?;
     let provider = Provider::start()?;
     let fail = |what: String| move |e: anyhow::Error| e.context(format!("FAIL: {what}"));
-    if checks.contains(&Check::Steady) || checks.contains(&Check::Owned) {
+    if checks.contains(&Check::Steady)
+        || checks.contains(&Check::Owned)
+        || checks.contains(&Check::Aside)
+        || checks.contains(&Check::Side)
+        || checks.contains(&Check::Summary)
+    {
         for cols in WIDTHS {
             let dest = out.join(format!("width-{cols}"));
             std::fs::create_dir_all(&dest)?;
-            let prompt = if checks.contains(&Check::Owned) { "owned-capture" } else { "capture" };
+            let prompt = if checks.contains(&Check::Summary) {
+                "summary-capture"
+            } else if checks.contains(&Check::Side) {
+                "side-capture"
+            } else if checks.contains(&Check::Aside) {
+                "aside-capture"
+            } else if checks.contains(&Check::Owned) {
+                "owned-capture"
+            } else {
+                "capture"
+            };
             tools_capture(&binary, &provider.endpoint, cols, &dest, prompt).map_err(fail(format!("{cols} columns")))?;
         }
     }
@@ -314,6 +430,9 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "approval" => checks.push(Check::Approval),
             "steady" => checks.push(Check::Steady),
             "owned" => checks.push(Check::Owned),
+            "aside" => checks.push(Check::Aside),
+            "side" => checks.push(Check::Side),
+            "summary" => checks.push(Check::Summary),
             other => bail!("unknown tty check {other:?}; expected ctrl-c, approval or steady"),
         }
     }
@@ -342,7 +461,17 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     let (Some(binary), Some(output)) = (flag(args, "--binary"), flag(args, "--output")) else {
         bail!("usage: cargo xtask tty-capture --binary PATH --output DIR");
     };
-    let width = if args.iter().any(|a| a == "--owned") { Check::Owned } else { Check::Steady };
+    let width = if args.iter().any(|a| a == "--summary") {
+        Check::Summary
+    } else if args.iter().any(|a| a == "--side") {
+        Check::Side
+    } else if args.iter().any(|a| a == "--aside") {
+        Check::Aside
+    } else if args.iter().any(|a| a == "--owned") {
+        Check::Owned
+    } else {
+        Check::Steady
+    };
     if !run(&binary, &output, &[width, Check::Approval, Check::CtrlC], false)? {
         bail!("the ctrl-c capture was inconclusive");
     }

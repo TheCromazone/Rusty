@@ -491,3 +491,44 @@ against a local stand-in provider. The inspection replays each capture on a
 small terminal screen model and checks every panel frame for complete borders,
 an unused wrap column, colour, a footer that stays on the bottom row, and a
 clean exit. `cargo xtask tty` runs the same checks as a quick pass/fail.
+
+### A question on the side
+
+`/btw <question>` answers from the current conversation with no tools. It can
+run while a model response or shell command is in progress. The main task
+continues; the aside is shown separately and never enters its transcript,
+plan, goal, verification or learned memory. Recent aside exchanges provide
+context for follow-up `/btw` questions. `/btw` alone shows the last answer.
+Asides use the same model client and root budget, and their usage is included
+in the session totals. They are temporary and disappear when the process exits.
+
+### Persistent read-only discussions
+
+`/side new <name>` starts a saved child conversation from the main context.
+Ask it follow-up questions and let it inspect local files with read-only tools.
+`/back` selects the main chat; `/side open <name or id>` returns to the child,
+and `/side list` shows saved children. A side has its own history and no parent
+goal or verification authority. Its findings stay out of the main conversation.
+
+Side commands also work while the main turn is running. Questions entered
+while a side is selected go to that side; `/back` changes focus without stopping
+its work. Ctrl-C targets a running selected side; quitting cancels and saves
+outstanding side turns. Settings commands require returning to main first.
+The shared checkout is live, not frozen, and side tools are classifier-enforced
+read-only, not an OS sandbox. Side tools are local-only for now, with no MCP
+servers or nested delegation. All model calls share the parent's root budget.
+
+### Returning findings to main
+
+From a selected side, `/send main` prepares a bounded summary of that side's
+own discussion and queues it for its recorded parent. It uses no tools and
+shares the root budget. The parent receives the note between tool steps, or
+on the next idle input cycle, with source/revision labels and warnings when
+observed files changed. The note is generated advice, not a user instruction,
+permission grant or passing verification receipt. An idle parent does not start
+a new coding turn automatically; use `/back` and continue when ready.
+
+The inbox survives restart. Delivery receipts are saved with the parent before
+queued notes are removed, so replay does not duplicate a summary. Repeating
+`/send main` without further side discussion does not spend another model call.
+Sending findings does not apply a patch, merge a branch or close the main goal.
