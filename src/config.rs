@@ -18,16 +18,30 @@ pub enum Provider {
     Compatible,
     OpenAi,
     Anthropic,
+    /// The Codex backend, signed in with the ChatGPT account from `codex login`.
+    Codex,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Compatible, Provider::Anthropic, Provider::OpenAi];
+    pub const ALL: [Provider; 4] = [Provider::Compatible, Provider::Anthropic, Provider::OpenAi, Provider::Codex];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Compatible => "compatible",
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// What to do to set this provider up, for error messages and the doctor.
+    pub fn setup_hint(self) -> String {
+        match self {
+            Self::Codex => "run `codex login`".into(),
+            p => {
+                let vars = p.key_vars();
+                format!("add {}", vars.iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or(&vars[0]))
+            }
         }
     }
 
@@ -35,7 +49,8 @@ impl Provider {
     /// and bare `gpt-*` / `o1`-style ids are OpenAI's; anything with a slash
     /// (`openai/gpt-oss-20b` on NVIDIA, `anthropic/claude-…` on a router) or
     /// any other name goes to the compatible endpoint. `RUSTY_PROVIDER`
-    /// overrides the guess.
+    /// overrides the guess. An OpenAI model goes to the Codex sign-in instead
+    /// when there is no OpenAI key (see `Client::endpoint_for`).
     pub fn for_model(model: &str) -> Provider {
         if let Some(p) = env_nonempty("RUSTY_PROVIDER").and_then(|v| Provider::parse(&v)) {
             return p;
@@ -59,6 +74,7 @@ impl Provider {
             "compatible" | "nvidia" | "openai-compatible" => Some(Self::Compatible),
             "openai" => Some(Self::OpenAi),
             "anthropic" | "claude" => Some(Self::Anthropic),
+            "codex" | "chatgpt" => Some(Self::Codex),
             _ => None,
         }
     }
@@ -69,6 +85,8 @@ impl Provider {
             Self::Compatible => (&["RUSTY_API_KEY", "NVIDIA_API_KEY"], "NVIDIA_API_KEY"),
             Self::OpenAi => (&["OPENAI_API_KEY"], "OPENAI_API_KEY"),
             Self::Anthropic => (&["ANTHROPIC_API_KEY"], "ANTHROPIC_API_KEY"),
+            // Signed in, not keyed: the tokens live in ~/.codex/auth.json.
+            Self::Codex => return Vec::new(),
         };
         let mut names: Vec<String> = first.iter().map(|s| s.to_string()).collect();
         names.extend((2..=9).map(|i| format!("{base}_{i}")));
@@ -93,32 +111,39 @@ impl Provider {
             Self::Compatible => return base_url(),
             Self::OpenAi => env_nonempty("OPENAI_BASE_URL").unwrap_or_else(|| OPENAI_BASE_URL.to_string()),
             Self::Anthropic => env_nonempty("ANTHROPIC_BASE_URL").unwrap_or_else(|| ANTHROPIC_BASE_URL.to_string()),
+            Self::Codex => env_nonempty("RUSTY_CODEX_BASE_URL").unwrap_or_else(|| crate::codex::BASE_URL.to_string()),
         };
         url.trim_end_matches('/').to_string()
     }
 
-    pub fn default_model(self) -> &'static str {
+    pub fn default_model(self) -> String {
         match self {
-            Self::Compatible => DEFAULT_MODEL,
-            Self::OpenAi => OPENAI_MODEL,
-            Self::Anthropic => ANTHROPIC_MODEL,
+            Self::Compatible => DEFAULT_MODEL.into(),
+            Self::OpenAi => OPENAI_MODEL.into(),
+            Self::Anthropic => ANTHROPIC_MODEL.into(),
+            // Whatever Codex itself is set to use, so both tools agree.
+            Self::Codex => crate::codex::configured_model().unwrap_or_else(|| crate::codex::DEFAULT_MODEL.into()),
+        }
+    }
+
+    /// Whether this provider can be used from here: a key in the
+    /// environment, or for Codex a saved sign-in.
+    pub fn configured(self) -> bool {
+        match self {
+            Self::Codex => crate::codex::Auth::load().is_some(),
+            p => !p.keys().is_empty(),
         }
     }
 }
 
 /// The model to use when none was chosen: the default of the first provider
-/// with a key, in the order compatible (NVIDIA), Anthropic, OpenAI, so an
-/// existing NVIDIA setup behaves exactly as before.
+/// that is set up, in the order compatible (NVIDIA), Anthropic, OpenAI, then
+/// the Codex sign-in, so an existing NVIDIA setup behaves exactly as before.
 pub fn default_model() -> String {
     if let Some(p) = env_nonempty("RUSTY_PROVIDER").and_then(|v| Provider::parse(&v)) {
-        return p.default_model().to_string();
+        return p.default_model();
     }
-    [Provider::Compatible, Provider::Anthropic, Provider::OpenAi]
-        .into_iter()
-        .find(|p| !p.keys().is_empty())
-        .unwrap_or(Provider::Compatible)
-        .default_model()
-        .to_string()
+    Provider::ALL.into_iter().find(|p| p.configured()).unwrap_or(Provider::Compatible).default_model()
 }
 
 /// Loads `.env` files without overriding variables already set in the shell.
@@ -308,6 +333,10 @@ mod tests {
         assert_eq!(Provider::parse("Claude"), Some(Provider::Anthropic));
         assert_eq!(Provider::parse("nvidia"), Some(Provider::Compatible));
         assert_eq!(Provider::parse("openai"), Some(Provider::OpenAi));
+        assert_eq!(Provider::parse("chatgpt"), Some(Provider::Codex));
+        assert!(Provider::Codex.key_vars().is_empty());
+        assert_eq!(Provider::Codex.setup_hint(), "run `codex login`");
+        assert_eq!(Provider::OpenAi.setup_hint(), "add OPENAI_API_KEY");
         assert_eq!(Provider::parse("bedrock"), None);
         assert_eq!(Provider::OpenAi.key_vars()[1], "OPENAI_API_KEY_2");
     }

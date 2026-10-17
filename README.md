@@ -125,7 +125,7 @@ classifier at work: `rm -rf` asks first while `cargo test` just runs.
 
 ```bash
 git clone https://github.com/jadenfix/rusty && cd rusty
-cp .env.example .env        # add NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY
+cp .env.example .env        # add NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY (or skip it after `codex login`)
 cargo install --path .
 ```
 
@@ -351,12 +351,26 @@ Anything your endpoint serves, chosen with `--model`, `RUSTY_MODEL` or `/model`.
 | `claude-sonnet-5-5`, `claude-haiku-4-5` | faster and cheaper; Haiku makes a quick swarm worker |
 | `gpt-5` | the default when `OPENAI_API_KEY` is the only key; reasoning effort follows the execution mode |
 
+| Codex sign-in | |
+|---|---|
+| the model from `~/.codex/config.toml` | the default when `codex login` is the only setup; `gpt-*` ids go here when there is no `OPENAI_API_KEY` |
+
 rusty picks the provider from the model id, per request, so one session can
 mix them: `/model claude-opus-5-5` for the lead and
 `/agents model openai/gpt-oss-20b` for the workers. Bare `claude-*` ids go to
 Anthropic's Messages API, bare `gpt-*` and `o4`-style ids to OpenAI, and
 anything else (including `openai/...` ids on NVIDIA) to the compatible
-endpoint. `RUSTY_PROVIDER=anthropic|openai|compatible` overrides the guess.
+endpoint. `RUSTY_PROVIDER=anthropic|openai|compatible|codex` overrides the guess.
+
+**Signed in to Codex?** rusty can use that ChatGPT account instead of a key.
+It reads the tokens `codex login` saved in `~/.codex/auth.json` (`CODEX_HOME`
+to point elsewhere), talks to the Codex backend's Responses API, refreshes the
+access token the way Codex does and writes the refreshed tokens back, so both
+tools stay signed in. A `gpt-*` model goes there whenever `OPENAI_API_KEY` is
+not set, and `/doctor` shows the sign-in as the account's email. Encrypted
+reasoning items go back to the API between turns, like Claude's thinking
+blocks. The backend publishes no model list, so `/models` shows only the
+model Codex itself is set to; `/model` takes any id the backend serves.
 
 On Claude, thinking blocks go back to the API unchanged between turns, and
 since compaction rewrites history, rusty asks the API to drop a thinking

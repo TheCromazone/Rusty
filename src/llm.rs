@@ -1,6 +1,7 @@
 //! Chat client with SSE streaming, tool calls and key rotation, for
-//! OpenAI-compatible endpoints (NVIDIA, OpenAI, local servers) and Anthropic's
-//! Messages API. Each request goes to the provider its model belongs to.
+//! OpenAI-compatible endpoints (NVIDIA, OpenAI, local servers), Anthropic's
+//! Messages API and the Codex backend behind a ChatGPT sign-in. Each request
+//! goes to the provider its model belongs to.
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
@@ -8,10 +9,11 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::anthropic;
+use crate::codex;
 use crate::config::Provider;
 use crate::execution::ExecutionMode;
 use crate::ui::truncate;
@@ -85,9 +87,11 @@ pub struct Reply {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
-    /// Anthropic's content blocks for this turn, kept so thinking goes back
-    /// to the API unchanged. None for other providers.
+    /// Provider-private blocks for this turn (Anthropic's content blocks,
+    /// Codex's reasoning items), kept on the assistant message under
+    /// `raw_key` so they go back to the API unchanged. None otherwise.
     pub raw: Option<Value>,
+    pub raw_key: &'static str,
     /// The output stopped because the context window was full (Anthropic's
     /// `model_context_window_exceeded`); `finish_reason` still says "length".
     pub window_full: bool,
@@ -99,11 +103,36 @@ pub struct Endpoint {
     pub base_url: String,
     keys: Vec<String>,
     key_idx: AtomicUsize,
+    /// The ChatGPT sign-in, for the Codex provider; refreshed in place.
+    codex: Option<Mutex<codex::Auth>>,
 }
 
 impl Endpoint {
     pub fn new(provider: Provider, base_url: String, keys: Vec<String>) -> Self {
-        Self { provider, base_url: base_url.trim_end_matches('/').to_string(), keys, key_idx: AtomicUsize::new(0) }
+        Self {
+            provider,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            keys,
+            key_idx: AtomicUsize::new(0),
+            codex: None,
+        }
+    }
+
+    /// The Codex backend with a saved sign-in instead of keys.
+    pub fn codex(base_url: String, auth: codex::Auth) -> Self {
+        let mut ep = Self::new(Provider::Codex, base_url, Vec::new());
+        ep.codex = Some(Mutex::new(auth));
+        ep
+    }
+
+    /// Whether requests can be authenticated: a key, or a sign-in.
+    pub fn usable(&self) -> bool {
+        !self.keys.is_empty() || self.codex.is_some()
+    }
+
+    /// The signed-in account's email, for the doctor (Codex only).
+    pub fn account(&self) -> Option<String> {
+        self.codex.as_ref()?.lock().ok()?.email.clone()
     }
 }
 
@@ -123,17 +152,21 @@ impl Client {
     pub fn from_env() -> Result<Self> {
         let endpoints = Provider::ALL
             .into_iter()
-            .map(|p| Endpoint::new(p, p.base_url(), p.keys()))
-            .filter(|e| !e.keys.is_empty())
+            .filter_map(|p| match p {
+                Provider::Codex => codex::Auth::load().map(|auth| Endpoint::codex(p.base_url(), auth)),
+                p => Some(Endpoint::new(p, p.base_url(), p.keys())),
+            })
+            .filter(Endpoint::usable)
             .collect();
         Self::new(endpoints)
     }
 
     pub fn new(endpoints: Vec<Endpoint>) -> Result<Self> {
-        if endpoints.iter().all(|e| e.keys.is_empty()) {
+        if !endpoints.iter().any(Endpoint::usable) {
             bail!(
                 "no API key found. Set NVIDIA_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY in your shell, \
-                 in ~/.config/rusty/.env, or in the .env next to rusty's Cargo.toml"
+                 in ~/.config/rusty/.env, or in the .env next to rusty's Cargo.toml; or sign in with `codex login` \
+                 to use your ChatGPT account"
             );
         }
         let http = reqwest::blocking::Client::builder()
@@ -154,20 +187,27 @@ impl Client {
     }
 
     pub fn key_count(&self) -> usize {
-        self.endpoints.iter().map(|e| e.keys.len()).sum()
+        self.endpoints.iter().map(|e| e.keys.len().max(usize::from(e.codex.is_some()))).sum()
     }
 
     pub fn endpoints(&self) -> &[Endpoint] {
         &self.endpoints
     }
 
-    /// The endpoint that serves `model`. A model whose provider has no key
-    /// goes to a custom compatible endpoint (`RUSTY_BASE_URL`, say a local
-    /// router) when there is one, since that is where it was meant to go.
+    /// The endpoint that serves `model`. An OpenAI model with no OpenAI key
+    /// goes to the Codex sign-in when there is one. A model whose provider
+    /// has no key goes to a custom compatible endpoint (`RUSTY_BASE_URL`,
+    /// say a local router) when there is one, since that is where it was
+    /// meant to go.
     pub fn endpoint_for(&self, model: &str) -> Result<&Endpoint> {
         let want = Provider::for_model(model);
         if let Some(e) = self.endpoints.iter().find(|e| e.provider == want) {
             return Ok(e);
+        }
+        if want == Provider::OpenAi {
+            if let Some(e) = self.endpoints.iter().find(|e| e.provider == Provider::Codex) {
+                return Ok(e);
+            }
         }
         if let Some(e) = self
             .endpoints
@@ -175,6 +215,9 @@ impl Client {
             .find(|e| e.provider == Provider::Compatible && e.base_url != crate::config::DEFAULT_BASE_URL)
         {
             return Ok(e);
+        }
+        if want == Provider::Codex {
+            bail!("`{model}` needs the Codex sign-in, but none was found. Run `codex login`, or pick another model with /model")
         }
         let vars = want.key_vars();
         bail!(
@@ -234,6 +277,17 @@ impl Client {
             return self.stream_with_retry(on, |on| {
                 let sent = self.send(ep, &url, Some(&body), beta.as_deref(), role)?;
                 let result = anthropic::parse_stream(sent.response, on);
+                settle(sent.reservation, &result);
+                result
+            });
+        }
+        if ep.provider == Provider::Codex {
+            let mut body = codex::request(model, messages, tools, execution_mode);
+            clamp_output(&mut body, output_cap);
+            let url = format!("{}/codex/responses", ep.base_url);
+            return self.stream_with_retry(on, |on| {
+                let sent = self.send(ep, &url, Some(&body), None, role)?;
+                let result = codex::parse_stream(sent.response, on);
                 settle(sent.reservation, &result);
                 result
             });
@@ -324,6 +378,10 @@ impl Client {
     /// One provider's model ids. The doctor asks with `Retry::Once`, so a bad
     /// key answers in a second instead of after the whole retry budget.
     pub fn models_of(&self, ep: &Endpoint, retry: Retry) -> Result<Vec<String>> {
+        if ep.provider == Provider::Codex {
+            // The backend publishes no catalog; the model Codex is set to use is the one known to work.
+            return Ok(vec![Provider::Codex.default_model()]);
+        }
         let url = match ep.provider {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
             _ => format!("{}/models", ep.base_url),
@@ -344,7 +402,7 @@ impl Client {
     /// None when the provider publishes none (Anthropic) or can't be reached.
     pub fn context_window(&self, model: &str) -> Option<usize> {
         let ep = self.endpoint_for(model).ok()?;
-        if ep.provider == Provider::Anthropic {
+        if matches!(ep.provider, Provider::Anthropic | Provider::Codex) {
             return None;
         }
         let url = format!("{}/models", ep.base_url);
@@ -377,25 +435,38 @@ impl Client {
         let (body, role) = request;
         let reserve = body.map(reservation_tokens).transpose()?;
         let keys = &ep.keys;
+        // A sign-in is one slot that refreshes itself instead of rotating.
+        let slots = keys.len().max(usize::from(ep.codex.is_some()));
         let started = std::time::Instant::now();
         let budget = if retry == Retry::Once { Duration::ZERO } else { retry_budget() };
-        let mut refused = vec![0u32; keys.len()];
+        let mut refused = vec![0u32; slots];
         let mut last_err = String::new();
         let mut retry_after: Option<u64> = None;
         let mut attempts = 0usize;
         let mut round = 0u32;
         loop {
-            for _ in 0..keys.len() {
-                let idx = ep.key_idx.load(Ordering::Relaxed) % keys.len();
-                let key = &keys[idx];
+            for _ in 0..slots {
+                let idx = ep.key_idx.load(Ordering::Relaxed) % slots;
                 let mut req = match body {
                     Some(b) => self.http.post(url).json(b),
                     None => self.http.get(url),
                 };
-                req = if ep.provider == Provider::Anthropic {
-                    req.header("x-api-key", key).header("anthropic-version", anthropic::VERSION)
-                } else {
-                    req.bearer_auth(key)
+                req = match &ep.codex {
+                    Some(auth) => {
+                        let mut auth = auth.lock().map_err(|_| anyhow!("codex sign-in poisoned"))?;
+                        // Refused once, or about to expire: refresh before trying again.
+                        if auth.expiring() || refused[idx] > 0 {
+                            auth.refresh(&self.http)?;
+                        }
+                        req.bearer_auth(auth.access_token())
+                            .header("chatgpt-account-id", auth.account_id())
+                            .header("OpenAI-Beta", "responses=experimental")
+                            .header("originator", codex_originator())
+                    }
+                    None if ep.provider == Provider::Anthropic => {
+                        req.header("x-api-key", &keys[idx]).header("anthropic-version", anthropic::VERSION)
+                    }
+                    None => req.bearer_auth(&keys[idx]),
                 };
                 if let Some(b) = beta {
                     req = req.header("anthropic-beta", b);
@@ -426,6 +497,10 @@ impl Client {
                         last_err = format!("HTTP {}: {}", r_status(status), truncate(text.trim(), 400));
                         match status {
                             401 | 403 => refused[idx] += 1,
+                            // A ChatGPT plan's usage limit lasts hours; waiting it out here only stalls.
+                            429 if text.contains("usage_limit_reached") || text.contains("usage_not_included") => {
+                                bail!(last_err)
+                            }
                             429 => {
                                 if let Some(r) = reservation.take() {
                                     r.refund_rate_limited();
@@ -442,7 +517,7 @@ impl Client {
                         last_err = format!("request failed: {e}");
                     }
                 }
-                ep.key_idx.store((idx + 1) % keys.len(), Ordering::Relaxed);
+                ep.key_idx.store((idx + 1) % slots, Ordering::Relaxed);
             }
             round += 1;
             let wait = backoff(round, retry_after.take());
@@ -472,7 +547,7 @@ impl Client {
 /// the window. A reasoning budget keeps to three quarters of the new cap.
 fn clamp_output(body: &mut Value, cap: Option<u32>) {
     let Some(cap) = cap.map(u64::from) else { return };
-    for key in ["max_tokens", "max_completion_tokens"] {
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         if body[key].as_u64().is_some_and(|n| n > cap) {
             body[key] = json!(cap);
         }
@@ -486,6 +561,7 @@ fn reservation_tokens(body: &Value) -> Result<u64> {
     let output = body["max_completion_tokens"]
         .as_u64()
         .or_else(|| body["max_tokens"].as_u64())
+        .or_else(|| body["max_output_tokens"].as_u64())
         .ok_or_else(|| anyhow!("model request has no output token cap"))?;
     (serde_json::to_vec(body)?.len() as u64)
         .checked_add(output)
@@ -532,6 +608,15 @@ fn transient_stream_error(e: &str) -> bool {
 /// "429 Too Many Requests" style, as reqwest prints a status.
 fn r_status(code: u16) -> String {
     reqwest::StatusCode::from_u16(code).map(|s| s.to_string()).unwrap_or_else(|_| code.to_string())
+}
+
+/// What the Codex backend is told is calling it. It serves the Codex CLI,
+/// so that is the default; `RUSTY_CODEX_ORIGINATOR` names rusty instead.
+fn codex_originator() -> String {
+    std::env::var("RUSTY_CODEX_ORIGINATOR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "codex_cli_rs".into())
 }
 
 /// OpenAI's own API: reasoning models (gpt-5, o-series) take
