@@ -144,6 +144,9 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
             s.wait_for(&[Lit("read-only, live workspace")], "no persistent side selected")?;
             s.send("side-sentinel\r")?;
             s.wait_for(&[Lit("SIDE_ANSWER")], "no persistent side answer")?;
+            s.send("side-slow\rside-followup\r")?;
+            s.wait_for(&[Lit("SIDE_SLOW_ANSWER")], "slow side response missing")?;
+            s.wait_for(&[Lit("SIDE_FOLLOWUP_ANSWER")], "busy side dropped its queued follow-up")?;
             s.send("side-cancel\r")?;
             s.wait_for(&[Lit("side question running")], "second side did not start")?;
             s.send("\x03")?;

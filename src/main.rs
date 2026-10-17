@@ -557,7 +557,11 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut armed_quit = false;
 
     loop {
-        side::poll(&agent.side_parent()?);
+        let parent = agent.side_parent()?;
+        side::poll(&parent);
+        if side::running(&agent.side_book) {
+            side::wait(&parent);
+        }
         // Queued and freshly typed input go through the same slash router.
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::primary("›"), queued);
