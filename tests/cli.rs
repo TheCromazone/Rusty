@@ -1363,7 +1363,11 @@ fn careful_checks_an_answer_after_a_change() {
         ],
     );
     assert_eq!(requests.len(), 4);
-    assert!(requests[3]["messages"].to_string().contains("checker's review"));
+    let note = requests[3]["messages"].to_string();
+    assert!(note.contains("checker's review"), "{note}");
+    // The user already saw the answer once; the follow-up must not restate it.
+    assert!(note.contains("Do not repeat it") && note.contains("nothing to fix"), "{note}");
+    assert!(!note.contains("give your final answer"), "{note}");
 }
 
 #[test]
