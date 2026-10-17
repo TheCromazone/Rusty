@@ -1916,6 +1916,7 @@ fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
         .env("CODEX_HOME", &codex_home)
         .env("RUSTY_CODEX_BASE_URL", &codex)
         .env("RUSTY_CODEX_REFRESH_URL", format!("{refresh}/oauth/token"))
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
         .env_remove("OPENAI_API_KEY")
         .args(["--model", "gpt-5", "hi"])
         .stdin(Stdio::null())
@@ -2083,7 +2084,7 @@ fn retries_stop_at_the_budget() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 1 attempts") && err.contains("429"), "{err}");
+    assert!(err.contains("giving up after 1 attempts") && err.contains("429") && err.contains("slow down"), "{err}");
     assert_eq!(server.join().unwrap().len(), 1);
 }
 
@@ -2096,7 +2097,7 @@ fn a_refused_key_fails_fast() {
     let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 2 attempts") && err.contains("401"), "{err}");
+    assert!(err.contains("giving up after 2 attempts") && err.contains("401") && err.contains("bad key"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
     assert_eq!(server.join().unwrap().len(), 2);
 }
@@ -2114,6 +2115,89 @@ fn an_overload_inside_the_stream_is_retried() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("reviewed it"));
     assert_eq!(server.join().unwrap().len(), 2, "the overloaded stream was retried once");
+}
+
+#[test]
+fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-stall");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let answer = format!("data: {}\n\ndata: [DONE]\n\n", text_reply("still here"));
+        let mut seen = 0;
+        let mut first_closed = false;
+        for body in ["", answer.as_str()] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 65536];
+            let _ = stream.read(&mut buf);
+            seen += 1;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            if body.is_empty() {
+                // Headers arrived, then nothing: longer than the idle limit below.
+                let mut byte = [0u8; 1];
+                first_closed = matches!(stream.read(&mut byte), Ok(0));
+            } else {
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+        }
+        (seen, first_closed)
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still here"));
+    let (requests, first_closed) = server.join().unwrap();
+    assert_eq!(requests, 2, "the quiet stream was given up on and retried");
+    assert!(first_closed, "the timed-out response was dropped before retrying");
+    assert!(started.elapsed() < Duration::from_secs(20), "the stall was noticed within the idle limit");
+}
+
+#[test]
+fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
+    use std::io::{Read, Write};
+    let s = Sandbox::new("stream-active-long");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 65536];
+        let _ = stream.read(&mut buf);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
+        stream.flush().unwrap();
+        let pieces = ["still ", "working ", "after ", "idle limit"];
+        for piece in pieces {
+            let event = serde_json::json!({"choices": [{"delta": {"content": piece}, "finish_reason": null}]});
+            write!(stream, "data: {event}\n\n").unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+        }
+        let done = serde_json::json!({"choices": [{"delta": {}, "finish_reason": "stop"}]});
+        write!(stream, "data: {done}\n\ndata: [DONE]\n\n").unwrap();
+        stream.flush().unwrap();
+    });
+    let started = Instant::now();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_STREAM_IDLE_SECS", "1")
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("still working after idle limit"));
+    assert!(started.elapsed() > Duration::from_secs(2));
+    server.join().unwrap();
 }
 
 #[test]
