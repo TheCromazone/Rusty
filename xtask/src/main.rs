@@ -14,7 +14,10 @@
 //!     cargo xtask tty [CHECK]...       real-terminal checks (see tty.rs)
 //!     cargo xtask tty-capture | tty-inspect
 //!     cargo xtask record SCENE OUT     a demo session as an asciinema cast
+//!     cargo xtask bench [--binary PATH] [--json PATH] [--runs N]
+//!                                      startup, sessions, redaction, recall, turn and stream costs
 
+mod bench;
 mod eval;
 mod json;
 mod memory;
@@ -68,6 +71,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         Some("tty-capture") => tty::capture(rest),
         Some("tty-inspect") => tty::inspect(rest),
         Some("record") => record::command(rest),
+        Some("bench") => bench::command(rest),
         _ => {
             eprintln!(
                 "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks\n    \
@@ -75,7 +79,9 @@ fn run(args: &[String]) -> Result<ExitCode> {
                  | memory-smoke [...] | memory-bench [...] | memory-summary FILE\n    \
                  | tty [ctrl-c|approval|steady]... [--binary PATH] [--live]\n    \
                  | tty-capture --binary PATH --output DIR | tty-inspect DIR\n    \
-                 | record SCENE OUT.cast [-- RUSTY ARGS]>"
+                 | record SCENE OUT.cast [-- RUSTY ARGS]
+    \
+                 | bench [--binary PATH] [--json PATH] [--runs N]>"
             );
             Ok(ExitCode::from(2))
         }
