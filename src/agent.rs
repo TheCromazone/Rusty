@@ -211,6 +211,27 @@ pub struct CompactionEvent {
     pub model: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStop {
+    Complete,
+    StepLimit,
+    OutputLimit,
+    Interrupted,
+    Failed,
+}
+
+impl TurnStop {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "done",
+            Self::StepLimit => "incomplete: step limit",
+            Self::OutputLimit => "incomplete: output limit",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 pub struct Agent {
     pub backend: crate::backend::Backend,
     client: Arc<Client>,
@@ -298,6 +319,8 @@ pub struct Agent {
     /// MCP servers' tools, offered to the lead only.
     pub mcp: crate::mcp::Mcp,
     is_worker: bool,
+    turn_stop: TurnStop,
+    worker_constraints: String,
     request_role: &'static str,
     /// A swarm worker's board, its index, how many notes it has seen and its label.
     board: Option<(crate::swarm::Board, usize, usize, String)>,
@@ -387,6 +410,8 @@ impl Agent {
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
+            turn_stop: TurnStop::Complete,
+            worker_constraints: String::new(),
             request_role: "lead",
             board: None,
             opened: Default::default(),
@@ -533,7 +558,10 @@ impl Agent {
                     ""
                 }
             );
-            return s;
+            return format!(
+                "{s}\nProject instructions:\n{}\n\nUser constraints from the parent:\n{}",
+                self.project_notes, self.worker_constraints
+            );
         }
         let mut s = format!(
             "You are Rusty, a coding agent working in the user's terminal on the project at {}. You're a calm, \
@@ -920,6 +948,7 @@ impl Agent {
 
     /// Runs one user turn to completion. Returns false if interrupted.
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
+        self.turn_stop = TurnStop::StepLimit;
         self.history.push(json!({"role": "user", "content": user}));
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
@@ -1091,6 +1120,11 @@ impl Agent {
                     }
                     continue;
                 }
+                self.turn_stop = if reply.finish_reason.as_deref() == Some("length") {
+                    TurnStop::OutputLimit
+                } else {
+                    TurnStop::Complete
+                };
                 break;
             }
             for call in &reply.tool_calls {
@@ -1207,6 +1241,7 @@ impl Agent {
             if reply.finish_reason.as_deref() == Some("length") {
                 self.discard_claim();
                 d.line(&ui::warn(TOKEN_LIMIT_NOTE));
+                self.turn_stop = TurnStop::OutputLimit;
                 break;
             }
             if !self.is_worker {
@@ -1263,6 +1298,11 @@ impl Agent {
         }
         for (tool, n) in &d.stats.tool_tokens {
             *self.totals.by_tool.entry(tool.clone()).or_default() += n;
+        }
+        if outcome.is_err() {
+            self.turn_stop = TurnStop::Failed;
+        } else if matches!(outcome, Ok(false)) || signal::interrupted() {
+            self.turn_stop = TurnStop::Interrupted;
         }
         if self.is_worker || self.side_meta.is_some() {
             return outcome;
@@ -1358,11 +1398,6 @@ impl Agent {
                 return format!("error: arguments were not valid JSON ({e}). Call the tool again with valid JSON.")
             }
         };
-        if self.is_worker && self.board.is_some() {
-            if let Ok(cwd) = self.cwd.canonicalize() {
-                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
-            }
-        }
         if let Some(p) = &self.progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
@@ -1443,6 +1478,11 @@ impl Agent {
                         meta.observations.remove(&path);
                     }
                 }
+            }
+        }
+        if ok && self.is_worker && self.board.is_some() {
+            if let Ok(cwd) = self.cwd.canonicalize() {
+                self.opened.extend(crate::swarm::opened_by(&cwd, &call.name, &args));
             }
         }
         if ok && matches!(call.name.as_str(), "write_file" | "edit_file") {
@@ -1729,6 +1769,8 @@ impl Agent {
         let queue = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(jobs)));
         let counters: Arc<Vec<AtomicUsize>> = Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
         let (tx, rx) = std::sync::mpsc::channel();
+        let mut handles = Vec::new();
+        let constraints = context::user_messages(&self.history, self.carry_chars());
         for _ in 0..parallel {
             let (queue, counters, board, tx) = (queue.clone(), counters.clone(), board.clone(), tx.clone());
             let (client, cwd, deny, backend) =
@@ -1737,7 +1779,8 @@ impl Agent {
             let lead_window = (self.meter.window, self.meter.window_source);
             // Workers compact as the lead does; smart's own tool is the lead's alone.
             let (compaction, history_cap) = (self.compaction, self.history_cap);
-            std::thread::spawn(move || loop {
+            let (project_notes, constraints) = (self.project_notes.clone(), constraints.clone());
+            handles.push(std::thread::spawn(move || loop {
                 if signal::interrupted() {
                     break;
                 }
@@ -1751,6 +1794,8 @@ impl Agent {
                 let counter = Arc::new(AtomicUsize::new(0));
                 let mut w = Agent::new(client.clone(), model.clone(), cwd.clone(), Policy::new(Mode::ReadOnly));
                 w.is_worker = true;
+                w.project_notes = project_notes.clone();
+                w.worker_constraints = constraints.clone();
                 if model == lead_model {
                     w.meter = context::Meter::new(lead_window.0, lead_window.1);
                 }
@@ -1775,19 +1820,19 @@ impl Agent {
                     .and_then(|m| m["content"].as_str())
                     .unwrap_or("")
                     .to_string();
-                let report = match result {
-                    Err(_) => "failed: the worker crashed".to_string(),
-                    Ok(Err(e)) => format!("failed: {e:#}"),
-                    Ok(Ok(_)) if answer.is_empty() => "returned nothing".to_string(),
-                    Ok(Ok(_)) => answer,
+                let (stop, report) = match result {
+                    Err(_) => (TurnStop::Failed, "the worker crashed".to_string()),
+                    Ok(Err(e)) => (TurnStop::Failed, format!("{e:#}")),
+                    Ok(Ok(_)) if answer.is_empty() => (TurnStop::Failed, "returned nothing".to_string()),
+                    Ok(Ok(_)) => (w.turn_stop, answer),
                 };
                 if tx
-                    .send((i, desc, model, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
+                    .send((i, desc, model, stop, report, w.totals.clone(), t0.elapsed(), std::mem::take(&mut w.opened)))
                     .is_err()
                 {
                     break;
                 }
-            });
+            }));
         }
         drop(tx);
 
@@ -1796,12 +1841,12 @@ impl Agent {
         let mut done = 0;
         while done < n {
             match rx.recv_timeout(Duration::from_millis(60)) {
-                Ok((i, desc, model, report, totals, took, files)) => {
+                Ok((i, desc, model, stop, report, totals, took, files)) => {
                     done += 1;
                     opened.extend(files);
                     self.totals.merge(&totals);
                     let calls = counters[i].load(Ordering::Relaxed);
-                    let failed = report.starts_with("failed:");
+                    let failed = stop != TurnStop::Complete;
                     if display::view() != View::Adhd {
                         let mark = if failed { ui::err("✗") } else { ui::ok("✓") };
                         let short_model = model.rsplit('/').next().unwrap_or(&model).to_string();
@@ -1815,18 +1860,23 @@ impl Agent {
                             ))
                         ));
                     }
-                    reports[i] = format!("## {} ({})\n{}", desc, if failed { "failed" } else { "done" }, report);
+                    reports[i] = format!("## {} ({})\n{}", desc, stop.label(), report);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     signal::poll_keys();
                     if signal::interrupted() {
-                        break;
+                        d.set_status("waiting for interrupted workers to settle".into());
+                    } else {
+                        d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     }
-                    d.set_status(format!("{label} {done}/{n} · {parallel} at a time"));
                     d.tick();
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        // Do not let a previous worker resume when the next turn resets Ctrl-C.
+        for handle in handles {
+            let _ = handle.join();
         }
         d.set_status(String::new());
         let shared = board.map(|b| b.summary()).filter(|s| !s.is_empty());
@@ -1860,8 +1910,8 @@ impl Agent {
             }
             let more = if total > missed.len() { format!(" (+{} more)", total - missed.len()) } else { String::new() };
             out.push(format!(
-                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. If the task needs \
-                 full coverage, check them yourself or give them to another worker.",
+                "## Not opened by any worker\nThese sit beside files the workers read: {}{more}. Only successful read_file/outline calls are tracked; shell and search \
+                 coverage is not measured. If the task needs full coverage, check them yourself or give them to another worker.",
                 missed.join(", ")
             ));
         }
