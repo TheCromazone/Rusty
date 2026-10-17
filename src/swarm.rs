@@ -56,16 +56,11 @@ impl Board {
 /// Most blind spots named to the lead; the rest are counted.
 const MAX_UNOPENED: usize = 30;
 
-/// Files a worker's tool call opened: `read_file` and `outline` paths, and
-/// any word of a bash command that names an existing file under `cwd`.
+/// Files successfully inspected through read_file or outline. Shell arguments
+/// are path mentions, not evidence that file contents were observed.
 pub fn opened_by(cwd: &Path, tool: &str, args: &serde_json::Value) -> Vec<PathBuf> {
     let words: Vec<&str> = match tool {
         "read_file" | "outline" => args["path"].as_str().into_iter().collect(),
-        "bash" => args["command"]
-            .as_str()
-            .unwrap_or("")
-            .split(|c: char| c.is_whitespace() || "'\";|&<>()".contains(c))
-            .collect(),
         _ => Vec::new(),
     };
     words
@@ -127,7 +122,8 @@ mod tests {
         let cwd = dir.canonicalize().unwrap();
         let mut opened = BTreeSet::new();
         opened.extend(opened_by(&cwd, "read_file", &serde_json::json!({"path": "shop/cart.py"})));
-        opened.extend(opened_by(&cwd, "bash", &serde_json::json!({"command": "sed -n 1,40p shop/pricing.py | head"})));
+        opened.extend(opened_by(&cwd, "outline", &serde_json::json!({"path": "shop/pricing.py"})));
+        assert!(opened_by(&cwd, "bash", &serde_json::json!({"command": "ls shop/tax.py"})).is_empty());
         opened.extend(opened_by(&cwd, "bash", &serde_json::json!({"command": "cat /etc/hostname nosuch.py"})));
         assert_eq!(opened.len(), 2, "{opened:?}");
         // docs/ was never visited, so it is not a blind spot of this swarm.
