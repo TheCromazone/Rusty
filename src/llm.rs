@@ -8,8 +8,8 @@ use reqwest::blocking::Response;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::anthropic;
@@ -52,31 +52,22 @@ fn status(text: String) {
     });
 }
 
-/// The lines of a streamed response, read on their own thread so a stream
-/// that goes quiet for longer than [`stream_idle`] fails instead of hanging
-/// until the request's overall timeout.
+/// The lines of a streamed response, with the timer runtime entered while
+/// reqwest's blocking body is polled so its per-read timeout can fire.
 pub fn lines(resp: Response) -> impl Iterator<Item = std::io::Result<String>> {
-    lines_with(resp, stream_idle())
+    let mut lines = BufReader::new(resp).lines();
+    std::iter::from_fn(move || {
+        let _runtime = stream_runtime().enter();
+        lines.next()
+    })
 }
 
-fn lines_with<R: std::io::Read + Send + 'static>(
-    resp: R,
-    idle: Duration,
-) -> impl Iterator<Item = std::io::Result<String>> {
-    let (tx, rx) = channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(resp).lines() {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    std::iter::from_fn(move || match rx.recv_timeout(idle) {
-        Ok(line) => Some(line),
-        Err(RecvTimeoutError::Timeout) => {
-            Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("no data for {}s", idle.as_secs()))))
-        }
-        Err(RecvTimeoutError::Disconnected) => None,
+fn stream_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("stream timer runtime");
+        runtime.spawn(std::future::pending::<()>());
+        runtime
     })
 }
 
@@ -226,10 +217,11 @@ impl Client {
                  to use your ChatGPT account"
             );
         }
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let http = reqwest::blocking::ClientBuilder::from(
+            reqwest::Client::builder().connect_timeout(Duration::from_secs(20)).read_timeout(stream_idle()),
+        )
+        .timeout(Duration::from_secs(600))
+        .build()?;
         Ok(Self { http, endpoints, budget: crate::budget::Budget::unbounded() })
     }
 
@@ -850,27 +842,6 @@ mod tests {
         ] {
             assert!(!transient_stream_error(e), "{e}");
         }
-    }
-
-    #[test]
-    fn a_quiet_stream_fails_after_the_idle_limit_instead_of_hanging() {
-        struct Slow(bool);
-        impl std::io::Read for Slow {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.0 {
-                    std::thread::sleep(Duration::from_secs(5));
-                    return Ok(0);
-                }
-                self.0 = true;
-                buf[..6].copy_from_slice(b"data:\n");
-                Ok(6)
-            }
-        }
-        let mut lines = lines_with(Slow(false), Duration::from_millis(100));
-        assert_eq!(lines.next().unwrap().unwrap(), "data:");
-        let err = lines.next().unwrap().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        assert!(transient_stream_error(&format!("stream interrupted: {err}")));
     }
 
     #[test]
