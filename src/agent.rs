@@ -877,7 +877,7 @@ impl Agent {
                 );
             }
             if let Some(raw) = reply.raw.take() {
-                msg[crate::anthropic::BLOCKS_KEY] = raw;
+                msg[reply.raw_key] = raw;
             }
             self.history.push(msg);
 

@@ -1860,6 +1860,127 @@ fn doctor_checks_every_provider_without_showing_keys() {
     assert!(headers.starts_with("get /v1/models"), "{headers}");
 }
 
+/// A JWT with these claims and no real signature, enough for an expiry or an email.
+fn fake_jwt(claims: serde_json::Value) -> String {
+    fn b64(b: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut s = String::new();
+        for chunk in b.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+            for i in 0..chunk.len() + 1 {
+                s.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        s
+    }
+    format!("{}.{}.sig", b64(b"{\"alg\":\"none\"}"), b64(claims.to_string().as_bytes()))
+}
+
+#[test]
+fn codex_sign_in_serves_gpt_models_and_refreshes_a_refused_token() {
+    let s = Sandbox::new("codex-login");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let access = fake_jwt(serde_json::json!({"exp": now + 3600}));
+    let id = fake_jwt(serde_json::json!({"email": "dev@example.com"}));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "last_refresh": "2026-10-01T00:00:00Z",
+            "tokens": {"id_token": id, "access_token": access, "refresh_token": "refresh-1", "account_id": "acct_1"}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5-codex-test\"\n").unwrap();
+
+    let reply = [
+        r#"{"type":"response.created","response":{}}"#.to_string(),
+        r#"{"type":"response.output_text.delta","delta":"signed in fine"}"#.into(),
+        r#"{"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"signed in fine"}]}}"#.into(),
+        r#"{"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}"#.into(),
+    ]
+    .iter()
+    .map(|e| format!("data: {e}\n\n"))
+    .collect::<String>();
+    // The first call is refused; after a refresh the second one answers.
+    let (codex, codex_server) = scripted_http(vec![(401, r#"{"detail":"token expired"}"#.into()), (200, reply)]);
+    let (refresh, refresh_server) = scripted_http(vec![(
+        200,
+        serde_json::json!({"access_token": fake_jwt(serde_json::json!({"exp": now + 7200})), "refresh_token": "refresh-2", "id_token": fake_jwt(serde_json::json!({"email": "dev@example.com"}))}).to_string(),
+    )]);
+    let out = s
+        .cmd()
+        .env("CODEX_HOME", &codex_home)
+        .env("RUSTY_CODEX_BASE_URL", &codex)
+        .env("RUSTY_CODEX_REFRESH_URL", format!("{refresh}/oauth/token"))
+        .env_remove("OPENAI_API_KEY")
+        .args(["--model", "gpt-5", "hi"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}\n{err}");
+    assert!(text.contains("signed in fine"), "{text}\n{err}");
+
+    let requests = codex_server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let (headers, body) = &requests[1];
+    assert!(headers.starts_with("post /v1/codex/responses"), "{headers}");
+    assert!(headers.contains("chatgpt-account-id: acct_1"), "{headers}");
+    assert!(headers.contains("openai-beta: responses=experimental"), "{headers}");
+    assert!(!headers.contains("refresh-"), "the refresh token never travels as a header: {headers}");
+    assert!(
+        headers.contains("authorization: bearer ") && !headers.contains(&access.to_ascii_lowercase()),
+        "retried with the new token: {headers}"
+    );
+    assert_eq!(body["model"], "gpt-5");
+    assert_eq!(body["store"], false);
+    assert!(
+        body["messages"].is_null() && !body["instructions"].as_str().unwrap().is_empty(),
+        "Responses API shape: {body}"
+    );
+    assert_eq!(body["input"].as_array().unwrap().last().unwrap()["content"][0]["text"], "hi");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert!(body["tools"][0]["name"].is_string(), "{}", body["tools"][0]);
+
+    let refreshes = refresh_server.join().unwrap();
+    assert_eq!(refreshes.len(), 1);
+    assert_eq!(refreshes[0].1["grant_type"], "refresh_token");
+    assert_eq!(refreshes[0].1["refresh_token"], "refresh-1");
+    assert!(refreshes[0].1["client_id"].as_str().unwrap().starts_with("app_"));
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(saved["tokens"]["refresh_token"], "refresh-2", "the refreshed tokens are saved for Codex too");
+    assert_ne!(saved["tokens"]["access_token"], access);
+    assert_eq!(saved["auth_mode"], "chatgpt", "Codex's own fields stay");
+    assert_ne!(saved["last_refresh"], "2026-10-01T00:00:00Z");
+    assert!(!text.contains("refresh-") && !err.contains("refresh-"), "tokens are never printed");
+}
+
+#[test]
+fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
+    let s = Sandbox::new("codex-default");
+    let codex_home = s.home.join("codex");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({"auth_mode": "chatgpt", "tokens": {"access_token": "a", "refresh_token": "r", "account_id": "acct_9"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(codex_home.join("config.toml"), "# comment\nmodel = \"gpt-5-codex-test\"\n").unwrap();
+    let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("✓ codex") && text.contains("chatgpt sign-in"), "{text}");
+    assert!(text.contains("model gpt-5-codex-test → codex"), "Codex's own model is the default: {text}");
+    assert!(text.contains("not set up · add NVIDIA_API_KEY"), "{text}");
+    assert!(!text.contains("acct_9"), "{text}");
+
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("not set up · run `codex login`"), "{text}");
+}
+
 #[test]
 fn an_empty_base_url_means_the_default() {
     let s = Sandbox::new("empty-base");

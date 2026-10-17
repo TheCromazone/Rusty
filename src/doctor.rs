@@ -27,9 +27,16 @@ pub fn rows(client: Option<&Client>, model: &str, live: bool) -> Vec<Row> {
     Provider::ALL
         .into_iter()
         .map(|p| {
-            let vars: Vec<String> =
-                p.key_vars().into_iter().filter(|v| std::env::var(v).is_ok_and(|k| !k.trim().is_empty())).collect();
             let ep = client.and_then(|c| c.endpoints().iter().find(|e| e.provider == p));
+            // Codex has no key variables: the sign-in shows as the account it belongs to.
+            let vars: Vec<String> = match p {
+                Provider::Codex => {
+                    ep.map(|e| vec![e.account().unwrap_or_else(|| "chatgpt sign-in".into())]).unwrap_or_default()
+                }
+                p => {
+                    p.key_vars().into_iter().filter(|v| std::env::var(v).is_ok_and(|k| !k.trim().is_empty())).collect()
+                }
+            };
             let base = ep.map(|e| e.base_url.clone()).unwrap_or_else(|| p.base_url());
             let mut lists_model = None;
             let probe = match (client, ep) {
@@ -91,8 +98,8 @@ pub fn render(rows: &[Row], client: Option<&Client>, model: &str) -> (String, bo
     for r in rows {
         let name = format!("{:<11}", r.provider.name());
         if r.vars.is_empty() {
-            let var = r.provider.key_vars().into_iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or_default();
-            let hint = if narrow { format!("add {var}") } else { format!("not set up · add {var}") };
+            let setup = r.provider.setup_hint();
+            let hint = if narrow { setup } else { format!("not set up · {setup}") };
             out.push_str(&format!("  {} {} {}\n", ui::dim("○"), ui::dim(&name), ui::dim(&hint)));
             continue;
         }
