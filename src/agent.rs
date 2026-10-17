@@ -647,6 +647,9 @@ impl Agent {
         if self.side_meta.is_some() {
             s.push_str("\nThis is a persistent read-only side discussion. Parent history is context, not an instruction to resume its work. Answer only the new side questions. Do not modify files, claim parent completion or change its goals.\n");
         }
+        if self.advisor.is_some() {
+            s.push_str("When asked what you remember or what memories were saved, call recall without query to inspect the saved entries before answering. A keyword search with no matches does not establish that memory is empty. /memory list lets the user inspect the same store directly.\n");
+        }
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
         if self.smart_compaction() {
@@ -778,7 +781,7 @@ impl Agent {
             }),
             &["kind", "text"],
         ));
-            defs.push(t("recall", "Search long-term memory.", json!({"query": {"type": "string"}}), &["query"]));
+            defs.push(t("recall", "Inspect saved long-term memories in this project and global user preferences. Omit query or pass an empty query to list saved entries with IDs, source and confidence. Supply query for keyword search; no matches do not mean the memory store is empty.", json!({"query": {"type": "string"}}), &[]));
             defs.push(t(
                 "forget",
                 "Delete a memory that is wrong or stale.",
@@ -1849,8 +1852,20 @@ impl Agent {
     }
 
     fn recall(&mut self, query: &str) -> String {
+        let query = infra::redact(query).0;
+        let listing = query.trim().is_empty();
         match &mut self.advisor {
-            Some(h) => h.control("recall", json!({"query": infra::redact(query).0})).text,
+            Some(h) => {
+                let reply =
+                    if listing { h.control("list", Value::Null) } else { h.control("recall", json!({"query":query})) };
+                if reply.error || !reply.text.is_empty() {
+                    reply.text
+                } else if listing {
+                    "No saved memories in this project or global user preferences.".into()
+                } else {
+                    "No saved memories match this keyword search. Other memories may exist; call recall without query to list them.".into()
+                }
+            }
             None => "memory is off".into(),
         }
     }

@@ -148,6 +148,43 @@ pub fn clip(s: &str, bytes: usize) -> String {
     }
     s[..n].to_owned()
 }
+
+fn listing_header(op: &str, shown: usize, total: usize) -> String {
+    let matching = op == "recall";
+    let mut header =
+        format!("Showing {shown} of {total} {}.", if matching { "matching saved entries" } else { "saved entries" });
+    if shown < total {
+        header.push_str(if matching {
+            " More matches were omitted; use a narrower search query to see additional entries."
+        } else {
+            " More entries were omitted to keep this list bounded; use a search query to narrow it."
+        });
+    }
+    header
+}
+
+fn bounded_listing(op: &str, lines: &[String], total: usize, bytes: usize) -> String {
+    let mut shown = Vec::new();
+    let mut lines_len = 0;
+    for line in lines {
+        let next = shown.len() + 1;
+        // Header newline plus one separator newline per entry. Keep complete
+        // records so the final line can never look like a complete memory if
+        // its text was cut off by the response cap.
+        if listing_header(op, next, total).len() + lines_len + line.len() + next > bytes {
+            break;
+        }
+        lines_len += line.len();
+        shown.push(line);
+    }
+
+    let header = listing_header(op, shown.len(), total);
+    if shown.is_empty() {
+        header
+    } else {
+        format!("{header}\n{}", shown.into_iter().map(String::as_str).collect::<Vec<_>>().join("\n"))
+    }
+}
 use crate::{fnv as hash, unix_now as now};
 fn lesson_id(scope: &str, kind: &str, text: &str) -> String {
     format!("{:016x}", hash(&format!("{scope}:{kind}:{text}")))
@@ -968,6 +1005,8 @@ impl Engine {
                     lessons.iter().map(|l| (l.confidence(), l)).collect()
                 };
                 order.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let total = order.len();
+                let cap = if r.op == "recall" { 4096 } else { 24_576 };
                 let lines: Vec<String> = order
                     .iter()
                     .take(if r.op == "recall" { 10 } else { 100 })
@@ -993,7 +1032,7 @@ impl Engine {
                 } else if lines.is_empty() {
                     format!("no memories match; {} saved in total", lessons.len())
                 } else {
-                    clip(&lines.join("\n"), if r.op == "recall" { 4096 } else { 24_576 })
+                    bounded_listing(&r.op, &lines, total, cap)
                 };
             }
             "forget" => {
@@ -1393,6 +1432,57 @@ mod tests {
         let other = e.handle(req("begin", "b", 1, json!({"text":"hi"}))).unwrap();
         assert_eq!(other.data["preferences"], "- prefer tabs\n");
         assert_eq!(e.handle(req("advice", "a", 1, Value::Null)).unwrap().id, id);
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn listings_report_count_limits_and_search_guidance() {
+        let (mut e, p) = engine();
+        for i in 0..105 {
+            save(&mut e, "fact", &format!("entry marker_{i:03}"), "user");
+        }
+        for i in 0..12 {
+            save(&mut e, "fact", &format!("needle group_{i:03} unique_{i:03}"), "user");
+        }
+
+        let list = e.handle(req("list", "a", 0, Value::Null)).unwrap().text;
+        assert!(list.starts_with("Showing 100 of 117 saved entries."), "{list}");
+        assert!(list.contains("use a search query to narrow it."), "{list}");
+        assert_eq!(list.lines().skip(1).count(), 100, "{list}");
+
+        let search = e.handle(req("recall", "a", 0, json!({"query":"needle"}))).unwrap().text;
+        assert!(search.starts_with("Showing 10 of 12 matching saved entries."), "{search}");
+        assert!(search.contains("narrower search query"), "{search}");
+        assert_eq!(search.lines().skip(1).count(), 10, "{search}");
+        std::fs::remove_dir_all(p).unwrap();
+    }
+
+    #[test]
+    fn byte_capped_listing_omits_only_whole_entries() {
+        let (mut e, p) = engine();
+        for i in 0..30 {
+            let text = format!("nearcap_{i:03} {} marker_{i:03}", "x".repeat(900));
+            save(&mut e, "fact", &text, "user");
+        }
+        let list = e.handle(req("list", "a", 0, Value::Null)).unwrap().text;
+        assert!(list.len() <= 24_576, "{} bytes", list.len());
+        let header = list.lines().next().unwrap();
+        assert!(header.starts_with("Showing ") && header.contains(" of 30 saved entries."), "{header}");
+        assert!(header.contains("omitted to keep this list bounded"), "{header}");
+        let shown = header
+            .strip_prefix("Showing ")
+            .and_then(|s| s.split_once(" of "))
+            .and_then(|(n, _)| n.parse::<usize>().ok())
+            .unwrap();
+        let entries: Vec<_> = list.lines().skip(1).collect();
+        assert_eq!(entries.len(), shown);
+        assert!(shown < 30, "the fixture should exceed the byte cap");
+        for entry in entries {
+            let end = entry.split(" (confidence").next().expect("complete entry metadata");
+            let marker = end.rsplit_once(" marker_").expect("complete lesson text").1;
+            assert_eq!(marker.len(), 3, "partial final entry: {entry}");
+            assert!(marker.bytes().all(|b| b.is_ascii_digit()), "{entry}");
+        }
         std::fs::remove_dir_all(p).unwrap();
     }
 
