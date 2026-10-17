@@ -3,6 +3,7 @@ mod agent;
 mod anthropic;
 mod backend;
 mod budget;
+mod codex;
 mod config;
 mod context;
 mod display;
@@ -687,8 +688,11 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 }
                 Err(_) => {
                     let p = config::Provider::for_model(&agent.model);
-                    let var = p.key_vars().into_iter().find(|v| !v.starts_with("RUSTY_")).unwrap_or_default();
-                    println!("  model {} {}", ui::info(&agent.model), ui::warn(&format!("· {} needs {var}", p.name())))
+                    let hint = match p.key_vars().into_iter().find(|v| !v.starts_with("RUSTY_")) {
+                        Some(var) => format!("needs {var}"),
+                        None => p.setup_hint(),
+                    };
+                    println!("  model {} {}", ui::info(&agent.model), ui::warn(&format!("· {} {hint}", p.name())))
                 }
             }
         }

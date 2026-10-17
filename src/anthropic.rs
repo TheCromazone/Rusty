@@ -474,6 +474,7 @@ fn finish(
             }
         }
         reply.raw = Some(Value::Array(blocks));
+        reply.raw_key = BLOCKS_KEY;
     } else {
         reply.tool_calls.retain(|_| finish_reason != "refusal");
     }
