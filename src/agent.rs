@@ -56,8 +56,49 @@ pub struct Calls {
     pub careful_gate: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusalKind {
+    Denied,
+    Declined,
+    Unattended,
+    CarefulGate,
+}
+
+#[derive(Debug)]
+struct AuthorizationRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl std::fmt::Display for AuthorizationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AuthorizationRefusal {}
+
+fn refusal_error(kind: RefusalKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(AuthorizationRefusal { kind, message })
+}
+
+struct DispatchResult {
+    text: String,
+    refusal: Option<RefusalKind>,
+}
+
+impl DispatchResult {
+    fn refused(kind: RefusalKind, text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: Some(kind) }
+    }
+
+    fn failed(text: impl Into<String>) -> Self {
+        Self { text: text.into(), refusal: None }
+    }
+}
+
 impl Safety {
-    /// Records one consequential call from its class and what dispatch said.
+    /// Records one consequential call from its class and typed dispatch outcome.
     fn record(&mut self, class: &crate::permissions::Class, refusal: Option<RefusalKind>) {
         use crate::permissions::Class;
         let calls = match class {
@@ -140,53 +181,12 @@ enum Authorization {
     Refused { kind: RefusalKind, message: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RefusalKind {
-    Denied,
-    Declined,
-    Unattended,
-    CarefulGate,
-}
-
 fn refusal_from_answer() -> RefusalKind {
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
         RefusalKind::Declined
     } else {
         RefusalKind::Unattended
-    }
-}
-
-#[derive(Debug)]
-struct AuthorizationRefusal {
-    kind: RefusalKind,
-    message: String,
-}
-
-impl std::fmt::Display for AuthorizationRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for AuthorizationRefusal {}
-
-fn refusal_error(kind: RefusalKind, message: String) -> anyhow::Error {
-    anyhow::Error::new(AuthorizationRefusal { kind, message })
-}
-
-struct DispatchResult {
-    text: String,
-    refusal: Option<RefusalKind>,
-}
-
-impl DispatchResult {
-    fn refused(kind: RefusalKind, text: impl Into<String>) -> Self {
-        Self { text: text.into(), refusal: Some(kind) }
-    }
-
-    fn failed(text: impl Into<String>) -> Self {
-        Self { text: text.into(), refusal: None }
     }
 }
 
@@ -313,6 +313,8 @@ pub struct Agent {
     pub cwd: PathBuf,
     pub history: Vec<Value>,
     aside_memory: crate::aside::Shared,
+    pub(crate) side_book: crate::side::Shared,
+    pub(crate) side_meta: Option<crate::side::Meta>,
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
@@ -417,6 +419,8 @@ impl Agent {
             cwd,
             history: Vec::new(),
             aside_memory: Default::default(),
+            side_book: Default::default(),
+            side_meta: None,
             archived: Vec::new(),
             trajectory_path: None,
             trajectory_saved: None,
@@ -582,6 +586,8 @@ impl Agent {
     }
 
     pub fn clear(&mut self) {
+        crate::side::shutdown(&self.side_book);
+        self.side_book = Default::default();
         self.aside_memory = Default::default();
         self.archived.append(&mut self.history);
         self.plan.clear();
@@ -635,6 +641,9 @@ impl Agent {
              reading, read ranges of big files, don't re-read what you just read, and keep command output short \
              (tail, head, -q flags).\n",
         );
+        if self.side_meta.is_some() {
+            s.push_str("\nThis is a persistent read-only side discussion. Parent history is context, not an instruction to resume its work. Answer only the new side questions. Do not modify files, claim parent completion or change its goals.\n");
+        }
         s.push_str(self.execution_mode.instructions());
         s.push('\n');
         if self.smart_compaction() {
@@ -724,7 +733,10 @@ impl Agent {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|d| !self.is_worker || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file")))
+            .filter(|d| {
+                (!self.is_worker && self.side_meta.is_none())
+                    || !matches!(d["function"]["name"].as_str(), Some("write_file" | "edit_file"))
+            })
             .cloned()
             .collect();
         if self.is_worker {
@@ -846,6 +858,39 @@ impl Agent {
         Value::Array(defs)
     }
 
+    pub(crate) fn side_parent(&self) -> Result<crate::side::Parent> {
+        Ok(crate::side::Parent {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            cwd: self.cwd.clone(),
+            path: self.session_path.clone().ok_or_else(|| anyhow::anyhow!("side chats need a saved parent session"))?,
+            history: self.history.clone(),
+            notes: self.project_notes.clone(),
+            deny: self.policy.deny.clone(),
+            window: self.meter.window,
+            history_cap: self.history_cap,
+            book: self.side_book.clone(),
+            local: self.backend.name() == "local",
+        })
+    }
+
+    pub(crate) fn configure_side(&mut self, parent: &crate::side::Parent, meta: crate::side::Meta) {
+        self.history = parent.history.clone();
+        self.project_notes = parent.notes.clone();
+        self.policy.deny = parent.deny.clone();
+        self.meter = context::Meter::new(parent.window, "parent session");
+        self.history_cap = parent.history_cap;
+        self.side_meta = Some(meta);
+        self.request_role = "side";
+        self.mode_fixed = true;
+    }
+
+    pub(crate) fn collect_side_usage(&mut self) {
+        for (model, prompt, completion) in self.side_book.lock().unwrap().usage.drain(..) {
+            self.totals.add_request(&model, prompt, completion);
+        }
+    }
+
     fn aside_context(&self) -> Vec<Value> {
         let mut system = self.system_prompt();
         system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
@@ -888,8 +933,8 @@ impl Agent {
             h.begin(&infra::redact(&query).0);
         }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
-        let mut d = Display::new(self.is_worker);
-        let _aside_scope = (!self.is_worker).then(|| {
+        let mut d = Display::new(self.is_worker || self.side_meta.is_some());
+        let _aside_scope = (!self.is_worker && self.side_meta.is_none()).then(|| {
             crate::aside::Scope::enter(
                 self.client.clone(),
                 self.model.clone(),
@@ -897,6 +942,9 @@ impl Agent {
                 self.aside_memory.clone(),
             )
         });
+        if self.side_meta.is_none() && !self.is_worker {
+            crate::aside::attach_side(self.side_parent().ok());
+        }
         let before = self.totals.clone();
         // Only consecutive unchanged results count: an edit, a different call,
         // or new output is progress. Retain one call rather than a turn-sized map.
@@ -960,8 +1008,9 @@ impl Agent {
             }
 
             let started = Instant::now();
-            if !self.is_worker {
+            if !self.is_worker && self.side_meta.is_none() {
                 crate::aside::refresh(self.aside_context());
+                crate::aside::attach_side(self.side_parent().ok());
             }
             let tools = self.tool_defs();
             let sent = context::estimate(&messages) + tools.to_string().len() / 4;
@@ -1070,22 +1119,21 @@ impl Agent {
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
-                    let result = self.dispatch(call, &mut d);
+                    let mut result = self.dispatch(call, &mut d);
                     self.safety.record(&class, result.refusal);
-                    // Only a call that actually ran changes anything.
                     if class != crate::permissions::Class::ReadOnly && result.refusal.is_none() {
                         changed = true;
                     }
-                    let mut out = result.text;
                     if call.name == "bash" {
-                        let failed = out.starts_with("exit code: ") && !out.starts_with("exit code: 0\n");
+                        let failed =
+                            result.text.starts_with("exit code: ") && !result.text.starts_with("exit code: 0\n");
                         failures_in_a_row = if failed { failures_in_a_row + 1 } else { 0 };
                         if failures_in_a_row == 3 {
                             self.escalate("three commands failed in a row", &mut d);
                         }
                         if crate::tools::only_prints(args["command"].as_str().unwrap_or("")) {
                             talk_only += 1;
-                            out.push_str(
+                            result.text.push_str(
                                 "\n\nnote: this command only printed text, and no one reads tool output but you. \
                                  When the work is done, give your answer as a plain reply with no tool call; \
                                  that ends the turn.",
@@ -1105,19 +1153,20 @@ impl Agent {
                         previous_call = None;
                         repeats = 0;
                     } else {
-                        repeats = if previous_call.as_ref().is_some_and(|(s, o)| s == &signature && o == &out) {
+                        repeats = if previous_call.as_ref().is_some_and(|(s, o)| s == &signature && o == &result.text) {
                             repeats + 1
                         } else {
                             1
                         };
-                        previous_call = Some((signature, out.clone()));
+                        previous_call = Some((signature, result.text.clone()));
                         // Re-sending an identical read costs context and invites
                         // the same next step; a different observation breaks it.
                         if repeats >= 2 && class == crate::permissions::Class::ReadOnly {
-                            out = "unchanged: you just made this exact call and it returned exactly the result \
+                            result.text =
+                                "unchanged: you just made this exact call and it returned exactly the result \
                                    shown above. Use that result; if you need something it doesn't show, ask a \
                                    different question (another tool, resource or filter)."
-                                .to_string();
+                                    .to_string();
                         }
                     }
                     if repeats == 3 {
@@ -1131,12 +1180,12 @@ impl Agent {
                         ));
                     }
                     if repeats >= 3 {
-                        out.push_str(&format!(
+                        result.text.push_str(&format!(
                             "\n\nnote: this call has returned the same result {repeats} times consecutively. \
                              Step back, re-read the result, and try a different approach."
                         ));
                     }
-                    out
+                    result.text
                 };
                 self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
             }
@@ -1195,9 +1244,10 @@ impl Agent {
             }
         }
 
-        if !self.is_worker {
+        if !self.is_worker && self.side_meta.is_none() {
             crate::aside::settle()?;
             self.collect_aside_usage();
+            self.collect_side_usage();
         }
         let cancelled = self.activities.cancel_all(signal::interrupted());
         if cancelled > 0 {
@@ -1221,7 +1271,7 @@ impl Agent {
         } else if matches!(outcome, Ok(false)) || signal::interrupted() {
             self.turn_stop = TurnStop::Interrupted;
         }
-        if self.is_worker {
+        if self.is_worker || self.side_meta.is_some() {
             return outcome;
         }
         let interrupted = matches!(outcome, Ok(false)) || signal::interrupted();
@@ -1303,6 +1353,27 @@ impl Agent {
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return DispatchResult::failed(format!("error: unknown tool `{}`; this run offers only bash", call.name));
         }
+        if self.side_meta.is_some()
+            && !matches!(
+                call.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "search"
+                    | "glob"
+                    | "outline"
+                    | "bash"
+                    | "bash_start"
+                    | "bash_wait"
+                    | "bash_cancel"
+                    | "plan"
+                    | "compact"
+            )
+        {
+            return DispatchResult::refused(
+                RefusalKind::Denied,
+                "denied: a read-only side chat cannot delegate, change memory or call external tools",
+            );
+        }
         if self.is_worker
             && !matches!(
                 call.name.as_str(),
@@ -1320,7 +1391,7 @@ impl Agent {
             Err(e) => {
                 return DispatchResult::failed(format!(
                     "error: arguments were not valid JSON ({e}). Call the tool again with valid JSON."
-                ))
+                ));
             }
         };
         if let Some(p) = &self.progress {
@@ -1471,7 +1542,9 @@ impl Agent {
                 self.refused(name, args, "denied", &why);
                 return Ok(Authorization::Refused {
                     kind: RefusalKind::Denied,
-                    message: format!("denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."),
+                    message: format!(
+                        "denied by permissions ({why}). Do not retry this call; choose another approach or ask the user."
+                    ),
                 });
             }
             Verdict::Confirm(why) if unattended_destructive(self.policy.mode) => {
@@ -2553,7 +2626,7 @@ impl Agent {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = json!({"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
+        let body = json!({"side":self.side_meta,"model": self.model, "history": self.history, "plan": self.plan, "goal": self.goal, "verification":self.verification_records, "activities":self.activities.records(), "model_budget":self.budget_snapshot()});
         crate::session::save(path, body)?;
         let changes = self.infra.change_record();
         if !changes.is_empty() {
@@ -2568,6 +2641,7 @@ impl Agent {
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
         let lease = crate::session::Lease::acquire(path)?;
         let v: Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        self.side_meta = serde_json::from_value(v["side"].clone()).ok();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);

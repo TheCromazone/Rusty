@@ -892,9 +892,9 @@ fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
     s.fake("kubectl", "case \"$*\" in diff*) printf 'diff'; exit 1;; apply*) printf 'configured\\n';; esac");
     s.fake("terraform", "case \"$*\" in plan*) touch rusty.tfplan;; esac; printf 'ok\\n'");
     std::fs::write(s.project.join("deploy.yaml"), "replicas: 1\n").unwrap();
-    let (out, _, requests) = scripted_run(
+    let (out, stderr, requests) = scripted_run(
         &s,
-        &["--yolo", "--mode", "careful", "deploy"],
+        &["--yolo", "--mode", "careful", "--stats", "deploy"],
         vec![
             bash_reply("kubectl apply -f deploy.yaml"),
             bash_reply("kubectl diff -f deploy.yaml"),
@@ -939,6 +939,12 @@ fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
     assert!(out.contains("blocked by careful mode"), "{out}");
     assert!(out.contains("change record · 5 changes"), "{out}");
     assert!(out.matches("blocked").count() >= 3, "{out}");
+    let stats: serde_json::Value = serde_json::from_str(stderr.lines().last().unwrap()).unwrap();
+    let safety = &stats["safety"];
+    assert!(
+        safety["risky"]["careful_gate"].as_u64().unwrap() + safety["destructive"]["careful_gate"].as_u64().unwrap() > 0,
+        "careful-gate refusals must remain distinct from denials and execution: {safety}"
+    );
     // Standard mode only advises; it does not refuse.
     let s2 = Sandbox::new("gate-standard");
     s2.fake("kubectl", "printf 'configured\\n'");
@@ -4474,6 +4480,62 @@ fn btw_followups_retain_only_the_private_aside_context() {
 }
 
 #[test]
+fn persistent_sides_read_files_but_cannot_write_or_pollute_the_parent() {
+    let s = Sandbox::new("persistent-sides");
+    std::fs::write(s.project.join("sample.txt"), "OBSERVED_SIDE_FILE").unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        say("MAIN_SEED"),
+        tool_reply("read_file", serde_json::json!({"path":"sample.txt"})),
+        say("PRIVATE_SIDE_FACT"),
+        say("main continued"),
+        tool_reply("write_file", serde_json::json!({"path":"forbidden.txt","content":"bad"})),
+        say("write was refused"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    let shown = s.repl_with(
+        cmd,
+        &[
+            "remember MAIN_SEED",
+            "/side new research",
+            "inspect sample",
+            "/back",
+            "continue main",
+            "/side open research",
+            "try a write",
+            "/back",
+            "/quit",
+        ],
+    );
+    let r = server.join().unwrap();
+    assert_eq!(r.len(), 6);
+    assert!(r[1]["messages"].to_string().contains("MAIN_SEED"));
+    assert!(!r[1]["tools"].to_string().contains("write_file"));
+    assert!(r[2]["messages"].to_string().contains("OBSERVED_SIDE_FILE"));
+    assert!(!r[3]["messages"].to_string().contains("PRIVATE_SIDE_FACT"));
+    assert!(r[4]["messages"].to_string().contains("PRIVATE_SIDE_FACT"));
+    assert!(r[5]["messages"].to_string().contains("denied"));
+    assert!(!s.project.join("forbidden.txt").exists());
+    assert!(shown.contains("read-only, live workspace"));
+}
+
+#[test]
+fn a_saved_side_chat_reopens_after_restarting_the_parent() {
+    let s = Sandbox::new("side-restart");
+    let (url, server) = scripted_endpoint(vec![say("MAIN_SEED"), say("SAVED_SIDE_ANSWER")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["remember MAIN_SEED", "/side new saved", "first side question", "/back", "/quit"]);
+    assert_eq!(server.join().unwrap().len(), 2);
+    let (url, server) = scripted_endpoint(vec![say("resumed side")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--continue", "--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["/side open saved", "follow up", "/back", "/quit"]);
+    let requests = server.join().unwrap();
+    assert!(requests[0]["messages"].to_string().contains("SAVED_SIDE_ANSWER"));
+}
+
+#[test]
 fn workers_inherit_project_rules_and_parent_user_constraints() {
     let s = Sandbox::new("worker-contract");
     std::fs::write(s.project.join("AGENTS.md"), "PROJECT_RULE_SENTINEL: do not inspect private files.").unwrap();
@@ -4589,4 +4651,20 @@ fn a_worker_that_exhausts_its_steps_returns_partial_findings_as_incomplete() {
     let lead = requests.last().unwrap()["messages"].to_string();
     assert!(lead.contains("slice 0 (incomplete: step limit)"), "{lead}");
     assert!(lead.contains("still investigating"));
+}
+
+#[test]
+fn side_capabilities_are_enforced_even_for_unadvertised_control_calls() {
+    let s = Sandbox::new("side-control-scope");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("task", serde_json::json!({"description":"nested","prompt":"unrequested work"})),
+        say("side stopped"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["/side new scope", "inspect only", "/back", "/quit"]);
+    let r = server.join().unwrap();
+    assert_eq!(r.len(), 2);
+    assert!(r[1]["messages"].to_string().contains("a read-only side chat cannot delegate"));
+    assert!(!r[1]["messages"][0]["content"].as_str().unwrap().starts_with("You are a research worker"));
 }

@@ -17,6 +17,7 @@ mod markdown;
 mod mcp;
 mod permissions;
 mod session;
+mod side;
 mod signal;
 mod skills;
 mod slash;
@@ -557,6 +558,11 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     let mut armed_quit = false;
 
     loop {
+        let parent = agent.side_parent()?;
+        side::poll(&parent);
+        if side::running(&agent.side_book) {
+            side::wait(&parent);
+        }
         // Queued and freshly typed input go through the same slash router.
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::primary("›"), queued);
@@ -623,6 +629,14 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 Ok(false) => Ok(()),
                 Err(e) => Err(e),
             }
+        } else if side::focused(&agent.side_book) {
+            (|| {
+                let parent = agent.side_parent()?;
+                side::submit(&parent, &input)?;
+                side::wait(&parent);
+                agent.collect_side_usage();
+                Ok(())
+            })()
         } else {
             agent.run_turn(&input).map(|_| ())
         };
@@ -631,6 +645,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         }
         agent.save_session()?;
     }
+    side::shutdown(&agent.side_book);
     if let Some(h) = &history_file {
         if let Some(dir) = h.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -662,7 +677,12 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         Some((c, r)) => (c, r.trim()),
         None => (input, ""),
     };
+    if side::focused(&agent.side_book) && !matches!(cmd, "/side" | "/back" | "/help" | "/?" | "/exit" | "/quit" | "/q")
+    {
+        anyhow::bail!("use /back before changing main-chat settings or asking /btw");
+    }
     match cmd {
+        "/side" | "/back" => side::command(&agent.side_parent()?, input)?,
         "/exit" | "/quit" | "/q" => return Ok(true),
         "/help" | "/?" => print_help(cwd),
         "/clear" | "/new" => {

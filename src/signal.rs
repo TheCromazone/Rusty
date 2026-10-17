@@ -6,8 +6,34 @@ use std::sync::OnceLock;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+thread_local! { static RUN_CANCEL: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> = const {std::cell::RefCell::new(None)}; }
+static FOCUSED_CANCEL: std::sync::Mutex<Option<std::sync::Weak<AtomicBool>>> = std::sync::Mutex::new(None);
+pub fn focus_cancel(token: Option<std::sync::Arc<AtomicBool>>) {
+    *FOCUSED_CANCEL.lock().unwrap() = token.as_ref().map(std::sync::Arc::downgrade);
+}
+fn cancel_focused() -> bool {
+    let token = FOCUSED_CANCEL.lock().ok().and_then(|v| v.as_ref().and_then(std::sync::Weak::upgrade));
+    if let Some(token) = token {
+        !token.swap(true, Ordering::SeqCst)
+    } else {
+        false
+    }
+}
+pub struct CancelScope(Option<std::sync::Arc<AtomicBool>>);
+pub fn cancel_scope(token: std::sync::Arc<AtomicBool>) -> CancelScope {
+    CancelScope(RUN_CANCEL.with(|c| c.replace(Some(token))))
+}
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        RUN_CANCEL.with(|c| c.replace(self.0.take()));
+    }
+}
+
 pub fn install() {
     let _ = ctrlc::set_handler(|| {
+        if cancel_focused() {
+            return;
+        }
         if INTERRUPTED.swap(true, Ordering::SeqCst) {
             eprintln!("\nbye");
             std::process::exit(130);
@@ -16,7 +42,9 @@ pub fn install() {
 }
 
 pub fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    RUN_CANCEL
+        .with(|c| c.borrow().as_ref().map(|v| v.load(Ordering::SeqCst)))
+        .unwrap_or_else(|| INTERRUPTED.load(Ordering::SeqCst))
 }
 
 pub fn reset() {
@@ -63,6 +91,9 @@ fn read_keys() {
         }
         let bytes = &buf[..n as usize];
         if bytes.contains(&3) {
+            if cancel_focused() {
+                return;
+            }
             if INTERRUPTED.swap(true, Ordering::SeqCst) {
                 eprintln!("\nbye");
                 std::process::exit(130);
@@ -96,6 +127,10 @@ pub fn take_command(command: &str) -> Option<String> {
         offset += line.len();
     }
     None
+}
+
+pub fn peek_queued() -> Option<String> {
+    QUEUED.lock().ok()?.lines().find(|s| !s.trim().is_empty()).map(|s| s.trim().to_string())
 }
 
 fn pop_queued(q: &mut String) -> Option<String> {
