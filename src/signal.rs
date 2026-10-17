@@ -14,8 +14,7 @@ pub fn focus_cancel(token: Option<std::sync::Arc<AtomicBool>>) {
 fn cancel_focused() -> bool {
     let token = FOCUSED_CANCEL.lock().ok().and_then(|v| v.as_ref().and_then(std::sync::Weak::upgrade));
     if let Some(token) = token {
-        token.store(true, Ordering::SeqCst);
-        true
+        !token.swap(true, Ordering::SeqCst)
     } else {
         false
     }

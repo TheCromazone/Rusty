@@ -271,7 +271,61 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     ready(&mut s)?;
     s.send("\x03")?;
     s.finish().context("a second ctrl-c did not quit")?;
+    if let Some((endpoint, home)) = endpoint {
+        side_ctrl_c(binary, cwd, endpoint, home)?;
+    }
     Ok(Interrupt::Stopped(ms))
+}
+
+/// Checks focused side cancellation and prompt-level Ctrl-C on a controlling
+/// PTY. A side task consumes the first Ctrl-C; the parent must remain usable,
+/// and the usual prompt double-Ctrl-C quit must still work afterwards.
+fn side_ctrl_c(binary: &Path, cwd: &Path, endpoint: &str, home: &Path) -> Result<()> {
+    let command = |name: &str| {
+        let mut cmd = Command::new(binary);
+        cmd.current_dir(cwd).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+        offline(&mut cmd, endpoint, &home.join(name));
+        cmd
+    };
+    let prompt = &[Lit("?2004h")];
+
+    let mut idle = Session::spawn(command("side-idle-home"), 80, Box::new(std::io::sink()), Duration::from_secs(4))?;
+    idle.wait_for(prompt, "idle-side check had no prompt")?;
+    idle.send("/side new idle\r")?;
+    idle.wait_for(&[Lit("read-only, live workspace")], "idle-side check could not select a side")?;
+    idle.wait_for(prompt, "idle side prompt did not return")?;
+    idle.send("\x03")?;
+    idle.wait_for(
+        &[Lit("again to quit")],
+        "Ctrl-C with an idle selected side did not reach the normal prompt handler",
+    )?;
+    idle.wait_for(prompt, "idle side prompt did not recover after the first Ctrl-C")?;
+    idle.drain(0.2)?;
+    idle.send("\x03")?;
+    idle.finish().context("double Ctrl-C with an idle selected side did not quit")?;
+
+    let mut busy = Session::spawn(command("side-busy-home"), 80, Box::new(std::io::sink()), Duration::from_secs(12))?;
+    busy.wait_for(prompt, "busy-side check had no prompt")?;
+    busy.send("/side new busy\r")?;
+    busy.wait_for(&[Lit("read-only, live workspace")], "busy-side check could not select a side")?;
+    busy.wait_for(prompt, "busy side prompt did not return")?;
+    busy.send("side-cancel\r")?;
+    busy.wait_for(&[Lit("side question running")], "busy side task did not start")?;
+    busy.send("\x03")?;
+    busy.wait_for(&[Lit("side turn interrupted")], "first Ctrl-C did not cancel the selected child")?;
+    busy.send("/back\r")?;
+    busy.wait_for(&[Lit("main chat selected")], "parent did not survive child cancellation")?;
+    busy.wait_for(prompt, "parent prompt did not return after child cancellation")?;
+    busy.send("reply with just the word pong\r")?;
+    busy.wait_for(&[Lit("pong")], "parent could not run a turn after cancelling its child")?;
+    busy.wait_for(prompt, "parent prompt did not return after its turn")?;
+    busy.send("\x03")?;
+    busy.wait_for(&[Lit("again to quit")], "first prompt Ctrl-C after child cancellation did not offer to quit")?;
+    busy.wait_for(prompt, "parent prompt did not recover after the first prompt Ctrl-C")?;
+    busy.drain(0.2)?;
+    busy.send("\x03")?;
+    busy.finish().context("double Ctrl-C after child cancellation did not quit")?;
+    Ok(())
 }
 
 /// The line the expect script printed for an outcome.

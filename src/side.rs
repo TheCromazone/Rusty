@@ -55,7 +55,6 @@ pub struct Book {
     focus: Option<String>,
     children: BTreeMap<String, Child>,
     pub usage: Vec<(String, u64, u64)>,
-    idle_cancel: Arc<AtomicBool>,
 }
 struct Child {
     title: String,
@@ -89,9 +88,9 @@ pub fn running(book: &Shared) -> bool {
     book.focus.as_ref().is_some_and(|id| matches!(book.children[id].state, State::Running { .. }))
 }
 fn set_focus(book: &mut Book, id: Option<String>) {
-    let token = id.as_ref().and_then(|id| book.children.get(id)).map(|child| match &child.state {
-        State::Running { cancel, .. } => cancel.clone(),
-        _ => book.idle_cancel.clone(),
+    let token = id.as_ref().and_then(|id| book.children.get(id)).and_then(|child| match &child.state {
+        State::Running { cancel, .. } => Some(cancel.clone()),
+        State::Idle(_) => None,
     });
     book.focus = id;
     signal::focus_cancel(token);
@@ -270,7 +269,7 @@ fn poll_results(shared: &Shared) {
             child.state = State::Idle(agent);
             book.usage.push((model, prompt, completion));
             if book.focus.as_ref() == Some(&id) {
-                signal::focus_cancel(Some(book.idle_cancel.clone()));
+                signal::focus_cancel(None);
             }
         }
     }
