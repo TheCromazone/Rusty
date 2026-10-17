@@ -10,6 +10,7 @@ mod display;
 mod doctor;
 mod execution;
 mod footer;
+mod inbox;
 mod infra;
 mod llm;
 mod markdown;
@@ -558,6 +559,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
 
     loop {
         side::poll(&agent.side_parent()?);
+        agent.accept_side_summaries()?;
         // Queued and freshly typed input go through the same slash router.
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::primary("›"), queued);
@@ -672,12 +674,21 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         Some((c, r)) => (c, r.trim()),
         None => (input, ""),
     };
-    if side::focused(&agent.side_book) && !matches!(cmd, "/side" | "/back" | "/help" | "/?" | "/exit" | "/quit" | "/q")
+    if side::focused(&agent.side_book)
+        && !matches!(cmd, "/side" | "/back" | "/send" | "/help" | "/?" | "/exit" | "/quit" | "/q")
     {
         anyhow::bail!("use /back before changing main-chat settings or asking /btw");
     }
     match cmd {
-        "/side" | "/back" => side::command(&agent.side_parent()?, input)?,
+        "/side" | "/back" | "/send" => {
+            let parent = agent.side_parent()?;
+            side::command(&parent, input)?;
+            if cmd == "/send" {
+                side::wait(&parent);
+                agent.collect_side_usage();
+                agent.accept_side_summaries()?;
+            }
+        }
         "/exit" | "/quit" | "/q" => return Ok(true),
         "/help" | "/?" => print_help(cwd),
         "/clear" | "/new" => {

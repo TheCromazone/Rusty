@@ -83,7 +83,13 @@ fn serve(stream: TcpStream) -> Result<()> {
 
     out.write_all(b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")?;
     let mut sse = Sse(out);
-    if prompt == "aside-sentinel" {
+    let system = messages.first().map(text).unwrap_or_default();
+    let main_side_capture =
+        messages.iter().any(|m| role(m) == "user" && matches!(text(m).as_str(), "side-capture" | "summary-capture"))
+            && !system.contains("persistent read-only side discussion");
+    if system.starts_with("Summarize this read-only side discussion") {
+        sse.content("PTY_SIDE_SUMMARY: inspect idempotency before applying a retry.\n", Some("stop"))?;
+    } else if prompt == "aside-sentinel" {
         sse.content("ASIDE_ANSWER: this is a context-only answer.\n", Some("stop"))?;
     } else if prompt == "side-sentinel" {
         if tools == 0 {
@@ -96,7 +102,7 @@ fn serve(stream: TcpStream) -> Result<()> {
             pause(0.15);
             sse.content("side reasoning\n", None)?;
         }
-    } else if prompt == "aside-capture" || prompt == "side-capture" {
+    } else if prompt == "aside-capture" || main_side_capture {
         if tools == 0 {
             sse.call(
                 "running",
