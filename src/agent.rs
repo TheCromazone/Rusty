@@ -2918,3 +2918,44 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
         other => Answer::No(Some(other.to_string())),
     }
 }
+
+#[cfg(test)]
+mod stable_prompt_tests {
+    use super::*;
+
+    fn agent() -> Agent {
+        let endpoint = crate::llm::Endpoint::new(
+            crate::config::Provider::Compatible,
+            "http://127.0.0.1:1/v1".into(),
+            vec!["offline-test-key".into()],
+        );
+        let client = Arc::new(Client::new(vec![endpoint]).unwrap());
+        Agent::new(client, "test-model".into(), std::env::temp_dir(), Policy::new(Mode::Yolo))
+    }
+
+    #[test]
+    fn plan_and_running_commands_are_ephemeral_and_included_in_estimate() {
+        let mut agent = agent();
+        let system = agent.system_prompt();
+        let initial_estimate = agent.fixed_estimate();
+
+        agent.plan.push(PlanItem { text: "plan detail ".repeat(100), status: "in_progress".into() });
+        let plan_estimate = agent.fixed_estimate();
+        let plan_state = agent.live_state().unwrap();
+        assert!(plan_state.contains("Current plan:") && plan_state.contains("plan detail"));
+        assert!(plan_estimate > initial_estimate, "the plan note must be counted in the fixed context estimate");
+        assert_eq!(agent.system_prompt(), system, "changing the plan must not change the system prompt");
+
+        let command = format!("sleep 30; # {}", "activity detail ".repeat(100));
+        agent.activities.start(&command, 60).unwrap();
+        let activity_estimate = agent.fixed_estimate();
+        let live_state = agent.live_state().unwrap();
+        assert!(live_state.contains("Owned shell activities") && live_state.contains("activity detail"));
+        assert!(activity_estimate > plan_estimate, "a running activity must be counted in the fixed context estimate");
+        assert_eq!(agent.system_prompt(), system, "changing activities must not change the system prompt");
+
+        let persisted = agent.trajectory()["messages"].to_string();
+        assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
+        agent.activities.cancel_all(false);
+    }
+}
