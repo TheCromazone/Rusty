@@ -85,7 +85,18 @@ fn serve(stream: TcpStream) -> Result<()> {
     let mut sse = Sse(out);
     if prompt == "aside-sentinel" {
         sse.content("ASIDE_ANSWER: this is a context-only answer.\n", Some("stop"))?;
-    } else if prompt == "aside-capture" {
+    } else if prompt == "side-sentinel" {
+        if tools == 0 {
+            sse.call("read", "read_file", r#"{"path":"side-fact.txt"}"#)?;
+        } else {
+            sse.content("SIDE_ANSWER: inspected the local side fact.\n", Some("stop"))?;
+        }
+    } else if prompt == "side-cancel" {
+        for _ in 0..40 {
+            pause(0.15);
+            sse.content("side reasoning\n", None)?;
+        }
+    } else if prompt == "aside-capture" || prompt == "side-capture" {
         if tools == 0 {
             sse.call(
                 "running",

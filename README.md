@@ -484,3 +484,19 @@ plan, goal, verification or learned memory. Recent aside exchanges provide
 context for follow-up `/btw` questions. `/btw` alone shows the last answer.
 Asides use the same model client and root budget, and their usage is included
 in the session totals. They are temporary and disappear when the process exits.
+
+### Persistent read-only discussions
+
+`/side new <name>` starts a saved child conversation from the main context.
+Ask it follow-up questions and let it inspect local files with read-only tools.
+`/back` selects the main chat; `/side open <name or id>` returns to the child,
+and `/side list` shows saved children. A side has its own history and no parent
+goal or verification authority. Its findings stay out of the main conversation.
+
+Side commands also work while the main turn is running. Questions entered
+while a side is selected go to that side; `/back` changes focus without stopping
+its work. Ctrl-C targets a running selected side; quitting cancels and saves
+outstanding side turns. Settings commands require returning to main first.
+The shared checkout is live, not frozen, and side tools are classifier-enforced
+read-only, not an OS sandbox. Side tools are local-only for now, with no MCP
+servers or nested delegation. All model calls share the parent's root budget.

@@ -4160,3 +4160,59 @@ fn btw_followups_retain_only_the_private_aside_context() {
     assert!(!requests[2]["messages"].to_string().contains("PRIVATE_ASIDE_ANSWER"));
     assert!(!requests[2]["messages"].to_string().contains("PRIVATE_FIRST_QUESTION"));
 }
+
+#[test]
+fn persistent_sides_read_files_but_cannot_write_or_pollute_the_parent() {
+    let s = Sandbox::new("persistent-sides");
+    std::fs::write(s.project.join("sample.txt"), "OBSERVED_SIDE_FILE").unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        say("MAIN_SEED"),
+        tool_reply("read_file", serde_json::json!({"path":"sample.txt"})),
+        say("PRIVATE_SIDE_FACT"),
+        say("main continued"),
+        tool_reply("write_file", serde_json::json!({"path":"forbidden.txt","content":"bad"})),
+        say("write was refused"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    let shown = s.repl_with(
+        cmd,
+        &[
+            "remember MAIN_SEED",
+            "/side new research",
+            "inspect sample",
+            "/back",
+            "continue main",
+            "/side open research",
+            "try a write",
+            "/back",
+            "/quit",
+        ],
+    );
+    let r = server.join().unwrap();
+    assert_eq!(r.len(), 6);
+    assert!(r[1]["messages"].to_string().contains("MAIN_SEED"));
+    assert!(!r[1]["tools"].to_string().contains("write_file"));
+    assert!(r[2]["messages"].to_string().contains("OBSERVED_SIDE_FILE"));
+    assert!(!r[3]["messages"].to_string().contains("PRIVATE_SIDE_FACT"));
+    assert!(r[4]["messages"].to_string().contains("PRIVATE_SIDE_FACT"));
+    assert!(r[5]["messages"].to_string().contains("denied"));
+    assert!(!s.project.join("forbidden.txt").exists());
+    assert!(shown.contains("read-only, live workspace"));
+}
+
+#[test]
+fn a_saved_side_chat_reopens_after_restarting_the_parent() {
+    let s = Sandbox::new("side-restart");
+    let (url, server) = scripted_endpoint(vec![say("MAIN_SEED"), say("SAVED_SIDE_ANSWER")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["remember MAIN_SEED", "/side new saved", "first side question", "/back", "/quit"]);
+    assert_eq!(server.join().unwrap().len(), 2);
+    let (url, server) = scripted_endpoint(vec![say("resumed side")]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--continue", "--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["/side open saved", "follow up", "/back", "/quit"]);
+    let requests = server.join().unwrap();
+    assert!(requests[0]["messages"].to_string().contains("SAVED_SIDE_ANSWER"));
+}
