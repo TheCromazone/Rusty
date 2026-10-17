@@ -439,6 +439,7 @@ impl Client {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
             _ => format!("{}/models", ep.base_url),
         };
+        let _runtime = stream_runtime().enter();
         let v: Value = self
             .send_with(ep, &url, (None, "catalog"), None, retry)?
             .response
@@ -459,6 +460,7 @@ impl Client {
             return None;
         }
         let url = format!("{}/models", ep.base_url);
+        let _runtime = stream_runtime().enter();
         let v: Value = self.send_with(ep, &url, (None, "catalog"), None, Retry::Once).ok()?.response.json().ok()?;
         let entry = v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?;
         ["context_length", "max_model_len", "context_window", "max_context_length"]
@@ -485,6 +487,10 @@ impl Client {
         beta: Option<&str>,
         retry: Retry,
     ) -> Result<Sent> {
+        // The async read timeout is polled while blocking responses are
+        // consumed here too: error bodies and Codex refresh bodies need the
+        // same timer context as streamed and catalog responses.
+        let _runtime = stream_runtime().enter();
         let (body, role) = request;
         let reserve = body.map(reservation_tokens).transpose()?;
         let keys = &ep.keys;

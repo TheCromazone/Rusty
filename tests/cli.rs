@@ -2083,7 +2083,7 @@ fn retries_stop_at_the_budget() {
         .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 1 attempts") && err.contains("429"), "{err}");
+    assert!(err.contains("giving up after 1 attempts") && err.contains("429") && err.contains("slow down"), "{err}");
     assert_eq!(server.join().unwrap().len(), 1);
 }
 
@@ -2096,7 +2096,7 @@ fn a_refused_key_fails_fast() {
     let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
-    assert!(err.contains("giving up after 2 attempts") && err.contains("401"), "{err}");
+    assert!(err.contains("giving up after 2 attempts") && err.contains("401") && err.contains("bad key"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
     assert_eq!(server.join().unwrap().len(), 2);
 }
