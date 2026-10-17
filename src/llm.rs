@@ -8,8 +8,8 @@ use reqwest::blocking::Response;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::anthropic;
@@ -24,6 +24,55 @@ use crate::ui::truncate;
 const RETRY_SECS: u64 = 300;
 /// The longest single wait, whatever a Retry-After header asks for.
 const MAX_WAIT_SECS: u64 = 120;
+/// How long a stream may go quiet before it counts as dropped and is retried,
+/// unless `RUSTY_STREAM_IDLE_SECS` says otherwise. Codex waits five minutes;
+/// a model that is still working sends reasoning or keep-alive lines well
+/// within two.
+const STREAM_IDLE_SECS: u64 = 120;
+
+fn stream_idle() -> Duration {
+    let secs = std::env::var("RUSTY_STREAM_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(STREAM_IDLE_SECS);
+    Duration::from_secs(secs.clamp(1, 3600))
+}
+
+thread_local! {
+    /// Where this thread's request reports a retry wait, when someone is watching.
+    static STATUS: std::cell::RefCell<Option<Sender<Event>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tells whoever started this request what it is waiting for; silent otherwise.
+fn status(text: String) {
+    STATUS.with(|s| {
+        if let Some(tx) = s.borrow().as_ref() {
+            let _ = tx.send(Event::Status(text));
+        }
+    });
+}
+
+/// The lines of a streamed response, with the timer runtime entered while
+/// reqwest's blocking body is polled so its per-read timeout can fire.
+pub fn lines(resp: Response) -> impl Iterator<Item = std::io::Result<String>> {
+    let mut lines = BufReader::new(resp).lines();
+    std::iter::from_fn(move || {
+        let _runtime = stream_runtime().enter();
+        lines.next()
+    })
+}
+
+fn stream_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        // One shared timer worker, independent of CPU count and retry count.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()
+            .expect("stream timer runtime")
+    })
+}
 
 /// How hard a request tries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +101,8 @@ fn backoff(round: u32, retry_after: Option<u64>) -> Duration {
 pub enum Event {
     Reasoning(String),
     Content(String),
+    /// What the request is waiting on, such as a retry; empty when it moves on.
+    Status(String),
     Done(Result<Reply>),
 }
 
@@ -169,10 +220,11 @@ impl Client {
                  to use your ChatGPT account"
             );
         }
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(600))
-            .build()?;
+        let http = reqwest::blocking::ClientBuilder::from(
+            reqwest::Client::builder().connect_timeout(Duration::from_secs(20)).read_timeout(stream_idle()),
+        )
+        .timeout(Duration::from_secs(600))
+        .build()?;
         Ok(Self { http, endpoints, budget: crate::budget::Budget::unbounded() })
     }
 
@@ -242,6 +294,7 @@ impl Client {
         let (tx, rx) = channel();
         let me = self.clone();
         std::thread::spawn(move || {
+            STATUS.with(|s| *s.borrow_mut() = Some(tx.clone()));
             let result = me.chat(&model, &messages, &tools, temperature, inference, &mut |d| {
                 let ev = match d {
                     Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
@@ -386,6 +439,7 @@ impl Client {
             Provider::Anthropic => format!("{}/v1/models?limit=1000", ep.base_url),
             _ => format!("{}/models", ep.base_url),
         };
+        let _runtime = stream_runtime().enter();
         let v: Value = self
             .send_with(ep, &url, (None, "catalog"), None, retry)?
             .response
@@ -406,6 +460,7 @@ impl Client {
             return None;
         }
         let url = format!("{}/models", ep.base_url);
+        let _runtime = stream_runtime().enter();
         let v: Value = self.send_with(ep, &url, (None, "catalog"), None, Retry::Once).ok()?.response.json().ok()?;
         let entry = v["data"].as_array()?.iter().find(|m| m["id"].as_str() == Some(model))?;
         ["context_length", "max_model_len", "context_window", "max_context_length"]
@@ -432,6 +487,10 @@ impl Client {
         beta: Option<&str>,
         retry: Retry,
     ) -> Result<Sent> {
+        // The async read timeout is polled while blocking responses are
+        // consumed here too: error bodies and Codex refresh bodies need the
+        // same timer context as streamed and catalog responses.
+        let _runtime = stream_runtime().enter();
         let (body, role) = request;
         let reserve = body.map(reservation_tokens).transpose()?;
         let keys = &ep.keys;
@@ -581,12 +640,21 @@ fn settle(reservation: Option<crate::budget::Reservation>, result: &Result<Reply
 /// Sleeps for `wait`, or fails at once when Ctrl-C is pressed.
 fn wait_or_interrupt(wait: Duration, last_err: &str) -> Result<()> {
     let until = std::time::Instant::now() + wait;
+    let why = truncate(last_err.lines().next().unwrap_or(last_err), 60);
+    let mut shown = u64::MAX;
     while std::time::Instant::now() < until {
         if crate::signal::interrupted() {
+            status(String::new());
             bail!("interrupted while waiting to retry: {last_err}");
         }
-        std::thread::sleep(Duration::from_millis(100).min(until.saturating_duration_since(std::time::Instant::now())));
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.as_secs() != shown {
+            shown = left.as_secs();
+            status(format!("retrying in {}s · {why}", shown + 1));
+        }
+        std::thread::sleep(Duration::from_millis(100).min(left));
     }
+    status(String::new());
     Ok(())
 }
 
@@ -650,7 +718,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
     let mut saw_data = false;
     let mut raw = String::new();
 
-    for line in BufReader::new(resp).lines() {
+    for line in lines(resp) {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data {

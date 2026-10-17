@@ -11,7 +11,6 @@
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Response;
 use serde_json::{json, Map, Value};
-use std::io::{BufRead, BufReader};
 
 use crate::execution::ExecutionMode;
 use crate::llm::{Delta, Reply, ToolCall, Usage};
@@ -275,8 +274,7 @@ fn pair_tool_results(out: &mut Vec<Value>) {
 /// Reads the SSE stream into a `Reply`. Text and summarised thinking go to
 /// `on` as they arrive; returning false stops the stream.
 pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Reply> {
-    let mut lines = BufReader::new(resp).lines();
-    parse_lines(&mut std::iter::from_fn(|| lines.next()), on)
+    parse_lines(&mut crate::llm::lines(resp), on)
 }
 
 fn parse_lines(

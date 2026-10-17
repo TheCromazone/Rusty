@@ -1120,6 +1120,8 @@ impl Agent {
             self.temperature,
             (self.execution_mode, self.request_role, Some(cap)),
         );
+        // A retry wait borrows the status line and hands it back afterwards.
+        let status_before = d.status().to_string();
         loop {
             // Checked on every event: a model that streams steadily never goes quiet.
             if signal::interrupted() {
@@ -1135,6 +1137,7 @@ impl Agent {
             match rx.recv_timeout(Duration::from_millis(60)) {
                 Ok(Event::Reasoning(s)) => d.reasoning(&s),
                 Ok(Event::Content(s)) => d.content(&s),
+                Ok(Event::Status(s)) => d.set_status(if s.is_empty() { status_before.clone() } else { s }),
                 Ok(Event::Done(r)) => {
                     d.end_stream();
                     self.client.budget.remaining()?;
