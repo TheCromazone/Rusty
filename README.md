@@ -97,7 +97,7 @@ each request.
 <img src="docs/demo/focus.gif" alt="adhd view gives a three-bullet answer; memory, permission check and token breakdown" width="100%">
 
 `/view adhd` gets you one status line and an answer in three bullets.
-`/remember` saves a lesson for future sessions. `/permissions check` shows the
+`/remember` saves a lesson for future sessions. `/memory list` shows saved entries; `/memory search <words>` searches them. The model can call `recall` without a query to inspect the same saved entries, including their IDs, source and confidence. `/permissions check` shows the
 classifier at work: `rm -rf` asks first while `cargo test` just runs.
 `/tokens` shows where every token went.
 

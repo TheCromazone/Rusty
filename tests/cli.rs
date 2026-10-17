@@ -4110,3 +4110,45 @@ fn an_offered_lesson_stays_in_the_prompt_for_the_rest_of_the_turn() {
     assert_eq!(offered[0]["usage_index"], first, "{offered}");
     assert!(offered[0]["text"].as_str().unwrap().contains("STATS_SEED"), "{offered}");
 }
+
+#[test]
+fn the_model_can_list_saved_memories_after_an_unmatched_search() {
+    let s = Sandbox::new("memory-discovery");
+    let stored = s.repl_with(s.cmd(), &["/remember gotcha: run zephyr-build before testing", "/quit"]);
+    assert!(stored.contains("saved"), "{stored}");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("recall", serde_json::json!({"query":"unrelated_keyword_xyz"})),
+        tool_reply("recall", serde_json::json!({})),
+        text_reply("Your saved build lesson is available."),
+    ]);
+    let out =
+        s.cmd().env("RUSTY_BASE_URL", url).args(["--memory", "learn", "what memories did you save?"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 3);
+    let recall = requests[0]["tools"].as_array().unwrap().iter().find(|t| t["function"]["name"] == "recall").unwrap();
+    assert_eq!(recall["function"]["parameters"]["required"], serde_json::json!([]));
+    let search_result = requests[1]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap();
+    assert!(search_result["content"].as_str().unwrap().contains("Other memories may exist"));
+    let listing = requests[2]["messages"].as_array().unwrap().iter().rev().find(|m| m["role"] == "tool").unwrap()
+        ["content"]
+        .as_str()
+        .unwrap();
+    assert!(listing.contains("zephyr-build"), "{listing}");
+    assert!(listing.contains("confidence") && listing.contains("user"), "{listing}");
+    let manual = s.repl_with(s.cmd(), &["/memory list", "/quit"]);
+    assert!(manual.contains("zephyr-build"), "{manual}");
+}
+
+#[test]
+fn listing_an_empty_memory_store_is_explicit() {
+    let s = Sandbox::new("memory-empty-list");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("recall", serde_json::json!({"query":"  "})),
+        text_reply("No saved memories."),
+    ]);
+    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("list saved memories").output().unwrap();
+    assert!(out.status.success());
+    let r = server.join().unwrap();
+    assert!(r[1]["messages"].to_string().contains("No saved memories in this project or global user preferences."));
+}
