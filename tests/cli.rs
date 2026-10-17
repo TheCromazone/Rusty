@@ -4381,3 +4381,19 @@ fn a_worker_that_exhausts_its_steps_returns_partial_findings_as_incomplete() {
     assert!(lead.contains("slice 0 (incomplete: step limit)"), "{lead}");
     assert!(lead.contains("still investigating"));
 }
+
+#[test]
+fn side_capabilities_are_enforced_even_for_unadvertised_control_calls() {
+    let s = Sandbox::new("side-control-scope");
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("task", serde_json::json!({"description":"nested","prompt":"unrequested work"})),
+        say("side stopped"),
+    ]);
+    let mut cmd = s.cmd();
+    cmd.env("RUSTY_BASE_URL", url).args(["--mode", "standard", "--memory", "off"]);
+    s.repl_with(cmd, &["/side new scope", "inspect only", "/back", "/quit"]);
+    let r = server.join().unwrap();
+    assert_eq!(r.len(), 2);
+    assert!(r[1]["messages"].to_string().contains("a read-only side chat cannot delegate"));
+    assert!(!r[1]["messages"][0]["content"].as_str().unwrap().starts_with("You are a research worker"));
+}
