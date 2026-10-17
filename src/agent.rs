@@ -1291,6 +1291,24 @@ impl Agent {
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return format!("error: unknown tool `{}`; this run offers only bash", call.name);
         }
+        if self.side_meta.is_some()
+            && !matches!(
+                call.name.as_str(),
+                "read_file"
+                    | "list_files"
+                    | "search"
+                    | "glob"
+                    | "outline"
+                    | "bash"
+                    | "bash_start"
+                    | "bash_wait"
+                    | "bash_cancel"
+                    | "plan"
+                    | "compact"
+            )
+        {
+            return "denied: a read-only side chat cannot delegate, change memory or call external tools".into();
+        }
         if self.is_worker
             && !matches!(
                 call.name.as_str(),
