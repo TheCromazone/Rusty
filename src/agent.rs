@@ -672,9 +672,12 @@ impl Agent {
         if self.is_worker {
             let s = format!(
                 "You are a research worker for a coding agent, working in {}. Investigate the task you are given \
-                 with read-only tools and report back: findings first, with path:line references, then anything \
-                 uncertain. You cannot edit files. Prefer search, glob and outline over reading whole files. Stop \
-                 as soon as you can answer; your report should be under 400 words.\n{}",
+                 with read-only tools and report back. Start with References: one line per place that matters to \
+                 the answer, as path:start-end and a few words on what is there; the lead reads those lines next, \
+                 so list few and exact, and only lines you have seen. Then the answer in a few sentences, without \
+                 repeating what the references show, then anything uncertain. You cannot edit files. Prefer \
+                 search, glob and outline over reading whole files. Stop as soon as you can answer; your report \
+                 should be under 250 words.\n{}",
                 self.cwd.display(),
                 if self.board.is_some() {
                     "Other workers are investigating other parts at the same time. When you find something they \
@@ -901,7 +904,9 @@ impl Agent {
         ));
         let job = json!({"type": "object", "properties": {
             "description": {"type": "string", "description": "3-6 word label"},
-            "prompt": {"type": "string", "description": "Self-contained instructions; the worker can't see this conversation"}
+            "prompt": {"type": "string", "description": "Self-contained instructions; the worker can't see this conversation"},
+            "scope": {"type": "string", "description": "Where to look and what is out of bounds, e.g. 'src/cache only; ignore tests'"},
+            "done_when": {"type": "string", "description": "The answer that ends the task, e.g. 'the function that writes the cache, as path:line'"}
         }, "required": ["description", "prompt"]});
         if matches!(self.agents.mode, AgentsMode::Sub | AgentsMode::Auto) {
             defs.push(t(
@@ -2215,7 +2220,13 @@ impl Agent {
                             ))
                         ));
                     }
-                    reports[i] = format!("## {} ({})\n{}", desc, stop.label(), report);
+                    // Daytona and SSH workers' files aren't here to check against.
+                    let check = (self.backend.name() == "local")
+                        .then(|| crate::swarm::check_references(&self.cwd, &report))
+                        .flatten();
+                    // First, so trimming a long report can't cut it.
+                    let check = check.map(|c| format!("{c}\n\n")).unwrap_or_default();
+                    reports[i] = format!("## {} ({})\n{check}{}", desc, stop.label(), report);
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     signal::poll_keys();
@@ -3189,8 +3200,15 @@ fn take_history(messages: Arc<Vec<Value>>, len: usize) -> Vec<Value> {
     all
 }
 
+/// A worker's label and brief: the task, then its scope and when it is done.
 fn job(v: &Value) -> (String, String) {
-    (v["description"].as_str().unwrap_or("worker").to_string(), v["prompt"].as_str().unwrap_or("").to_string())
+    let mut brief = v["prompt"].as_str().unwrap_or("").to_string();
+    for (key, label) in [("scope", "Scope"), ("done_when", "Done when")] {
+        if let Some(text) = v[key].as_str().map(str::trim).filter(|t| !t.is_empty()) {
+            brief.push_str(&format!("\n\n{label}: {text}"));
+        }
+    }
+    (v["description"].as_str().unwrap_or("worker").to_string(), brief)
 }
 
 pub(crate) fn load_project_notes(cwd: &std::path::Path) -> String {

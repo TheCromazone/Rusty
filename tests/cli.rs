@@ -2141,6 +2141,42 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
     assert_eq!(std::fs::read_to_string(s.project.join("proof.txt")).unwrap(), "verified");
 }
 
+/// A subagent's brief carries its scope and stopping point, and the lead
+/// hears which of the worker's path:line references point at nothing.
+#[test]
+fn a_worker_gets_its_brief_and_the_lead_hears_about_bad_references() {
+    use serde_json::json;
+    let s = Sandbox::new("worker-brief");
+    std::fs::write(s.project.join("cache.py"), "def load():\n    pass\n\ndef save(d):\n    write(d)\n").unwrap();
+    let brief = json!({"description": "find the writer", "prompt": "Which function writes the cache?",
+        "scope": "cache.py only", "done_when": "the function, as path:line"});
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--yolo", "--memory", "off", "--mode", "standard", "--agents", "sub", "who writes the cache?"],
+        vec![
+            tool_reply("task", brief),
+            text_reply(
+                "References:\n- cache.py:4-5 save writes it\n- cache.py:40-44 a helper\n- store.py:2 the format",
+            ),
+            text_reply("save, in cache.py."),
+        ],
+    );
+    assert_eq!(requests.len(), 3);
+    let worker = requests[1]["messages"].to_string();
+    assert!(
+        worker.contains("Scope: cache.py only") && worker.contains("Done when: the function, as path:line"),
+        "{worker}"
+    );
+    assert!(worker.contains("Start with References"), "{worker}");
+    let report = requests[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+    assert!(report.contains("2 of the 3 path:line references"), "{report}");
+    assert!(
+        report.contains("cache.py:40-44 (cache.py has 5 lines)") && report.contains("store.py:2 (no such file)"),
+        "{report}"
+    );
+    assert!(!report.contains("cache.py:4-5 ("), "a good reference is not flagged: {report}");
+}
+
 #[test]
 fn unchanged_call_loop_stalls_the_turn_and_three_stalls_end_the_goal() {
     use serde_json::json;
