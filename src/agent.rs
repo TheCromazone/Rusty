@@ -1927,7 +1927,8 @@ impl Agent {
         let before = verification::fingerprint(&self.cwd)?;
         d.tool("bash", &args);
         let started = Instant::now();
-        let (status, stdout, stderr) = self.backend.shell(check.command(), check.timeout())?;
+        let cache = verification::CheckCache::new()?;
+        let (status, stdout, stderr) = self.backend.shell(&cache.command(check.command()), check.timeout())?;
         let output = infra::redact(&format!("stdout:\n{stdout}\nstderr:\n{stderr}")).0;
         let after = verification::fingerprint(&self.cwd);
         let observation_error = after

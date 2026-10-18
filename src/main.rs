@@ -1113,7 +1113,10 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 println!("  future goals have no fixed check; the current goal is unchanged");
             }
             value if value.starts_with("verify ") => {
-                let check = verification::CheckSpec::new(&value[7..], 120)?;
+                if agent.backend.name() != "local" {
+                    return Err(anyhow!("/goal verify requires local tools; remote acceptance is not qualified"));
+                }
+                let check = verification::CheckSpec::parse_interactive(&value[7..])?;
                 agent.goal_check = Some(check);
                 println!("  fixed check set for future goals; /goal pin <path> pins an acceptance file");
             }

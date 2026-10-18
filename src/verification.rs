@@ -15,6 +15,39 @@ const MAX_BYTES: u64 = 128 * 1024 * 1024;
 // external services or arbitrary native processes. Document the exclusions.
 const GENERATED: &[&str] = &[".git", "target", "__pycache__", ".pytest_cache"];
 
+/// A fresh private Python bytecode namespace for each executor-owned check.
+/// `-B` alone does not prevent Python from loading planted cached bytecode.
+pub struct CheckCache(PathBuf);
+impl CheckCache {
+    pub fn new() -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..100 {
+            let path = std::env::temp_dir().join(format!(
+                "rusty-check-cache-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate a fresh verification cache")
+    }
+    pub fn command(&self, command: &str) -> String {
+        let path = self.0.to_string_lossy().replace('\'', "'\"'\"'");
+        format!("export PYTHONPYCACHEPREFIX='{path}';\n{command}")
+    }
+}
+impl Drop for CheckCache {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckSpec {
     command: String,
@@ -39,6 +72,19 @@ impl CheckSpec {
             bail!("verification commands must use environment variables for credentials");
         }
         Ok(Self { command: command.into(), timeout_secs, pinned_files: Vec::new() })
+    }
+
+    /// `/goal verify [--timeout SECONDS] COMMAND`; commands stay literal shell text.
+    pub fn parse_interactive(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if let Some(rest) = value.strip_prefix("--timeout ") {
+            let (seconds, command) = rest
+                .trim_start()
+                .split_once(char::is_whitespace)
+                .context("usage: /goal verify --timeout SECONDS COMMAND")?;
+            return Self::new(command.trim_start(), seconds.parse().context("invalid verification timeout")?);
+        }
+        Self::new(value, 120)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -326,6 +372,59 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn fresh_cache_rejects_planted_bytecode_and_is_removed() {
+        use std::process::Command;
+        let workspace = Workspace::new();
+        fs::write(workspace.0.join("calc.py"), "def add(a, b): return a - b\n").unwrap();
+        let planted = Command::new("python3")
+            .current_dir(&workspace.0)
+            .args([
+                "-c",
+                r#"
+import importlib.util, marshal, pathlib, struct
+source = pathlib.Path('calc.py')
+cache = pathlib.Path(importlib.util.cache_from_source(str(source)))
+cache.parent.mkdir(exist_ok=True)
+st = source.stat()
+header = importlib.util.MAGIC_NUMBER + struct.pack('<III', 0, int(st.st_mtime), st.st_size)
+cache.write_bytes(header + marshal.dumps(compile('def add(a, b): return a + b', 'calc.py', 'exec')))
+"#,
+            ])
+            .status()
+            .unwrap();
+        assert!(planted.success());
+        let check = "python3 -B -c 'from calc import add; assert add(2, 3) == 5'";
+        assert!(Command::new("bash")
+            .current_dir(&workspace.0)
+            .args(["-c", check])
+            .env_remove("PYTHONPYCACHEPREFIX")
+            .status()
+            .unwrap()
+            .success());
+        let cache = CheckCache::new().unwrap();
+        let path = cache.0.clone();
+        assert!(!Command::new("bash")
+            .current_dir(&workspace.0)
+            .args(["-c", &cache.command(check)])
+            .status()
+            .unwrap()
+            .success());
+        drop(cache);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn interactive_timeout_is_explicit_and_bounded() {
+        let check = CheckSpec::parse_interactive("--timeout 7 python3 check.py").unwrap();
+        assert_eq!(check.timeout(), Duration::from_secs(7));
+        assert_eq!(check.command(), "python3 check.py");
+        assert_eq!(CheckSpec::parse_interactive("true").unwrap().timeout(), Duration::from_secs(120));
+        for bad in ["--timeout 0 true", "--timeout 601 true", "--timeout nope true", "--timeout 5"] {
+            assert!(CheckSpec::parse_interactive(bad).is_err(), "{bad}");
+        }
+    }
 
     struct Workspace(PathBuf);
     impl Workspace {

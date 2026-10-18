@@ -1221,7 +1221,7 @@ no key, so a harness can refuse an unsupported setting before any model call.
 Configure a fixed check before starting an interactive goal:
 
 ```text
-/goal verify python3 -B check_public.py
+/goal verify --timeout 120 python3 -B check_public.py
 /goal pin check_public.py
 /goal fix pagination while preserving ordering
 /goal status
@@ -1282,3 +1282,8 @@ Counters are checkpointed before execution and after the stop transition.
 A crash between checkpoints can leave a started attempt without a stop reason;
 its effects need inspection. Pinned criteria, checker usage, verification
 freshness and permission decisions retain their existing contracts.
+
+Fixed checks use a fresh private `PYTHONPYCACHEPREFIX` directory for each execution,
+removed afterward. This prevents Python from loading planted workspace bytecode;
+`-B` alone only disables writing bytecode. `/goal verify` requires local tools
+and accepts `--timeout SECONDS` from 1 to 600 (default 120).
