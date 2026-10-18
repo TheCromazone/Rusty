@@ -335,9 +335,9 @@ every write. Put them in `~/.config/rusty/hooks.json`:
 
 `matcher` lists tool names separated by `|` (MCP tools by their full
 `mcp__server__tool` name); leave it out, or use `*`, to match every tool.
-The command runs in the working directory with JSON on its stdin: `event`,
-`tool`, `args`, `cwd`, `session_id` when the session is saved, and after the
-call `result` and `ok`. It gets 60 seconds unless `timeout_secs` says
+The command runs through `bash -c`, the same shell as the `bash` tool, in the
+working directory with JSON on its stdin: `event`, `tool`, `args`, `cwd`,
+`session_id` when the session is saved, and after the call `result` and `ok`. It gets 60 seconds unless `timeout_secs` says
 otherwise (at most 600). What the exit code means:
 
 | Exit code | PreToolUse (before the call) | PostToolUse (after the call) |
@@ -349,6 +349,8 @@ otherwise (at most 600). What the exit code means:
 PreToolUse hooks run before any permission prompt, so a call a hook blocks
 never asks you. Hooks run for every call, including workers' and side
 chats'. Notes for the model are redacted like any other tool output.
+A PostToolUse hook that rewrites files, like a formatter, means the agent
+re-reads those files before it edits them again.
 Hooks run on your machine, so they only apply when the tools do: with
 remote tools (Daytona or SSH) they are off, and rusty says so at startup.
 Hooks are only read from `$HOME/.config/rusty/hooks.json`, never from the
