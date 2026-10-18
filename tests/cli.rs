@@ -5964,7 +5964,7 @@ fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
         .unwrap();
     writeln!(
         child.stdin.take().unwrap(),
-        "/goal verify python3 check.py\n/goal pin check.py\n/goal repair calc.py\n/goal status\n/exit"
+        "/goal verify --timeout 7 python3 check.py\n/goal pin check.py\n/goal repair calc.py\n/goal status\n/exit"
     )
     .unwrap();
     let out = wait(child, Duration::from_secs(15));
@@ -5972,6 +5972,7 @@ fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
     let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(trace["goal_outcome"], "verified");
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal"]["check"]["timeout_secs"], 7);
     assert!(String::from_utf8_lossy(&out.stdout).contains("verified:"));
     assert_eq!(server.join().unwrap().len(), 2);
 }
@@ -6089,4 +6090,65 @@ fn goal_allowance_does_not_reset_a_finite_resource_budget() {
     let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(ledger).unwrap()).unwrap();
     assert_eq!(ledger["requests"], 3);
     assert!(ledger["denied_requests"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn completion_contract_planted_python_bytecode_cannot_verify_broken_source() {
+    let s = Sandbox::new("pinned-bytecode");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2,3)==5\n").unwrap();
+    let planted = Command::new("python3").current_dir(&s.project).args(["-B", "-c", r#"
+import importlib.util, marshal, pathlib, struct, sys
+sys.pycache_prefix = None
+source = pathlib.Path('calc.py')
+cache = pathlib.Path(importlib.util.cache_from_source(str(source)))
+cache.parent.mkdir(exist_ok=True)
+st = source.stat()
+cache.write_bytes(importlib.util.MAGIC_NUMBER + struct.pack('<III', 0, int(st.st_mtime), st.st_size) + marshal.dumps(compile('def add(a, b): return a + b', 'calc.py', 'exec')))
+"#]).status().unwrap();
+    assert!(planted.success());
+    let control = Command::new("python3")
+        .current_dir(&s.project)
+        .args(["-B", "-c", "import sys; sys.pycache_prefix=None; from calc import add; assert add(2,3)==5"])
+        .status()
+        .unwrap();
+    assert!(control.success(), "negative control must load the planted bytecode");
+    let before = std::fs::read(s.project.join("calc.py")).unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("still broken")]);
+    let path = s.home.join("trace.json");
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc",
+                "--verify",
+                "python3 -B check.py",
+                "--verify-file",
+                "check.py",
+                "--trajectory",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(20),
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["claims"]["accepted"], 0);
+    assert_eq!(trace["verification"][0]["outcome"], "Failed");
+    assert_eq!(trace["verification"][0]["exit_code"], 1);
+    assert_eq!(std::fs::read(s.project.join("calc.py")).unwrap(), before);
+    assert_eq!(server.join().unwrap().len(), 2);
 }
