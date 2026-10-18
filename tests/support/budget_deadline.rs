@@ -1,5 +1,6 @@
 use super::*;
 use crate::budget::{Budget, Limits};
+use anyhow::Context;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -41,6 +42,7 @@ fn read_model_post(stream: &mut TcpStream) -> Result<()> {
     if !complete {
         bail!("request headers exceed fixture limit");
     }
+    anyhow::ensure!(headers.starts_with("POST "), "expected model POST, got {:?}", headers.lines().next());
     let size = size.filter(|size| *size <= 64 * 1024).ok_or_else(|| anyhow::anyhow!("unbounded request"))?;
     let mut body = vec![0; size];
     reader.read_exact(&mut body)?;
@@ -93,7 +95,9 @@ fn root_budget_deadline_stops_a_silent_response() {
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
         stream.flush()?;
         elapsed.store(600_000, Ordering::SeqCst);
-        released.recv_timeout(Duration::from_secs(60))?;
+        released
+            .recv_timeout(Duration::from_secs(60))
+            .context("silent response was not released before fixture watchdog")?;
         Ok(())
     });
     // Keep unrelated signal tests from changing this turn's cancellation.
@@ -132,9 +136,10 @@ fn root_budget_deadline_stops_a_silent_response() {
 struct ChildFixture(std::process::Child, bool);
 impl Drop for ChildFixture {
     fn drop(&mut self) {
-        // The fixture owns this group, including on an assertion failure.
+        // Keep the direct child in the harness group so outer cancellation
+        // also reaches it. This handle owns its PID only until wait/reap.
         if self.1 {
-            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.kill();
             self.1 = false;
             let _ = self.0.wait();
         }
@@ -150,15 +155,21 @@ impl Drop for FixtureDir {
 
 #[test]
 fn deadline_exit_closes_the_silent_transport() {
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root = FixtureDir(std::env::temp_dir().join(format!(
-        "rusty-deadline-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )));
-    std::fs::create_dir(&root.0).unwrap();
+    let root_path = std::env::var_os("RUSTY_UNIT_DEADLINE_FIXTURE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "rusty-deadline-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+        });
+    // Own cleanup only after exclusive creation succeeds.
+    std::fs::create_dir(&root_path).unwrap();
+    let root = FixtureDir(root_path);
     let clock = root.0.join("clock");
     std::fs::write(&clock, "0").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -175,10 +186,11 @@ fn deadline_exit_closes_the_silent_transport() {
             .env("RUSTY_INFRA", "off")
             .env("RUSTY_NO_DOTENV", "1")
             .env("RUSTY_STREAM_IDLE_SECS", "300")
+            .env("RUSTY_RETRY_SECS", "1")
+            .env("RUSTY_UNIT_DEADLINE_HOLD", std::env::var_os("RUSTY_UNIT_DEADLINE_HOLD").unwrap_or_default())
             .env("RUSTY_UNIT_DEADLINE_CLOCK", &clock)
             .env("RUSTY_UNIT_DEADLINE_URL", url)
             .current_dir(&root.0)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(output.try_clone().unwrap())
             .stderr(output)
@@ -186,34 +198,52 @@ fn deadline_exit_closes_the_silent_transport() {
             .unwrap(),
         true,
     );
-    let server = std::thread::spawn(move || -> Result<()> {
-        let end = Instant::now() + Duration::from_secs(60);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(pair) => break pair,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
-                    std::thread::sleep(Duration::from_millis(1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let (completed, completion) = mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let end = Instant::now() + Duration::from_secs(60);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < end
+                            && !stopping.load(Ordering::SeqCst) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
+            };
+            read_model_post(&mut stream)?;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
+            stream.flush()?;
+            let next = clock.with_extension("next");
+            std::fs::write(&next, "600000")?;
+            std::fs::rename(next, clock)?;
+            let mut byte = [0];
+            if stream
+                .read(&mut byte)
+                .context("deadline child did not close the silent response before fixture watchdog")?
+                != 0
+            {
+                bail!("deadline exit must close the silent response");
             }
-        };
-        read_model_post(&mut stream)?;
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
-        stream.flush()?;
-        let next = clock.with_extension("next");
-        std::fs::write(&next, "600000")?;
-        std::fs::rename(next, clock)?;
-        let mut byte = [0];
-        if stream.read(&mut byte)? != 0 {
-            bail!("deadline exit must close the silent response");
-        }
-        Ok(())
+            Ok(())
+        })();
+        let _ = completed.send(result.is_err());
+        result
     });
     let end = Instant::now() + Duration::from_secs(120);
     let outcome = loop {
+        if completion.try_recv() == Ok(true) {
+            break Err("silent transport fixture failed".to_string());
+        }
         match child.0.try_wait() {
             Ok(Some(status)) => {
-                child.1 = false; // try_wait reaped: never signal this group again.
+                child.1 = false; // try_wait reaped: never signal this PID again.
                 break Ok(status);
             }
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(1)),
@@ -224,34 +254,29 @@ fn deadline_exit_closes_the_silent_transport() {
             }
         }
     };
+    if !outcome.as_ref().is_ok_and(|status| status.success()) {
+        stop.store(true, Ordering::SeqCst);
+    }
     if outcome.is_err() && child.1 {
-        unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL) };
+        let _ = child.0.kill();
         child.1 = false;
         let _ = child.0.wait();
     }
     // Join before asserting so every failure path closes the mock as well.
     let server_result = server.join();
-    let end = Instant::now() + Duration::from_secs(60);
-    let group_absent = loop {
-        // Nonblocking reap attempts never restore signal authority, including
-        // after an earlier observation error.
-        let _ = child.0.try_wait();
-        if unsafe { libc::kill(-(child.0.id() as i32), 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
-            break true;
-        }
-        if Instant::now() >= end {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
-    // Group absence is observation-only after reap, never signal authority.
     let mut log = String::new();
     std::fs::File::open(root.0.join("child.log")).unwrap().take(64 * 1024).read_to_string(&mut log).unwrap();
-    assert!(outcome.unwrap().success(), "{log}");
-    assert!(group_absent, "deadline child group must be gone before fixture cleanup");
-    server_result.unwrap().unwrap();
+    let server_result =
+        server_result.map_err(|_| "fixture thread panicked".to_string()).and_then(|r| r.map_err(|e| format!("{e:#}")));
+    assert!(outcome.as_ref().is_ok_and(|status| status.success()), "{outcome:?}; fixture: {server_result:?}\n{log}");
+    server_result.unwrap();
+    let process: Value = serde_json::from_slice(&std::fs::read(root.0.join("process.json")).unwrap()).unwrap();
+    assert_eq!(process["pid"].as_u64(), Some(child.0.id() as u64));
+    assert_eq!(
+        process["pgid"].as_i64(),
+        Some(unsafe { libc::getpgrp() } as i64),
+        "child must remain contained by the outer harness group"
+    );
     let trace: Value = serde_json::from_slice(&std::fs::read(root.0.join("outcome.json")).unwrap()).unwrap();
     assert_eq!(trace["requests"], 1);
     assert_eq!(trace["unknown_usage_requests"], 1);
@@ -265,6 +290,14 @@ fn deadline_child() {
     let Some(clock) = std::env::var_os("RUSTY_UNIT_DEADLINE_CLOCK") else { return };
     let clock = PathBuf::from(clock);
     let outcome = clock.with_file_name("outcome.json");
+    let process = json!({"pid":std::process::id(), "pgid":unsafe { libc::getpgrp() }});
+    std::fs::write(clock.with_file_name("process.json"), serde_json::to_vec(&process).unwrap()).unwrap();
+    if let Some(ready) = std::env::var_os("RUSTY_UNIT_DEADLINE_HOLD").filter(|value| !value.is_empty()) {
+        std::fs::write(ready, serde_json::to_vec(&process).unwrap()).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
     let budget = Budget::new_with_clock(
         Limits { seconds: 600, ..Limits::default() },
         Arc::new(move || Duration::from_millis(std::fs::read_to_string(&clock).unwrap().parse().unwrap())),
