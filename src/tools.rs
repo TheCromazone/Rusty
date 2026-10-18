@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use crate::signal;
 use crate::ui::{self, truncate};
 
-const MAX_OUTPUT: usize = 30_000;
-const SKIP_DIRS: &[&str] =
-    &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
+use rusty::workspace_query::{self, SKIP_DIRS};
+
+const MAX_OUTPUT: usize = workspace_query::RENDER_BYTES;
 
 /// The built-in tool schemas. They never change, so they are built once.
 pub fn definitions() -> &'static Value {
@@ -43,13 +43,13 @@ fn build_definitions() -> Value {
             "path": {"type": "string", "description": "Directory (default .)"},
             "max_depth": {"type": "integer", "description": "Default 3"}
         }), &[]),
-        tool("search", "Search file contents with a regex (ripgrep if installed, else grep). Smart case. Returns file:line:text. The cheapest way to find where something lives.", json!({
+        tool("search", "Search file contents with ripgrep smart-case regex and default ignore rules. Reports scan completeness separately from output truncation. Grep fallback has reduced semantics and is marked incomplete. Retrieval is not acceptance evidence.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory or file (default .)"},
             "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
             "context": {"type": "integer", "description": "Lines of context around each match (default 0)"}
         }), &["pattern"]),
-        tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents.", json!({
+        tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents. Skips build directories; includes hidden files; does not apply ignore files. Reports incomplete enumeration and skipped paths.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory to search (default .)"}
         }), &["pattern"]),
@@ -364,82 +364,100 @@ fn edit_file(args: &Value) -> Result<String> {
 
 fn list_files(args: &Value) -> Result<String> {
     let root = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
-    let max_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
+    let requested_depth = args["max_depth"].as_u64().unwrap_or(3) as usize;
+    let max_depth = requested_depth.min(128);
     let mut entries = Vec::new();
-    walk(Path::new(root), Path::new(root), 0, max_depth, &mut entries)?;
+    let mut scan = workspace_query::Enumeration::default();
+    if requested_depth > max_depth {
+        scan.skip(Path::new(root), "requested listing depth exceeds safety limit of 128");
+    }
+    walk(Path::new(root), Path::new(root), 0, max_depth, &mut entries, &mut scan);
     let total = entries.len();
     entries.truncate(500);
     let mut out = entries.join("\n");
     if total > 500 {
         let _ = write!(out, "\n… {} more entries (narrow the path or depth)", total - 500);
     }
-    Ok(if out.is_empty() { "(empty)".into() } else { out })
+    let truncated = total > 500 || out.len() > workspace_query::OUTPUT_BYTES;
+    if scan.incomplete || truncated {
+        out = format!(
+            "[requested depth={requested_depth} effective depth={max_depth}; deeper paths outside scope]\n{out}"
+        );
+    }
+    Ok(scan.render(truncate(&out, workspace_query::OUTPUT_BYTES), truncated))
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<String>) -> Result<()> {
-    let mut items: Vec<_> =
-        fs::read_dir(dir).with_context(|| format!("cannot list {}", dir.display()))?.filter_map(|e| e.ok()).collect();
+fn walk(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<String>,
+    scan: &mut workspace_query::Enumeration,
+) {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            scan.skip(dir, e);
+            return;
+        }
+    };
+    let mut items = Vec::new();
+    for (i, entry) in rd.take(2001).enumerate() {
+        if i == 2000 {
+            scan.skip(dir, "listing budget reached; remaining entries not enumerated");
+            break;
+        }
+        match entry {
+            Ok(entry) => items.push(entry),
+            Err(e) => scan.skip(dir, e),
+        }
+    }
     items.sort_by_key(|e| e.file_name());
     for e in items {
+        if out.len() >= 2000 {
+            scan.skip(dir, "listing budget reached; remaining entries/subtrees not scanned");
+            break;
+        }
         let name = e.file_name().to_string_lossy().to_string();
         let path = e.path();
         let rel = path.strip_prefix(root).unwrap_or(&path).display().to_string();
-        if path.is_dir() {
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                scan.skip(&path, e);
+                continue;
+            }
+        };
+        if metadata.is_dir() {
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
             out.push(format!("{rel}/"));
-            if depth + 1 < max_depth && out.len() < 2000 {
-                walk(root, &path, depth + 1, max_depth, out)?;
+            if depth + 1 < max_depth {
+                match e.file_type() {
+                    Ok(t) if t.is_symlink() => scan.skip(&path, "directory symlink not followed"),
+                    Ok(_) => walk(root, &path, depth + 1, max_depth, out, scan),
+                    Err(e) => scan.skip(&path, e),
+                }
             }
         } else {
             out.push(rel);
         }
     }
-    Ok(())
 }
 
 fn search(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
     let path = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
-    let context = args["context"].as_u64().unwrap_or(0).min(10).to_string();
-    let output = if has_rg() {
-        let mut cmd = Command::new("rg");
-        cmd.args(["--line-number", "--no-heading", "--color", "never", "--smart-case", "--max-columns", "300"]);
-        cmd.args(["--max-count", "30", "-C", &context]);
-        if let Some(g) = args["glob"].as_str() {
-            cmd.args(["-g", g]);
-        }
-        cmd.args(["-e", pattern, path]).output()?
-    } else {
-        let mut cmd = Command::new("grep");
-        cmd.args(["-rnEI", "-C", &context]);
-        for d in SKIP_DIRS {
-            cmd.arg(format!("--exclude-dir={d}"));
-        }
-        if let Some(g) = args["glob"].as_str() {
-            cmd.arg(format!("--include={g}"));
-        }
-        cmd.args(["-e", pattern, path]).output()?
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.trim().is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Ok(if stderr.trim().is_empty() { "no matches".into() } else { format!("error: {}", stderr.trim()) });
-    }
-    let mut lines = stdout.lines();
-    let mut out = String::new();
-    for (i, line) in lines.by_ref().take(200).enumerate() {
-        if i > 0 {
-            out.push('\n');
-        }
-        out.push_str(line);
-    }
-    let remaining = lines.count();
-    if remaining > 0 {
-        let _ = write!(out, "\n… {remaining} more matches");
-    }
-    Ok(cap(out))
+    Ok(workspace_query::search_cancellable(
+        pattern,
+        path,
+        args["glob"].as_str(),
+        args["context"].as_u64().unwrap_or(0),
+        signal::interrupted,
+    )?
+    .render())
 }
 
 fn bash(args: &Value) -> Result<String> {
@@ -679,38 +697,12 @@ fn drain(mut pipe: impl Read) -> Vec<u8> {
     out
 }
 
-fn has_rg() -> bool {
-    static RG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *RG.get_or_init(|| Command::new("rg").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok())
-}
-
-/// Every file under `root`, skipping build and dependency directories.
-fn files_under(root: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = fs::read_dir(root) else { return };
-    let mut items: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-    items.sort_by_key(|e| e.file_name());
-    for e in items {
-        if out.len() >= 20_000 {
-            return;
-        }
-        let path = e.path();
-        let name = e.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            if !SKIP_DIRS.contains(&name.as_str()) {
-                files_under(&path, out);
-            }
-        } else {
-            out.push(path);
-        }
-    }
-}
-
 fn glob(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
     let root = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
-    let mut files = Vec::new();
-    files_under(Path::new(root), &mut files);
-    let hits: Vec<String> = files
+    let scan = workspace_query::files_under(Path::new(root));
+    let hits: Vec<String> = scan
+        .files
         .iter()
         .filter_map(|p| {
             let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().trim_start_matches("./").to_string();
@@ -720,13 +712,17 @@ fn glob(args: &Value) -> Result<String> {
         })
         .collect();
     if hits.is_empty() {
-        return Ok("no files match".into());
+        return Ok(scan.render(
+            if scan.incomplete { "no files observed; enumeration incomplete" } else { "no files match" },
+            false,
+        ));
     }
     let mut out = hits.iter().take(300).cloned().collect::<Vec<_>>().join("\n");
     if hits.len() > 300 {
         let _ = write!(out, "\n… {} more", hits.len() - 300);
     }
-    Ok(out)
+    let truncated = hits.len() > 300 || out.len() > workspace_query::OUTPUT_BYTES;
+    Ok(scan.render(truncate(&out, workspace_query::OUTPUT_BYTES), truncated))
 }
 
 /// Glob matching: `*` and `?` stay within one path segment, `**` crosses them.
@@ -802,26 +798,45 @@ const DEF_PREFIXES: &[&str] = &[
 fn outline(args: &Value) -> Result<String> {
     let path = Path::new(arg(args, "path")?);
     if path.is_file() {
-        return outline_file(path).map(|o| if o.is_empty() { "(no definitions found)".into() } else { o });
+        let o = outline_file(path)?;
+        let truncated = o.len() > workspace_query::OUTPUT_BYTES;
+        return Ok(workspace_query::Enumeration::default().render(
+            if o.is_empty() { "(no definitions found)" } else { truncate(&o, workspace_query::OUTPUT_BYTES) },
+            truncated,
+        ));
     }
-    let mut files = Vec::new();
-    files_under(path, &mut files);
-    files.retain(|f| f.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXT.contains(&e)));
+    let mut scan = workspace_query::files_under(path);
+    let files: Vec<_> = scan
+        .files
+        .iter()
+        .filter(|f| f.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXT.contains(&e)))
+        .cloned()
+        .collect();
     let mut out = String::new();
-    for f in files.iter().take(60) {
-        if let Ok(o) = outline_file(f) {
-            if !o.is_empty() {
-                let _ = writeln!(out, "## {}\n{o}", f.display());
-            }
-        }
-        if out.len() > MAX_OUTPUT {
+    for (i, f) in files.iter().enumerate() {
+        if i >= 60 || out.len() >= workspace_query::OUTPUT_BYTES {
+            scan.skip(f, format!("outline budget reached; {} eligible files not read", files.len() - i));
             break;
         }
+        match outline_file(f) {
+            Ok(o) if !o.is_empty() => {
+                let _ = writeln!(out, "## {}\n{o}", f.display());
+            }
+            Ok(_) => {}
+            Err(e) => scan.skip(f, e),
+        }
     }
-    if files.len() > 60 {
-        let _ = writeln!(out, "… {} more files; outline a subdirectory", files.len() - 60);
-    }
-    Ok(cap(if out.is_empty() { "(no definitions found)".into() } else { out }))
+    let truncated = out.len() > workspace_query::OUTPUT_BYTES;
+    let body = if out.is_empty() {
+        if scan.incomplete {
+            "(no definitions observed; outline incomplete)"
+        } else {
+            "(no definitions found)"
+        }
+    } else {
+        truncate(&out, workspace_query::OUTPUT_BYTES)
+    };
+    Ok(scan.render(body, truncated))
 }
 
 fn outline_file(path: &Path) -> Result<String> {
@@ -1007,6 +1022,65 @@ os._exit(0)
             let mut eof = [0];
             assert_eq!(control.read(&mut eof).unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn query_tools_honor_run_scoped_cancellation() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = signal::cancel_scope(cancel);
+        let out = search(&json!({"pattern":"needle"})).unwrap();
+        assert!(out.contains("termination=cancelled") && out.contains("scan_complete=false"));
+    }
+
+    #[test]
+    fn query_tools_report_scope_skips_and_mutations() {
+        let dir = std::env::temp_dir().join(format!("rusty-query-tools-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let args = json!({"path": dir, "pattern": "**/*.rs"});
+        assert!(glob(&args).unwrap().contains("no files match"));
+        fs::write(dir.join("first.rs"), "fn first() {}\n").unwrap();
+        assert!(glob(&args).unwrap().contains("first.rs"));
+        fs::rename(dir.join("first.rs"), dir.join("second.rs")).unwrap();
+        let renamed = glob(&args).unwrap();
+        assert!(renamed.contains("second.rs") && !renamed.contains("first.rs"));
+        fs::write(dir.join("bad.rs"), [0xff]).unwrap();
+        let outline = outline(&json!({"path":dir})).unwrap();
+        assert!(outline.contains("scan_complete=false") && outline.contains("bad.rs"));
+        assert!(outline.contains("fn first()"));
+        let missing = json!({"path": dir.join("missing"), "pattern": "*.rs"});
+        let g = glob(&missing).unwrap();
+        assert!(g.contains("scan_complete=false") && !g.contains("no files match"));
+        let l = list_files(&missing).unwrap();
+        assert!(l.contains("scan_complete=false") && l.contains("missing"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn outline_unread_files_are_incomplete_not_merely_display_truncated() {
+        let dir = std::env::temp_dir().join(format!("rusty-outline-budget-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..61 {
+            fs::write(dir.join(format!("{i:03}.rs")), "fn f() {}\n").unwrap();
+        }
+        let out = outline(&json!({"path":dir})).unwrap();
+        assert!(out.contains("scan_complete=false output_truncated=false"));
+        assert!(out.contains("1 eligible files not read"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn small_query_enumerations_keep_plain_output_and_outline_signatures_are_bounded() {
+        let dir = std::env::temp_dir().join(format!("rusty-outline-signatures-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.rs");
+        fs::write(&path, format!("fn huge_{}() {{\nfn second() {{\n", "é".repeat(1000))).unwrap();
+        assert_eq!(list_files(&json!({"path":dir})).unwrap(), "small.rs");
+        assert_eq!(glob(&json!({"path":dir,"pattern":"*.rs"})).unwrap(), "small.rs");
+        let text = outline(&json!({"path":path})).unwrap();
+        assert!(!text.starts_with("[query"));
+        assert!(text.lines().next().unwrap().len() <= 167);
+        assert!(text.contains("fn second()"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -56,7 +56,7 @@ An agent's tools should be the ones a strong engineer reaches for in a
 terminal, shaped so each call returns as little as possible while still
 answering the question.
 
-1. **Locate before you read.** `search` (ripgrep, smart case, per-file caps,
+1. **Locate before you read.** `search` (ripgrep, smart case, bounded display,
    optional context lines and globs) answers "where", `glob` answers "which
    files", and `outline` answers "what's in here" with signatures and line
    numbers. Only then `read_file`, for a range.
@@ -67,6 +67,9 @@ answering the question.
    head-and-tail so the error at the end is never lost.
 4. **Every output is bounded.** Long results are capped and marked as
    truncated, and old results shrink as the conversation grows.
+
+See [workspace queries](WORKSPACE_QUERIES.md) for retrieval scope, completeness,
+and offline correctness checks. Retrieval alone is not task acceptance evidence.
 
 ## Token allocation
 

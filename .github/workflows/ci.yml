@@ -27,6 +27,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Query test prerequisite
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            case "$RUNNER_OS" in
+              Linux) sudo apt-get update && sudo apt-get install --yes ripgrep ;;
+              macOS) brew install ripgrep ;;
+              *) echo "Unsupported query test platform: $RUNNER_OS" >&2; exit 1 ;;
+            esac
+          fi
+          rg --version
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
