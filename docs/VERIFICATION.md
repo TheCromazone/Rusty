@@ -1331,3 +1331,9 @@ Regression coverage includes clear/resume with an unusable global temporary
 directory, explicit-export order and redaction, failed transition/lease recovery,
 and a subprocess-enforced file-size limit asserting `EFBIG` and rollback.
 A file-size limit is not a claim of testing a genuinely full filesystem.
+
+MCP outcome totals are computed after assembling spooled, compacted and active
+messages, so clear/resume does not omit earlier session outcomes from an export.
+The private per-message outcome metadata stays in the trajectory and is omitted
+from provider requests. A combined clear/resume/export regression checks this
+ordering, aggregation and provider privacy together.

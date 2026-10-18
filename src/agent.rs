@@ -3412,6 +3412,49 @@ mod stable_prompt_tests {
     }
 
     #[test]
+    fn archived_mcp_outcomes_survive_clear_resume_and_stay_private() {
+        let dir = SessionTestDir::new();
+        let mut agent = agent();
+        agent.session_path = Some(dir.0.join("current.json"));
+        agent.trajectory_path = Some(dir.0.join("export.json"));
+        let conversation = |id: &str, outcome: &str| {
+            vec![
+                json!({"role":"user","content":id}),
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":"mcp__fixture__apply","arguments":"{}"}}]}),
+                json!({"role":"tool","tool_call_id":id,"content":format!("effect {outcome}"),"_mcp_outcome":outcome}),
+            ]
+        };
+        let first = conversation("first", "unknown");
+        let second = conversation("second", "not_started");
+        let resumed = conversation("resumed", "settled");
+        agent.history = first.clone();
+        agent.clear().unwrap();
+        agent.history = second.clone();
+        let incoming = dir.0.join("incoming.json");
+        rusty::privacy::write_json(&incoming, json!({"history":resumed})).unwrap();
+        agent.load_session(&incoming).unwrap();
+        let trace = agent.trajectory().unwrap();
+        let expected: Vec<_> = first.into_iter().chain(second).chain(resumed).collect();
+        assert_eq!(trace["messages"], json!(expected));
+        assert_eq!(trace["mcp_outcomes"], json!({"unknown":1,"not_started":1,"settled":1}));
+        let messages = trace["messages"].as_array().unwrap();
+        let public = serde_json::to_value(crate::anthropic::Public(messages)).unwrap();
+        let (_, anthropic) = crate::anthropic::convert(messages);
+        let (_, codex) = crate::codex::convert(messages);
+        for request in [public, json!(anthropic), json!(codex)] {
+            let request = request.to_string();
+            assert!(!request.contains("_mcp_outcome"));
+            for outcome in ["unknown", "not_started", "settled"] {
+                assert!(request.contains(&format!("effect {outcome}")));
+            }
+        }
+        agent.write_trajectory().unwrap();
+        let exported: Value = serde_json::from_slice(&std::fs::read(dir.0.join("export.json")).unwrap()).unwrap();
+        assert_eq!(exported["messages"], trace["messages"]);
+        assert_eq!(exported["mcp_outcomes"], trace["mcp_outcomes"]);
+    }
+
+    #[test]
     fn mcp_result_metadata_is_private_for_every_provider_serializer() {
         let mut agent = agent();
         agent.history = vec![
