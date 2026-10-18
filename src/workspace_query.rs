@@ -726,6 +726,8 @@ mod tests {
         bounded.feed(b"1:needle\n");
         assert!(!bounded.complete && !bounded.match_limit_possible && bounded.pending.is_empty());
         assert!(bounded.pending.capacity() <= OUTPUT_BYTES);
+        // Exercise path-budget exhaustion independently of the malformed frame.
+        let mut bounded = RgAudit::new();
         for file in 0..1000 {
             bounded.feed(format!("{file:04}{}\0", "p".repeat(100)).as_bytes());
             bounded.feed(b"1:needle\n");
