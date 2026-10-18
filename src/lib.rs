@@ -4,6 +4,7 @@ pub mod advisor;
 pub mod cloud;
 pub mod privacy;
 pub mod recall;
+pub mod workspace_query;
 
 /// Seconds since the Unix epoch.
 pub fn unix_now() -> u64 {
