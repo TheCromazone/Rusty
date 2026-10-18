@@ -54,11 +54,14 @@ jobs:
           echo "RUSTY_TEST_SSH_CONFIG=$fixture/client" >> "$GITHUB_ENV"
           echo "RUSTY_TEST_SSH_WORKSPACE=$fixture/workspace" >> "$GITHUB_ENV"
           echo "RUSTY_TEST_SSH_AUTHORIZED_KEYS=$fixture/authorized_keys" >> "$GITHUB_ENV"
+      - name: Verify fixture authentication before testing the transport
+        run: ssh -F "$RUSTY_TEST_SSH_CONFIG" -oBatchMode=yes -oStrictHostKeyChecking=yes rusty-ci true
       - name: Real network concurrency, tools, timeout and revoked authentication
         run: cargo test --lib --locked cloud::ssh::tests::real_openssh_network -- --ignored --exact --nocapture
       - name: Stop disposable server
         if: always()
         run: |
           fixture="$RUNNER_TEMP/rusty-ssh"
+          if test -f "$fixture/server.log"; then sudo cat "$fixture/server.log"; fi
           if test -f "$fixture/sshd.pid"; then sudo kill "$(cat "$fixture/sshd.pid")"; fi
           rm -f "$fixture/identity" "$fixture/host"
