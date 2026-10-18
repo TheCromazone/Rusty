@@ -51,7 +51,7 @@ concurrency:
 jobs:
   check:
     if: inputs.suite != 'demo'
-    name: check
+    name: ${{ github.event.action == 'edited' && 'conventions' || 'check' }}
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     # Hosted run 39110575738 completed check in 309s; 15m leaves 591s headroom.
     # Revisit against scale-1 timings and cache/toolchain changes.
