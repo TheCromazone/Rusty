@@ -34,7 +34,7 @@ jobs:
           AuthorizedKeysFile $fixture/authorized_keys
           PasswordAuthentication no
           KbdInteractiveAuthentication no
-          UsePAM no
+          UsePAM yes
           StrictModes no
           MaxStartups 4:100:4
           AllowUsers $(id -un)
