@@ -537,6 +537,7 @@ pub fn banner(b: &BannerInfo) {
                 cells
             ))
         );
+        println!("{}", bold(&fit(&format!("provider {}", b.provider), cells)));
         println!("{}", info(&fit(&format!("model {}", b.model), cells)));
         // Permissions remain visible even in narrow splits.
         let mode = fit(&format!("permissions {} · {}", b.perms, b.exec), cells);

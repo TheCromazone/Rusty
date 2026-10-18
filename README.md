@@ -378,6 +378,34 @@ Anthropic's Messages API, bare `gpt-*` and `o4`-style ids to OpenAI, and
 anything else (including `openai/...` ids on NVIDIA) to the compatible
 endpoint. `RUSTY_PROVIDER=anthropic|openai|compatible|codex` overrides the guess.
 
+**Direct shell:** type `!pwd`, `!git status`, or `! command` at the prompt.
+The input switches to an amber shell label. Rusty runs it without a model
+request, shows stdout/stderr and the exit code, and keeps the redacted result
+in conversation context for your next question. Permissions and infrastructure
+checks still apply; Ctrl-C stops the command. Commands use the current tool
+location (local or Daytona), are non-interactive, and have a 120-second limit.
+Each command starts a fresh shell: use `!cd directory && command` when needed.
+Use your ordinary terminal for interactive programs such as `ssh` or `vim`.
+
+The provider line distinguishes saved credentials from a successful model
+response. `unverified` means no response has completed in this process for that
+model; `response OK` records a completed response, not an ongoing connectivity
+promise. Failures and interrupted responses remain visible. `/doctor` can probe
+provider model catalogs, but a cached Codex model list is never a live check.
+
+**Codex settings:** `/codex models` lists cached model names; `/codex model` shows the shared default;
+`/codex model <id>` updates the top-level model in `$CODEX_HOME/config.toml`
+(or `~/.codex/config.toml`) and applies it to a currently Codex-routed session.
+Profile models and unrelated settings stay intact; a private timestamped backup
+is saved beside the file. `/model <id>` still changes only the current session.
+`/codex config` opens the full config using `$VISUAL`, `$EDITOR`, or `vi`, so you
+can edit reasoning effort, profiles and other Codex settings. Those other
+settings are Codex settings, not Rusty runtime controls; Rusty uses its own
+`/mode` controls. Restart Codex to pick up edited defaults.
+
+On a light terminal background, select `/theme paper`; use `/theme rust` with
+the dark cmux/Ghostty preset. The terminal background is independent of the skin.
+
 **Signed in to Codex?** rusty can use that ChatGPT account instead of a key.
 It reads the tokens `codex login` saved in `~/.codex/auth.json` (`CODEX_HOME`
 to point elsewhere), talks to the Codex backend's Responses API, refreshes the

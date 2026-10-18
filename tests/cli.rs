@@ -2295,7 +2295,8 @@ fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     std::fs::write(codex_home.join("config.toml"), "# comment\nmodel = \"gpt-5-codex-test\"\n").unwrap();
     let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("✓ codex") && text.contains("chatgpt sign-in"), "{text}");
+    assert!(text.contains("• codex") && text.contains("chatgpt sign-in") && text.contains("not checked"), "{text}");
+    assert!(!text.contains("✓ codex"), "saved credentials are not a live connection check: {text}");
     assert!(text.contains("model gpt-5-codex-test → codex"), "Codex's own model is the default: {text}");
     assert!(text.contains("not set up · add NVIDIA_API_KEY"), "{text}");
     assert!(!text.contains("acct_9"), "{text}");
@@ -2315,7 +2316,7 @@ fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     .unwrap();
     let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("model gpt-6-alpha → codex") && text.contains("2 models"), "{text}");
+    assert!(text.contains("model gpt-6-alpha → codex") && text.contains("not checked"), "{text}");
     let out =
         s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--list-models").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

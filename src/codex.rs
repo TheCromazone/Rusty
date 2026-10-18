@@ -45,6 +45,107 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex"))
 }
 
+/// Edit only the top-level model; leave profiles and unrelated settings intact.
+fn replace_model(text: &str, model: &str) -> Result<String> {
+    if model.is_empty() || model.len() > 200 || !model.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:/".contains(c))
+    {
+        bail!("model id must contain only letters, digits, -, _, ., :, or /");
+    }
+    if text.contains("\"\"\"") || text.contains("'''") {
+        bail!("config contains multiline strings; use /codex config to edit it safely");
+    }
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            break;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (_, value) = line.split_once('=').context("complex config layout; use /codex config")?;
+        let value = value.trim();
+        if value.starts_with('[') && !value.contains(']') {
+            bail!("multiline config array; use /codex config to edit safely");
+        }
+    }
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let end = lines.iter().position(|l| l.trim_start().starts_with('[')).unwrap_or(lines.len());
+    let matches: Vec<_> = lines[..end]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            let (key, _) = l.split_once('=')?;
+            (key.trim().trim_matches(['\'', '"']) == "model").then_some(i)
+        })
+        .collect();
+    if matches.len() > 1 {
+        bail!("duplicate model keys; use /codex config to repair them");
+    }
+    let value = format!("model = \"{model}\"");
+    if let Some(i) = matches.first() {
+        lines[*i] = value;
+    } else {
+        lines.insert(0, value);
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
+pub fn save_model(model: &str) -> Result<()> {
+    let path = home().context("Codex home is unavailable")?.join("config.toml");
+    save_model_at(&path, model)
+}
+
+fn save_model_at(path: &std::path::Path, model: &str) -> Result<()> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        bail!("config is a symlink; use /codex config to edit its target");
+    }
+    std::fs::create_dir_all(path.parent().context("config parent missing")?)?;
+    let lock = path.with_extension("toml.rusty-lock");
+    std::fs::create_dir(&lock).context("another Rusty config edit is active; try again")?;
+    let result = (|| {
+        let original = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let updated = replace_model(&original, model)?;
+        let temp = lock.join("config.toml");
+        let mut file = rusty::privacy::private_file(&temp, false)?;
+        file.write_all(updated.as_bytes())?;
+        file.sync_all()?;
+        if std::fs::read_to_string(path).unwrap_or_default() != original {
+            bail!("config changed during editing; no update was written");
+        }
+        if path.exists() {
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+            let backup = path.with_extension(format!("toml.rusty-{stamp}.bak"));
+            rusty::privacy::private_file(&backup, false)?.write_all(original.as_bytes())?;
+        }
+        std::fs::rename(temp, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&lock);
+    result
+}
+
+pub fn edit_config() -> Result<()> {
+    let path = home().context("Codex home is unavailable")?.join("config.toml");
+    std::fs::create_dir_all(path.parent().context("config parent missing")?)?;
+    if !path.exists() {
+        rusty::privacy::private_file(&path, false)?;
+    }
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let status = std::process::Command::new("sh")
+        .args(["-c", &format!("exec {editor} \"$1\""), "rusty-editor"])
+        .arg(&path)
+        .status()
+        .context("could not start config editor; set VISUAL or EDITOR")?;
+    if !status.success() {
+        bail!("config editor exited with {status}");
+    }
+    Ok(())
+}
+
 /// The model Codex itself is configured to use (`model = "…"` in config.toml).
 pub fn configured_model() -> Option<String> {
     model_in(&std::fs::read_to_string(home()?.join("config.toml")).ok()?)
@@ -586,6 +687,37 @@ mod tests {
             s
         };
         format!("{}.{}.sig", b64(b"{\"alg\":\"none\"}"), b64(claims.to_string().as_bytes()))
+    }
+
+    #[test]
+    fn model_edit_preserves_profiles_and_rejects_ambiguous_values() {
+        let input = "# personal settings\nmodel = \"old\" # chosen\nmodel_reasoning_effort = \"high\"\n[profiles.work]\nmodel = \"profile-model\"\n";
+        let edited = replace_model(input, "gpt-test").unwrap();
+        assert!(edited.contains("model = \"gpt-test\""));
+        assert!(edited.contains("model_reasoning_effort = \"high\""));
+        assert!(edited.ends_with("[profiles.work]\nmodel = \"profile-model\"\n"));
+        assert!(replace_model(input, "bad\nmodel").is_err());
+        assert!(replace_model("model = \"a\"\nmodel=\"b\"", "new").is_err());
+        assert!(replace_model("value = \"\"\"multiline\"\"\"", "new").is_err());
+        assert!(replace_model("[profiles.x]\nmodel=\"other\"", "new").unwrap().starts_with("model = \"new\"\n"));
+    }
+
+    #[test]
+    fn model_save_backs_up_and_respects_edit_lock() {
+        let dir = auth_temp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# keep\nmodel = \"old\"\n").unwrap();
+        save_model_at(&path, "new").unwrap();
+        assert_eq!(model_in(&std::fs::read_to_string(&path).unwrap()).as_deref(), Some("new"));
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|s| s == "bak"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(backup.path()).unwrap(), "# keep\nmodel = \"old\"\n");
+        std::fs::create_dir(path.with_extension("toml.rusty-lock")).unwrap();
+        assert!(save_model_at(&path, "another").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

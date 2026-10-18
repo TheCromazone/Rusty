@@ -168,7 +168,8 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     let wrapped = format!("USER_PROMPT_START {}pong", "wrapped input ".repeat(16));
     s.send(&wrapped)?;
     s.send("\x0aUSER_PROMPT_END")?;
-    s.drain(0.3)?;
+    s.wait_for(&[Lit("USER_PROMPT_END")], "typed input did not finish redrawing")?;
+    s.drain(0.1)?;
     inspect_input(&s.text, cols, plain, indexed)?;
     std::fs::write(dest.join("input-live.ansi"), &s.text)?;
     s.send("\r")?;
@@ -221,6 +222,7 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
     }
     s.send("\r")?;
     s.wait_for(&[Lit("pong"), Space], "resized input did not run")?;
+    s.wait_for(&[Lit("response OK")], "completed response did not update connection status")?;
     ready(&mut s)?;
     s.send("/quit\r")?;
     s.finish()?;
@@ -228,6 +230,75 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
         bail!("resize changed the submitted input");
     }
     println!("PASS: menu selection and exact Unicode input survive 24/40/80/120-column contraction and expansion");
+    Ok(())
+}
+
+/// These controls must work even when no model server is listening.
+fn shell_capture(binary: &Path, dest: &Path) -> Result<()> {
+    let home = dest.join("home");
+    let codex = dest.join("codex");
+    std::fs::create_dir_all(&codex)?;
+    std::fs::write(codex.join("config.toml"), "# preserved\nmodel = \"old\"\n[profiles.work]\nmodel = \"keep\"\n")?;
+    std::fs::write(
+        codex.join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-test","visibility":"list","priority":0}]}"#,
+    )?;
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off", "--permissions", "yolo"]);
+    cmd.args(["--max-requests", "1", "--budget-secs", "30"]);
+    offline(&mut cmd, "http://127.0.0.1:1/v1", &home);
+    cmd.env("RUSTY_PROVIDER", "compatible").env("RUSTY_CONTEXT_TOKENS", "128000").env("CODEX_HOME", &codex);
+    std::fs::write(dest.join("editor.sh"), "printf '\\n# editor visited\\n' >> \"$1\"\n")?;
+    cmd.env("VISUAL", "sh ./editor.sh");
+    let log = File::create(dest.join("direct-shell.ansi"))?;
+    let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(10))?;
+    let ready = |s: &mut Session| -> Result<()> {
+        s.wait_for(&[Lit("?2004h")], "input did not return after direct shell")?;
+        s.drain(0.15)
+    };
+    ready(&mut s)?;
+    s.send("!pwd\r")?;
+    s.wait_for(&[Lit("stdout:")], "!pwd produced no stdout")?;
+    ready(&mut s)?;
+    if !s.text.contains(dest.to_str().context("non-UTF8 cwd")?) {
+        bail!("!pwd did not use session cwd");
+    }
+    s.send("!printf 'direct-%s' shell; exit 7\r")?;
+    s.wait_for(&[Lit("exit code: 7")], "shell exit code missing")?;
+    s.wait_for(&[Lit("direct-shell")], "shell output missing")?;
+    ready(&mut s)?;
+    s.send("!sleep 20\r")?;
+    s.drain(0.5)?;
+    s.send("\x03")?;
+    s.wait_for(&[Lit("interrupted by the user")], "shell was not interrupted")?;
+    ready(&mut s)?;
+    s.send("/permissions read-only\r")?;
+    ready(&mut s)?;
+    s.send("!touch forbidden\r")?;
+    s.wait_for(&[Lit("denied by permissions")], "direct shell bypassed read-only")?;
+    ready(&mut s)?;
+    if dest.join("forbidden").exists() {
+        bail!("denied command changed the workspace");
+    }
+    s.send("/codex model ")?;
+    s.drain(0.2)?;
+    s.send("\x1b[B\r")?;
+    ready(&mut s)?;
+    s.send("/codex config\r")?;
+    ready(&mut s)?;
+    let text = std::fs::read_to_string(codex.join("config.toml"))?;
+    if !text.contains("# editor visited") {
+        bail!("config editor did not receive the Codex path");
+    }
+    if !text.contains("model = \"gpt-test\"") || !text.contains("model = \"keep\"") {
+        bail!("Codex config edit lost settings");
+    }
+    s.send("hello\r")?;
+    s.wait_for(&[Lit("failed last request")], "failed request did not update connection status")?;
+    ready(&mut s)?;
+    s.send("/quit\r")?;
+    s.finish()?;
+    println!("PASS: direct shell cwd, output, exit status, interrupt, permissions and Codex config work without a model server");
     Ok(())
 }
 
@@ -471,6 +542,7 @@ enum Check {
     Owned,
     Input,
     Menu,
+    Shell,
     Aside,
     Side,
     Summary,
@@ -520,6 +592,11 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
         std::fs::create_dir_all(&dest)?;
         input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
     }
+    if checks.contains(&Check::Shell) {
+        let dest = out.join("direct-shell");
+        std::fs::create_dir_all(&dest)?;
+        shell_capture(&binary, &dest)?;
+    }
     if checks.contains(&Check::Menu) {
         let dest = out.join("menu-resize");
         std::fs::create_dir_all(&dest)?;
@@ -565,6 +642,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "owned" => checks.push(Check::Owned),
             "input" => checks.push(Check::Input),
             "menu" => checks.push(Check::Menu),
+            "shell" => checks.push(Check::Shell),
             "aside" => checks.push(Check::Aside),
             "side" => checks.push(Check::Side),
             "summary" => checks.push(Check::Summary),
@@ -607,7 +685,8 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     } else {
         Check::Steady
     };
-    if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Approval, Check::CtrlC], false)? {
+    if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Shell, Check::Approval, Check::CtrlC], false)?
+    {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)

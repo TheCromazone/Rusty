@@ -237,6 +237,7 @@ pub struct Endpoint {
     /// cache on it and, without one, gives every request a fresh key, so
     /// nothing is ever served from the cache.
     session: String,
+    responses: Mutex<std::collections::BTreeMap<String, &'static str>>,
 }
 
 impl Endpoint {
@@ -248,6 +249,7 @@ impl Endpoint {
             key_idx: AtomicUsize::new(0),
             codex: None,
             session: String::new(),
+            responses: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -396,11 +398,54 @@ impl Client {
         rx
     }
 
+    pub fn connection_status(&self, model: &str) -> String {
+        let ep = match self.endpoint_for(model) {
+            Ok(ep) => ep,
+            Err(_) => return "○ provider unavailable · /doctor".into(),
+        };
+        let name =
+            if ep.provider == Provider::Compatible && ep.base_url.starts_with("https://integrate.api.nvidia.com/") {
+                "nvidia"
+            } else {
+                ep.provider.name()
+            };
+        let credential = if ep.provider == Provider::Codex { "sign-in saved" } else { "key configured" };
+        let result = ep.responses.lock().ok().and_then(|m| m.get(model).copied());
+        match result {
+            Some("response OK") => format!("✓ {name} · response OK · {model}"),
+            Some(status) => format!("! {name} · {status} · /doctor"),
+            None => format!("○ {name} · unverified · {credential}"),
+        }
+    }
+
+    pub fn chat(
+        &self,
+        model: &str,
+        messages: &[Value],
+        tools: &Value,
+        temperature: f32,
+        inference: (ExecutionMode, &str, Option<u32>),
+        on: &mut dyn FnMut(Delta) -> bool,
+    ) -> Result<Reply> {
+        let result = self.chat_inner(model, messages, tools, temperature, inference, on);
+        if let Ok(ep) = self.endpoint_for(model) {
+            if let Ok(mut states) = ep.responses.lock() {
+                let status = match &result {
+                    Ok(reply) if reply.finish_reason.as_deref() == Some("interrupted") => "interrupted",
+                    Ok(_) => "response OK",
+                    Err(_) => "failed last request",
+                };
+                states.insert(model.to_string(), status);
+            }
+        }
+        result
+    }
+
     /// Streams one chat completion, calling `on` for every text/reasoning
     /// delta; `on` returns false to stop early. An empty `tools` array means a
     /// plain completion. `inference` is the mode, the request's role, and the
     /// most output it may ask for (see [`clamp_output`]).
-    pub fn chat(
+    fn chat_inner(
         &self,
         model: &str,
         messages: &[Value],

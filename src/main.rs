@@ -640,6 +640,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         // and sit there unsent, joins the queue first.
         signal::poll_keys();
         // Queued and freshly typed input go through the same slash router.
+        println!("{}", ui::bold(&ui::fit(&client.connection_status(&agent.model), ui::width().saturating_sub(1))));
         ui::input_rule();
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::user("›"), ui::user(&queued));
@@ -700,7 +701,13 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         signal::restore_terminal();
         signal::reset();
 
-        let result = if input.starts_with('/') {
+        let result = if let Some(shell) = input.strip_prefix('!') {
+            if side::focused(&agent.side_book) {
+                Err(anyhow!("use /back before running a shell command"))
+            } else {
+                agent.direct_shell(shell)
+            }
+        } else if input.starts_with('/') {
             match command(agent, client, cwd, settings, &input) {
                 Ok(true) => break,
                 Ok(false) => Ok(()),
@@ -826,6 +833,44 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
         }
         "/btw" => agent.ask_aside(rest)?,
+        "/codex" => {
+            let (action, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            match action {
+                "model" if !value.trim().is_empty() => {
+                    codex::save_model(value.trim())?;
+                    println!("  saved Codex model {} · applies to future Codex sessions", ui::info(value.trim()));
+                    if client.endpoint_for(value.trim()).is_ok_and(|ep| ep.provider == config::Provider::Codex) {
+                        agent.model = value.trim().into();
+                        agent.model_override = Some(agent.model.clone());
+                        println!("  applied to this session · {}", client.connection_status(&agent.model));
+                    } else {
+                        println!("  current session unchanged; start RUSTY_PROVIDER=codex rusty to use the saved Codex model");
+                    }
+                }
+                "models" => {
+                    let models = codex::listed_models();
+                    if models.is_empty() {
+                        println!("  no cached catalog · default {}", codex::default_model());
+                    }
+                    for model in models {
+                        println!("  {model}");
+                    }
+                    println!("  cached Codex catalog; availability is checked by the next request");
+                }
+                "config" => {
+                    codex::edit_config()?;
+                    println!("  config editor closed · /codex model <id> applies a model here; other settings apply on restart");
+                }
+                "" | "model" => {
+                    println!("  Codex default {}", ui::info(&codex::default_model()));
+                    println!("  /codex model <id> · save shared default");
+                    println!("  /codex config · edit full config");
+                    println!("  /model <id> · this session only");
+                    println!("  /codex models · cached model names");
+                }
+                _ => anyhow::bail!("use /codex model <id>, /codex models, or /codex config"),
+            }
+        }
         "/model" => {
             if !rest.is_empty() {
                 agent.model = rest.to_string();
@@ -1400,6 +1445,7 @@ fn parse_duration(s: &str) -> Option<u64> {
 fn print_help(cwd: &Path) {
     let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
     print!("{}", slash::help(&skill_list));
+    println!("  !command · direct shell, no model request · ctrl-c stops");
 }
 
 /// `/Users/me/code/x` → `~/code/x`.
