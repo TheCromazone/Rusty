@@ -15,6 +15,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -394,6 +395,17 @@ fn text_of(content: &Value) -> String {
     }
 }
 
+/// A text or reasoning delta read in place (see `crate::sse`); other events
+/// are rare enough to read as a `Value`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TextEvent<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: crate::sse::Str<'a>,
+    #[serde(borrow)]
+    delta: crate::sse::Str<'a>,
+}
+
 /// Folds the backend's event stream into a `Reply`, calling `on` for every
 /// text and reasoning-summary delta; `on` returning false stops early.
 pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Reply> {
@@ -404,11 +416,12 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     let mut saw_data = false;
     let mut raw = String::new();
 
-    for line in crate::llm::lines(resp) {
+    let mut lines = crate::llm::lines(resp);
+    while let Some(line) = lines.next_line() {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data && !line.starts_with("event:") {
-                raw.push_str(&line);
+                raw.push_str(line);
             }
             continue;
         };
@@ -416,6 +429,31 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
         let data = data.trim();
         if data == "[DONE]" {
             break;
+        }
+        let mut spare = None;
+        let Some(ev) = crate::sse::event::<TextEvent>(data, &mut spare) else { continue };
+        match ev.kind.get().unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(s) = ev.delta.get().filter(|s| !s.is_empty()) {
+                    streamed_text = true;
+                    reply.content.push_str(s);
+                    if !on(Delta::Content(s)) {
+                        reply.finish_reason = Some("interrupted".into());
+                        return Ok(finish(reply, items));
+                    }
+                }
+                continue;
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(s) = ev.delta.get().filter(|s| !s.is_empty()) {
+                    if !on(Delta::Reasoning(s)) {
+                        reply.finish_reason = Some("interrupted".into());
+                        return Ok(finish(reply, items));
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
         let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
         match v["type"].as_str().unwrap_or("") {
@@ -427,24 +465,6 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
                 match e["code"].as_str() {
                     Some(code) => bail!("API error: {code}: {msg}"),
                     None => bail!("API error: {msg}"),
-                }
-            }
-            "response.output_text.delta" => {
-                if let Some(s) = v["delta"].as_str().filter(|s| !s.is_empty()) {
-                    streamed_text = true;
-                    reply.content.push_str(s);
-                    if !on(Delta::Content(s)) {
-                        reply.finish_reason = Some("interrupted".into());
-                        return Ok(finish(reply, items));
-                    }
-                }
-            }
-            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                if let Some(s) = v["delta"].as_str().filter(|s| !s.is_empty()) {
-                    if !on(Delta::Reasoning(s)) {
-                        reply.finish_reason = Some("interrupted".into());
-                        return Ok(finish(reply, items));
-                    }
                 }
             }
             "response.output_item.done" => {

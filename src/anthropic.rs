@@ -10,10 +10,13 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Response;
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::io::Read;
 
 use crate::execution::ExecutionMode;
 use crate::llm::{Delta, Reply, ToolCall, Usage};
+use crate::sse::{Lines, Obj, Str, U64};
 
 pub const VERSION: &str = "2023-06-01";
 /// Lets a request ask for `prefix_mismatch_behavior`.
@@ -277,10 +280,34 @@ pub fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result
     parse_lines(&mut crate::llm::lines(resp), on)
 }
 
-fn parse_lines(
-    lines: &mut dyn Iterator<Item = std::io::Result<String>>,
-    on: &mut dyn FnMut(Delta) -> bool,
-) -> Result<Reply> {
+/// An event read in place (see `crate::sse`); only text, thinking and tool
+/// input deltas, the bulk of a stream, are read this way.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Event<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Str<'a>,
+    index: U64,
+    #[serde(borrow)]
+    delta: Obj<BlockDelta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BlockDelta<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Str<'a>,
+    #[serde(borrow)]
+    text: Str<'a>,
+    #[serde(borrow)]
+    thinking: Str<'a>,
+    #[serde(borrow)]
+    signature: Str<'a>,
+    #[serde(borrow)]
+    partial_json: Str<'a>,
+}
+
+fn parse_lines(lines: &mut Lines<impl Read>, on: &mut dyn FnMut(Delta) -> bool) -> Result<Reply> {
     let mut blocks: Vec<Value> = Vec::new();
     let mut partial: Vec<String> = Vec::new();
     let mut usage = Usage::default();
@@ -290,16 +317,50 @@ fn parse_lines(
     let mut interrupted = false;
     let mut saw_data = false;
     let mut raw = String::new();
-    for line in lines {
+    while let Some(line) = lines.next_line() {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data && !line.starts_with("event:") {
-                raw.push_str(&line);
+                raw.push_str(line);
             }
             continue;
         };
         saw_data = true;
-        let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { continue };
+        let data = data.trim();
+        let mut spare = None;
+        let Some(ev) = crate::sse::event::<Event>(data, &mut spare) else { continue };
+        if ev.kind.get() == Some("content_block_delta") {
+            let i = ev.index.0.unwrap_or(0) as usize;
+            let Some(block) = blocks.get_mut(i) else { continue };
+            let d = &ev.delta.0;
+            let keep_going = match d.kind.get().unwrap_or("") {
+                "text_delta" => {
+                    let s = d.text.get().unwrap_or("");
+                    append(block, "text", s);
+                    s.is_empty() || on(Delta::Content(s))
+                }
+                "thinking_delta" => {
+                    let s = d.thinking.get().unwrap_or("");
+                    append(block, "thinking", s);
+                    s.is_empty() || on(Delta::Reasoning(s))
+                }
+                "signature_delta" => {
+                    append(block, "signature", d.signature.get().unwrap_or(""));
+                    true
+                }
+                "input_json_delta" => {
+                    partial[i].push_str(d.partial_json.get().unwrap_or(""));
+                    true
+                }
+                _ => true,
+            };
+            if !keep_going {
+                interrupted = true;
+                break;
+            }
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
         match v["type"].as_str().unwrap_or("") {
             "message_start" => {
                 let u = &v["message"]["usage"];
@@ -317,36 +378,6 @@ fn parse_lines(
                     partial.push(String::new());
                 }
                 blocks[i] = v["content_block"].clone();
-            }
-            "content_block_delta" => {
-                let i = v["index"].as_u64().unwrap_or(0) as usize;
-                let Some(block) = blocks.get_mut(i) else { continue };
-                let d = &v["delta"];
-                let keep_going = match d["type"].as_str().unwrap_or("") {
-                    "text_delta" => {
-                        let s = d["text"].as_str().unwrap_or("");
-                        append(block, "text", s);
-                        s.is_empty() || on(Delta::Content(s))
-                    }
-                    "thinking_delta" => {
-                        let s = d["thinking"].as_str().unwrap_or("");
-                        append(block, "thinking", s);
-                        s.is_empty() || on(Delta::Reasoning(s))
-                    }
-                    "signature_delta" => {
-                        append(block, "signature", d["signature"].as_str().unwrap_or(""));
-                        true
-                    }
-                    "input_json_delta" => {
-                        partial[i].push_str(d["partial_json"].as_str().unwrap_or(""));
-                        true
-                    }
-                    _ => true,
-                };
-                if !keep_going {
-                    interrupted = true;
-                    break;
-                }
             }
             "message_delta" => {
                 if let Some(s) = v["delta"]["stop_reason"].as_str() {
@@ -403,10 +434,13 @@ fn cache_usage(u: &Value) -> (u64, u64) {
     (n("cache_read_input_tokens"), n("cache_creation_input_tokens"))
 }
 
+/// Grows the block's text in place. Copying it out and back on every delta
+/// made a long answer quadratic: minutes and gigabytes for a few megabytes.
 fn append(block: &mut Value, key: &str, s: &str) {
-    let mut cur = block[key].as_str().unwrap_or("").to_string();
-    cur.push_str(s);
-    block[key] = json!(cur);
+    match &mut block[key] {
+        Value::String(cur) => cur.push_str(s),
+        other => *other = Value::String(s.to_owned()),
+    }
 }
 
 fn finish(
@@ -500,19 +534,14 @@ pub fn strip_private(messages: &[Value]) -> Vec<Value> {
 mod tests {
     use super::*;
 
-    fn sse(events: &[Value]) -> Vec<std::io::Result<String>> {
-        events
-            .iter()
-            .flat_map(|e| {
-                vec![Ok(format!("event: {}", e["type"].as_str().unwrap())), Ok(format!("data: {e}")), Ok(String::new())]
-            })
-            .collect()
+    fn sse(events: &[Value]) -> String {
+        events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect()
     }
 
     fn parse(events: &[Value]) -> (Reply, Vec<String>) {
         let mut seen = Vec::new();
-        let lines = sse(events);
-        let reply = parse_lines(&mut lines.into_iter(), &mut |d| {
+        let text = sse(events);
+        let reply = parse_lines(&mut Lines::new(text.as_bytes()), &mut |d| {
             seen.push(match d {
                 Delta::Content(s) => format!("c:{s}"),
                 Delta::Reasoning(s) => format!("r:{s}"),
@@ -618,9 +647,20 @@ mod tests {
     }
 
     #[test]
+    fn deltas_grow_a_block_in_place() {
+        let mut block = json!({"type": "text", "text": "a"});
+        append(&mut block, "text", "b");
+        append(&mut block, "signature", "s");
+        assert_eq!(block, json!({"type": "text", "text": "ab", "signature": "s"}));
+        let mut odd = json!({"type": "text", "text": 7});
+        append(&mut odd, "text", "c");
+        assert_eq!(odd["text"], "c", "a non-string is replaced, as before");
+    }
+
+    #[test]
     fn mid_stream_errors_fail_the_request() {
-        let lines = sse(&[json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})]);
-        let err = parse_lines(&mut lines.into_iter(), &mut |_| true).unwrap_err();
+        let text = sse(&[json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})]);
+        let err = parse_lines(&mut Lines::new(text.as_bytes()), &mut |_| true).unwrap_err();
         assert!(err.to_string().contains("overloaded_error"));
     }
 

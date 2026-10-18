@@ -256,12 +256,18 @@ impl Display {
             self.answered = true;
         }
         // Render whole lines so markdown styling works mid-stream.
+        // Only the new text can hold a line end, and the rendered lines are
+        // dropped from the front once: a batch of many lines stays linear.
+        let scanned = self.line_buf.len();
         self.line_buf.push_str(s);
-        while let Some(pos) = self.line_buf.find('\n') {
-            let line: String = self.line_buf.drain(..=pos).collect();
-            let rendered = crate::markdown::line(line.trim_end_matches('\n'), &mut self.in_code);
+        let mut start = 0;
+        while let Some(pos) = self.line_buf[start.max(scanned)..].find('\n') {
+            let end = start.max(scanned) + pos;
+            let rendered = crate::markdown::line(&self.line_buf[start..end], &mut self.in_code);
             self.append(&rendered);
+            start = end + 1;
         }
+        self.line_buf.drain(..start);
         let _ = std::io::stdout().flush();
     }
 

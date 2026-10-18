@@ -5,8 +5,9 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Response;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -16,6 +17,7 @@ use crate::anthropic;
 use crate::codex;
 use crate::config::Provider;
 use crate::execution::ExecutionMode;
+use crate::sse::{Field, First, Obj, Str};
 use crate::ui::truncate;
 
 /// How long a request keeps retrying rate limits and server errors before it
@@ -40,13 +42,64 @@ fn stream_idle() -> Duration {
 thread_local! {
     /// Where this thread's request reports a retry wait, when someone is watching.
     static STATUS: std::cell::RefCell<Option<Sender<Event>>> = const { std::cell::RefCell::new(None) };
+    /// Streamed text this thread has parsed but not yet sent (see `Held`).
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Tells whoever started this request what it is waiting for; silent otherwise.
 /// False when the one who started it has stopped listening (Ctrl-C, a
 /// budget stop), so a retry nobody will read is not sent.
 fn status(text: String) -> bool {
+    send_held();
     STATUS.with(|s| s.borrow().as_ref().is_none_or(|tx| tx.send(Event::Status(text)).is_ok()))
+}
+
+/// Deltas on their way to the UI thread, joined into one event. A fast
+/// stream parses many deltas from each read, and an event apiece cost an
+/// allocation, a channel message and a wake-up of the UI thread per token.
+/// What is held goes out before the stream next reads from the network, so
+/// text never waits on a slow server: the first token is sent as soon as
+/// its read has been parsed.
+struct Held {
+    tx: Sender<Event>,
+    reasoning: bool,
+    text: String,
+    /// The receiver has gone; the stream should stop.
+    gone: bool,
+}
+
+impl Held {
+    fn push(&mut self, d: Delta) -> bool {
+        let (reasoning, s) = match d {
+            Delta::Reasoning(s) => (true, s),
+            Delta::Content(s) => (false, s),
+        };
+        if reasoning != self.reasoning {
+            self.send();
+            self.reasoning = reasoning;
+        }
+        self.text.push_str(s);
+        !self.gone
+    }
+
+    fn send(&mut self) {
+        if self.text.is_empty() || self.gone {
+            return;
+        }
+        // The next batch is likely the same size; start it with that room.
+        let room = self.text.len();
+        let text = std::mem::replace(&mut self.text, String::with_capacity(room));
+        let ev = if self.reasoning { Event::Reasoning(text) } else { Event::Content(text) };
+        self.gone = self.tx.send(ev).is_err();
+    }
+}
+
+fn send_held() {
+    HELD.with(|h| {
+        if let Some(h) = h.borrow_mut().as_mut() {
+            h.send();
+        }
+    });
 }
 
 fn ensure_request_watched() -> Result<()> {
@@ -68,14 +121,22 @@ fn refresh_codex_auth(budget: &crate::budget::Budget, refresh: impl FnOnce(Durat
     ensure_request_watched()
 }
 
-/// The lines of a streamed response, with the timer runtime entered while
-/// reqwest's blocking body is polled so its per-read timeout can fire.
-pub fn lines(resp: Response) -> impl Iterator<Item = std::io::Result<String>> {
-    let mut lines = BufReader::new(resp).lines();
-    std::iter::from_fn(move || {
+/// The lines of a streamed response.
+pub fn lines(resp: Response) -> crate::sse::Lines<Body> {
+    crate::sse::Lines::new(Body(resp))
+}
+
+/// A streamed response body, read with the timer runtime entered so
+/// reqwest's per-read timeout can fire.
+pub struct Body(Response);
+
+impl Read for Body {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Everything parsed so far reaches the UI before this read waits.
+        send_held();
         let _runtime = stream_runtime().enter();
-        lines.next()
-    })
+        self.0.read(buf)
+    }
 }
 
 fn stream_runtime() -> &'static tokio::runtime::Runtime {
@@ -324,13 +385,12 @@ impl Client {
         let me = self.clone();
         std::thread::spawn(move || {
             STATUS.with(|s| *s.borrow_mut() = Some(tx.clone()));
+            let held = Held { tx: tx.clone(), reasoning: false, text: String::new(), gone: false };
+            HELD.with(|h| *h.borrow_mut() = Some(held));
             let result = me.chat(&model, &messages, &tools, temperature, inference, &mut |d| {
-                let ev = match d {
-                    Delta::Reasoning(s) => Event::Reasoning(s.to_string()),
-                    Delta::Content(s) => Event::Content(s.to_string()),
-                };
-                tx.send(ev).is_ok()
+                HELD.with(|h| h.borrow_mut().as_mut().is_none_or(|h| h.push(d)))
             });
+            send_held();
             let _ = tx.send(Event::Done(result));
         });
         rx
@@ -778,6 +838,37 @@ fn openai_inference(body: &mut Value, model: &str, mode: ExecutionMode) {
     }
 }
 
+/// One streamed chat-completions chunk, read in place (see `crate::sse`).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Chunk<'a> {
+    error: Field,
+    usage: Field,
+    #[serde(borrow)]
+    choices: First<Obj<Choice<'a>>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Choice<'a> {
+    #[serde(borrow)]
+    finish_reason: Str<'a>,
+    #[serde(borrow)]
+    delta: Obj<ChunkDelta<'a>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ChunkDelta<'a> {
+    #[serde(borrow)]
+    reasoning_content: Str<'a>,
+    #[serde(borrow)]
+    reasoning: Str<'a>,
+    #[serde(borrow)]
+    content: Str<'a>,
+    tool_calls: Field,
+}
+
 fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Reply> {
     let mut reply = Reply::default();
     let mut calls: Vec<ToolCall> = Vec::new();
@@ -785,11 +876,12 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
     let mut done = false;
     let mut raw = String::new();
 
-    for line in lines(resp) {
+    let mut lines = lines(resp);
+    while let Some(line) = lines.next_line() {
         let line = line.context("stream interrupted")?;
         let Some(data) = line.strip_prefix("data:") else {
             if !saw_data {
-                raw.push_str(&line);
+                raw.push_str(line);
             }
             continue;
         };
@@ -799,26 +891,27 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
             done = true;
             break;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
-        if let Some(err) = v.get("error") {
+        let mut spare = None;
+        let Some(chunk) = crate::sse::event::<Chunk>(data, &mut spare) else { continue };
+        if let Some(err) = chunk.error.0 {
             bail!("API error: {err}");
         }
-        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            reply.usage = usage_of(u);
+        if let Some(u) = chunk.usage.0.filter(|u| !u.is_null()) {
+            reply.usage = usage_of(&u);
         }
-        let Some(choice) = v["choices"].get(0) else { continue };
-        if let Some(fr) = choice["finish_reason"].as_str() {
+        let Some(Obj(choice)) = chunk.choices.0 else { continue };
+        if let Some(fr) = choice.finish_reason.get() {
             reply.finish_reason = Some(fr.to_string());
         }
-        let delta = &choice["delta"];
+        let delta = choice.delta.0;
         // Providers name this field differently; take the first one present.
-        if let Some(s) = ["reasoning_content", "reasoning"].iter().find_map(|k| delta[*k].as_str()) {
+        if let Some(s) = delta.reasoning_content.get().or(delta.reasoning.get()) {
             if !s.is_empty() && !on(Delta::Reasoning(s)) {
                 reply.finish_reason = Some("interrupted".into());
                 break;
             }
         }
-        if let Some(s) = delta["content"].as_str() {
+        if let Some(s) = delta.content.get() {
             if !s.is_empty() {
                 reply.content.push_str(s);
                 if !on(Delta::Content(s)) {
@@ -827,7 +920,7 @@ fn parse_stream(resp: Response, on: &mut dyn FnMut(Delta) -> bool) -> Result<Rep
                 }
             }
         }
-        if let Some(tcs) = delta["tool_calls"].as_array() {
+        if let Some(tcs) = delta.tool_calls.0.as_ref().and_then(Value::as_array) {
             for tc in tcs {
                 merge_tool_call(&mut calls, tc);
             }
@@ -929,6 +1022,32 @@ mod tests {
         ] {
             assert!(!transient_stream_error(e), "{e}");
         }
+    }
+
+    #[test]
+    fn held_deltas_go_out_joined_and_in_order() {
+        let (tx, rx) = channel();
+        let mut held = Held { tx, reasoning: false, text: String::new(), gone: false };
+        for d in [Delta::Reasoning("a"), Delta::Reasoning("b"), Delta::Content("c"), Delta::Content("d")] {
+            assert!(held.push(d));
+        }
+        held.send();
+        assert!(held.push(Delta::Content("e")));
+        held.send();
+        held.send();
+        let got: Vec<String> = rx
+            .try_iter()
+            .map(|e| match e {
+                Event::Reasoning(s) => format!("r:{s}"),
+                Event::Content(s) => format!("c:{s}"),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(got, ["r:ab", "c:cd", "c:e"]);
+        drop(rx);
+        held.push(Delta::Content("f"));
+        held.send();
+        assert!(!held.push(Delta::Content("g")), "a closed receiver stops the stream");
     }
 
     #[test]

@@ -23,6 +23,7 @@ mod signal;
 mod skills;
 mod slash;
 mod snapshot;
+mod sse;
 mod swarm;
 mod tips;
 mod tools;
