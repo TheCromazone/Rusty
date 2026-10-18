@@ -448,7 +448,14 @@ fn walk(
 fn search(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
     let path = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
-    Ok(workspace_query::search(pattern, path, args["glob"].as_str(), args["context"].as_u64().unwrap_or(0))?.render())
+    Ok(workspace_query::search_cancellable(
+        pattern,
+        path,
+        args["glob"].as_str(),
+        args["context"].as_u64().unwrap_or(0),
+        signal::interrupted,
+    )?
+    .render())
 }
 
 fn bash(args: &Value) -> Result<String> {
@@ -1013,6 +1020,14 @@ os._exit(0)
             let mut eof = [0];
             assert_eq!(control.read(&mut eof).unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn query_tools_honor_run_scoped_cancellation() {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = signal::cancel_scope(cancel);
+        let out = search(&json!({"pattern":"needle"})).unwrap();
+        assert!(out.contains("termination=cancelled") && out.contains("scan_complete=false"));
     }
 
     #[test]

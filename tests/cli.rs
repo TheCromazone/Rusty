@@ -6458,3 +6458,57 @@ fn completion_contract_verify_and_pin_words_remain_ordinary_objectives() {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 }
+
+#[test]
+fn ctrl_c_stops_a_workspace_search_and_reaps_its_process() {
+    let s = Sandbox::new("query-interrupt");
+    s.fake("rg", "echo $$ > query.pid; exec sleep 30");
+    let (url, server) = scripted_endpoint(vec![tool_reply("search", serde_json::json!({"pattern":"needle"}))]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args([
+            "--mode",
+            "standard",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--yolo",
+            "--goal",
+            "investigate the workspace",
+            "--verify",
+            "true",
+            "--trajectory",
+        ])
+        .arg(s.home.join("query-interrupted.json"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(server.join().unwrap().len(), 1);
+    let started = Instant::now();
+    let query_pid = loop {
+        if let Some(pid) =
+            std::fs::read_to_string(s.project.join("query.pid")).ok().and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            break pid;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the scripted search did not start");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let out = wait(child, Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(130), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(unsafe { libc::kill(query_pid, 0) }, -1, "query process must be reaped");
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("query-interrupted.json")).unwrap()).unwrap();
+    let messages = trace["messages"].to_string();
+    assert!(messages.contains("termination=cancelled") && messages.contains("scan_complete=false"), "{messages}");
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 0);
+}

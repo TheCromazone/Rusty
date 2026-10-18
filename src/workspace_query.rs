@@ -62,7 +62,19 @@ impl BoundedPipe {
     }
 
     fn finish(self) -> Capture {
-        Capture { text: String::from_utf8_lossy(&self.bytes).into_owned(), truncated: self.truncated }
+        // Lossy conversion can temporarily expand invalid bytes up to 3x.
+        // Bound the retained rendered prefix as well as the raw buffer.
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let mut truncated = self.truncated;
+        if text.len() > self.limit {
+            let mut end = self.limit;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            truncated = true;
+        }
+        Capture { text, truncated }
     }
 }
 
@@ -110,7 +122,11 @@ impl Drop for QueryChild {
 }
 
 #[cfg(unix)]
-fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
+fn collect_query_cancellable(
+    child: Child,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     use std::os::fd::AsRawFd;
     let mut child = QueryChild { child, group_cleaned: false };
     let mut stdout = child.child.stdout.take().expect("piped stdout");
@@ -139,14 +155,15 @@ fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, O
                 }
             }
         }
-        if status.is_some() && output.eof && diagnostics.eof {
-            break;
-        }
-        if started.elapsed() >= timeout {
-            termination = "deadline";
+        let was_cancelled = cancelled();
+        if was_cancelled || started.elapsed() >= timeout {
+            termination = if was_cancelled { "cancelled" } else { "deadline" };
             child.kill_group();
             let _ = child.child.kill();
             status = Some(child.child.wait()?);
+            break;
+        }
+        if status.is_some() && output.eof && diagnostics.eof {
             break;
         }
         // An escaped descendant can hold a pipe without belonging to our group.
@@ -161,9 +178,18 @@ fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, O
 }
 
 #[cfg(not(unix))]
-fn collect_query(child: Child, _: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
+fn collect_query_cancellable(
+    child: Child,
+    _: Duration,
+    _: &dyn Fn() -> bool,
+) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     drop(QueryChild { child, group_cleaned: false });
     anyhow::bail!("bounded workspace search requires Unix pipes")
+}
+
+#[cfg(test)]
+fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
+    collect_query_cancellable(child, timeout, &|| false)
 }
 
 #[derive(Debug)]
@@ -205,10 +231,38 @@ impl SearchResult {
 /// Spawn rg directly each time: cached executable availability could outlive a PATH change.
 /// Only a missing executable selects fallback; a failed rg query must retain its diagnostics.
 pub fn search(pattern: &str, path: &str, glob: Option<&str>, context: u64) -> Result<SearchResult> {
-    search_with("rg", pattern, path, glob, context)
+    search_cancellable(pattern, path, glob, context, || false)
 }
 
-fn search_with(program: &str, pattern: &str, path: &str, glob: Option<&str>, context: u64) -> Result<SearchResult> {
+/// The caller owns cancellation; this layer creates no global state or polling threads.
+pub fn search_cancellable(
+    pattern: &str,
+    path: &str,
+    glob: Option<&str>,
+    context: u64,
+    cancelled: impl Fn() -> bool,
+) -> Result<SearchResult> {
+    search_with("rg", pattern, path, glob, context, &cancelled)
+}
+
+fn search_with(
+    program: &str,
+    pattern: &str,
+    path: &str,
+    glob: Option<&str>,
+    context: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SearchResult> {
+    if cancelled() {
+        return Ok(SearchResult {
+            engine: "rg",
+            scan_complete: false,
+            output: BoundedPipe::new(0).finish(),
+            diagnostics: BoundedPipe::new(0).finish(),
+            exit_code: None,
+            termination: "cancelled",
+        });
+    }
     let context = context.min(10).to_string();
     let mut rg = Command::new(program);
     rg.args([
@@ -245,7 +299,7 @@ fn search_with(program: &str, pattern: &str, path: &str, glob: Option<&str>, con
         }
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
-    let (output, diagnostics, exit_code, termination) = collect_query(child, QUERY_TIMEOUT)?;
+    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(child, QUERY_TIMEOUT, cancelled)?;
     let scan_complete =
         engine == "rg" && termination == "exited" && matches!(exit_code, Some(0 | 1)) && diagnostics.text.is_empty();
     Ok(SearchResult { engine, scan_complete, output, diagnostics, exit_code, termination })
@@ -375,6 +429,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_cannot_expand_retained_output_beyond_the_cap() {
+        let mut reader = Cursor::new(vec![0xff; 100_000]);
+        let mut bounded = BoundedPipe::new(17);
+        while !bounded.eof {
+            bounded.read_available(&mut reader).unwrap();
+            assert!(bounded.bytes.len() <= 17);
+        }
+        assert_eq!(reader.position(), 100_000);
+        let result = bounded.finish();
+        assert_eq!(result.text, "\u{fffd}".repeat(5));
+        assert!(result.text.len() <= 17 && result.truncated);
+    }
+
+    #[test]
     fn partial_matches_keep_diagnostics_and_never_claim_complete() {
         let result = SearchResult {
             engine: "rg",
@@ -392,12 +460,12 @@ mod tests {
 
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
-        let result = search_with("/rusty/nonexistent-rg", "pub fn search", file!(), None, 0).unwrap();
+        let result = search_with("/rusty/nonexistent-rg", "pub fn search", file!(), None, 0, &|| false).unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
         assert!(!result.output.text.is_empty());
         assert!(result.render().contains("parity unavailable"));
-        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0).unwrap();
+        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0, &|| false).unwrap();
         assert!(empty.render().contains("no matches observed; search incomplete"));
     }
 
@@ -412,8 +480,8 @@ mod tests {
         let (out, err, _, reason) = collect_query(child, Duration::from_millis(200)).unwrap();
         assert_eq!(reason, "deadline");
         assert!(started.elapsed() < Duration::from_secs(10));
-        // UTF-8 replacement can add at most two bytes at the prefix boundary.
-        assert!(out.text.len() <= OUTPUT_BYTES + 2 && err.text.len() <= DIAGNOSTIC_BYTES + 2);
+        // Both retained raw and rendered prefixes have strict byte limits.
+        assert!(out.text.len() <= OUTPUT_BYTES && err.text.len() <= DIAGNOSTIC_BYTES);
         assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let result = SearchResult {
@@ -426,6 +494,27 @@ mod tests {
         };
         assert!(result.render().contains("termination=deadline"));
         assert!(result.render().contains("scan_complete=false"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn caller_cancellation_reaps_the_owned_child() {
+        let before = search_with("/rusty/nonexistent-rg", "needle", ".", None, 0, &|| true).unwrap();
+        assert_eq!(before.termination, "cancelled");
+        assert!(!before.scan_complete && before.output.text.is_empty());
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf partial; sleep 30"]);
+        let child = spawn_query(&mut cmd).unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let (_, _, _, reason) = collect_query_cancellable(child, Duration::from_secs(5), &|| {
+            started.elapsed() >= Duration::from_millis(50)
+        })
+        .unwrap();
+        assert_eq!(reason, "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
     }
 
     #[test]

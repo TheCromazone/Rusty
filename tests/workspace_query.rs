@@ -166,7 +166,7 @@ fn skipped_paths_and_partial_matches_keep_error_evidence() {
     let f = Fixture::new();
     f.put("good.rs", "needle\n");
     f.put("private.rs", "needle secret\n");
-    fs::set_permissions(f.0.join("private.rs"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(f.0.join("private.rs"), fs::Permissions::from_mode(0o0)).unwrap();
     let partial = f.query("needle", None, 0);
     fs::set_permissions(f.0.join("private.rs"), fs::Permissions::from_mode(0o600)).unwrap();
     assert!(!partial.scan_complete);
