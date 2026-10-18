@@ -2749,6 +2749,26 @@ mod tests {
         assert!(matches!(ask.decide("edit_file", &edit, cwd), Verdict::Ask(_)));
     }
 
+    /// The careful checker is told builds and tests are refused in its
+    /// read-only mode, and to judge them from the transcript instead.
+    #[test]
+    fn read_only_refuses_builds_and_tests() {
+        let cwd = Path::new("/work/proj");
+        let ro = Policy::new(Mode::ReadOnly);
+        for cmd in [
+            "python3 -m unittest -q",
+            "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -q",
+            "pytest -q",
+            "cargo test",
+            "cargo build",
+            "go test ./...",
+            "make",
+        ] {
+            assert!(matches!(ro.decide("bash", &json!({"command": cmd}), cwd), Verdict::Deny(_)), "{cmd}");
+        }
+        assert_eq!(ro.decide("bash", &json!({"command": "diff -r shop /tmp/base"}), cwd), Verdict::Allow);
+    }
+
     #[test]
     fn destructive_ignores_yolo_and_allow_rules() {
         let cwd = Path::new("/work/proj");

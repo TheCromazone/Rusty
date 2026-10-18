@@ -72,7 +72,10 @@ profile if you configured `RUSTY_CAREFUL_MODEL`, `RUSTY_STANDARD_MODEL`, or
 `RUSTY_VIBE_MODEL`; an explicit model choice wins.
 
 The careful checker gets a fresh view of the task and files. It reports
-findings; it cannot edit. There is one checker attempt for a goal, including
+findings; it cannot edit. Because it runs read-only, it cannot run builds or
+tests either: it judges the test evidence from the transcript, and a goal's
+fixed `--verify` check is run by Rusty itself before the goal can close.
+There is one checker attempt for a goal, including
 across resume, and no recursive chain of reviewers. Plain questions do not
 trigger the changed-work review.
 

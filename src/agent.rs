@@ -601,12 +601,24 @@ impl Agent {
         let working = context::working_set(&self.history);
         let recent: Vec<Value> = self.history.iter().rev().take(12).rev().cloned().collect();
         let recent = serde_json::to_string(&recent).unwrap_or_default();
+        // The checker runs read-only, where builds and tests count as writes
+        // and are refused. Say so, so it judges the evidence instead of
+        // spending calls finding that out.
+        let fixed = match self.goal.as_ref().and_then(|g| g.check.as_ref()) {
+            Some(check) => format!(
+                " Before the goal can close, rusty runs the user's fixed check `{}` itself; you don't need to.",
+                check.command()
+            ),
+            None => String::new(),
+        };
         let prompt = format!(
             "Check this proposed completion once, as a read-only reviewer. Look at the actual files or state it \
              touched, compare the work with everything the user asked for, and judge the test evidence. Look for \
              concrete bugs, regressions, and security or data-integrity problems where they matter. You may read \
-             and run read-only commands, never change anything. Report actionable findings with file and line \
-             references, or say you found none and name what you could not verify. Keep it short.\n\n\
+             files and run read-only commands, never change anything. Builds, tests and anything else that writes \
+             files, caches included, are refused here, so don't run them: judge the tests from the commands and \
+             output in the recent steps below.{fixed} Report actionable findings with file and line references, or \
+             say you found none and name what you could not verify. Keep it short.\n\n\
              Task: {query}\n\nWhat the user asked for:\n{constraints}\n\nWorking set:\n{working}\n\n{}\n\
              Recent steps and the proposed completion:\n{}",
             self.plan_text(),

@@ -1886,6 +1886,8 @@ fn careful_goal_gets_one_checker_review_then_closes() {
     assert_eq!(requests.len(), 4);
     let checker = requests[1]["messages"].to_string();
     assert!(checker.contains("read-only reviewer"), "{checker}");
+    assert!(checker.contains("are refused here, so don't run them"), "{checker}");
+    assert!(!checker.contains("fixed check"), "no fixed check was set: {checker}");
     assert!(!requests[1]["tools"].to_string().contains("goal_done"), "the checker can't close the goal");
     let fix = requests[2]["messages"].to_string();
     assert!(fix.contains("checker's review") && fix.contains("empty-input"), "{fix}");
@@ -2335,6 +2337,35 @@ fn a_repeated_read_with_the_same_result_is_not_sent_again() {
     assert_eq!(tools.len(), 2);
     assert!(tools[0].contains("queue:send"), "{tools:?}");
     assert!(tools[1].starts_with("unchanged:") && !tools[1].contains("queue:send"), "{tools:?}");
+}
+
+#[test]
+fn careful_checker_is_told_the_runtime_runs_the_fixed_check() {
+    let s = Sandbox::new("careful-fixed-check");
+    std::fs::write(s.project.join("check.py"), "assert True\n").unwrap();
+    let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
+    let (_, stderr, requests) = scripted_run(
+        &s,
+        &[
+            "--mode",
+            "careful",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--goal",
+            "check the workspace",
+            "--verify",
+            "python3 -B check.py",
+            "--stats",
+        ],
+        vec![done.clone(), text_reply("no findings; tests not rerun"), done],
+    );
+    assert_eq!(requests.len(), 3);
+    let checker = requests[1]["messages"].to_string();
+    assert!(checker.contains("read-only reviewer") && checker.contains("are refused here"), "{checker}");
+    assert!(checker.contains("fixed check `python3 -B check.py` itself"), "{checker}");
+    assert!(stderr.contains("\"goal\":\"done\""), "{stderr}");
 }
 
 #[test]
