@@ -146,6 +146,12 @@ fn bitbucket(url: &str, access: Option<String>, basic: Option<(String, String)>)
     ensure!(bytes.len() <= 1_048_576, "Bitbucket response exceeded 1 MiB");
     serde_json::from_slice(&bytes).context("invalid Bitbucket JSON response")
 }
+/// Blank values count as unset, so an empty export can't stand in for a
+/// credential or hide the other form.
+fn bitbucket_auth(var: impl Fn(&str) -> Option<String>) -> (Option<String>, Option<(String, String)>) {
+    let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+    (set("BITBUCKET_ACCESS_TOKEN"), set("BITBUCKET_EMAIL").zip(set("BITBUCKET_API_TOKEN")))
+}
 pub fn command(backend: &Backend, policy: &Policy, cwd: &Path, path: &Path, args: &[String]) -> Result<String> {
     let action = args.first().map(String::as_str).unwrap_or("status");
     if action == "mcp" || (action == "setup" && args.get(1).is_some_and(|s| s == "mcp")) {
@@ -244,8 +250,7 @@ pub fn command(backend: &Backend, policy: &Policy, cwd: &Path, path: &Path, args
             // download nor transfers its credential to a remote tool backend.
             let verdict = policy.decide("integration_read", &json!({"provider":"bitbucket", "operation":action}), cwd);
             ensure!(matches!(verdict, Verdict::Allow), "integration read refused by permissions: {verdict:?}");
-            let access = std::env::var("BITBUCKET_ACCESS_TOKEN").ok().filter(|t| !t.trim().is_empty());
-            let basic = std::env::var("BITBUCKET_EMAIL").ok().zip(std::env::var("BITBUCKET_API_TOKEN").ok());
+            let (access, basic) = bitbucket_auth(|name| std::env::var(name).ok());
             let data = bitbucket(&url, access, basic)?;
             if action == "check" {
                 return Ok(format!("Bitbucket repository access verified: {}", repo.path));
@@ -278,6 +283,20 @@ mod tests {
             assert!(remote_url(u).is_err(), "{u}");
         }
         assert!(!setup("gitlab", None).unwrap().contains("github.com"));
+    }
+    #[test]
+    fn blank_bitbucket_credentials_count_as_unset() {
+        fn auth(pairs: &[(&str, &str)]) -> (Option<String>, Option<(String, String)>) {
+            bitbucket_auth(|name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string()))
+        }
+        let blank = [("BITBUCKET_ACCESS_TOKEN", " "), ("BITBUCKET_EMAIL", ""), ("BITBUCKET_API_TOKEN", "t")];
+        assert_eq!(auth(&blank), (None, None));
+        assert_eq!(auth(&[("BITBUCKET_EMAIL", "u@example.com"), ("BITBUCKET_API_TOKEN", "\n")]), (None, None));
+        assert_eq!(
+            auth(&[("BITBUCKET_ACCESS_TOKEN", ""), ("BITBUCKET_EMAIL", "u@example.com"), ("BITBUCKET_API_TOKEN", "t")]),
+            (None, Some(("u@example.com".to_string(), "t".to_string())))
+        );
+        assert_eq!(auth(&[("BITBUCKET_ACCESS_TOKEN", "a")]), (Some("a".to_string()), None));
     }
     #[test]
     fn bitbucket_errors_never_echo_response_bodies_or_follow_redirects() {
