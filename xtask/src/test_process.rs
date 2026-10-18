@@ -203,7 +203,7 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         let result = capture(
             Command::new("/bin/sh")
-                .args(["-c", r#"printf '%s' "$$" > "$RUSTY_CAPTURE_READY"; exec /bin/sleep 60"#])
+                .args(["-c", r#"printf '%s' "$$" > "$RUSTY_CAPTURE_READY.next"; /bin/mv "$RUSTY_CAPTURE_READY.next" "$RUSTY_CAPTURE_READY"; exec /bin/sleep 60"#])
                 .env("RUSTY_CAPTURE_READY", root.join("ready")),
             4096,
             Duration::from_secs(120),
