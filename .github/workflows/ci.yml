@@ -43,7 +43,7 @@ concurrency:
 
 jobs:
   check:
-    name: ${{ github.event.action == 'edited' && 'metadata' || 'check' }}
+    name: check
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.suite == 'live' && 45 || inputs.suite == 'cloud' && 30 || 15 }}
     steps:
@@ -57,14 +57,7 @@ jobs:
           ACTION: ${{ github.event.action }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         shell: bash
-        run: |
-          if [[ "$EVENT" == workflow_dispatch ]]; then
-            echo runtime=true >> "$GITHUB_OUTPUT"
-          elif [[ "$ACTION" == edited ]]; then
-            echo runtime=false >> "$GITHUB_OUTPUT"
-          else
-            bash .github/ci-scope.sh "$BASE" HEAD >> "$GITHUB_OUTPUT"
-          fi
+        run: echo runtime=true >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         if: steps.scope.outputs.runtime == 'true' || github.event_name == 'pull_request'
         with:
@@ -74,6 +67,7 @@ jobs:
         with:
           # PRs restore caches; main alone publishes them.
           save-if: ${{ github.event_name == 'push' }}
+          key: qa-${{ hashFiles('Cargo.lock') }}
       - name: Pull request conventions
         if: github.event_name == 'pull_request'
         env:

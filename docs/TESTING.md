@@ -16,12 +16,11 @@ for diagnosis; CI invokes the same QA command developers run locally.
 
 ## CI policy
 
-`.github/workflows/ci.yml` is the only workflow. A code PR runs one Ubuntu
-`check` job. Superseded code runs cancel. Main publishes the Rust cache; PRs
-restore it. Documentation-only changes keep the check present but skip the
-runtime build. Unknown paths, deleted code and diff errors run the full gate.
-PR title/body edits run a separate `metadata` check name, never a replacement
-for the code verdict. Conventions run in the same job, without a second runner.
+`.github/workflows/ci.yml` is the only workflow. Every PR, title/body edit,
+and main push runs `check` and the full offline gate. Superseded code runs
+cancel; metadata edits cannot cancel code checks. The cache includes compiler
+identity and the lockfile. Main publishes caches; PRs restore them. Conventions
+run in the same job, without a second runner.
 
 Use Run workflow to select offline, perf, live or cloud. macOS is available
 explicitly for platform qualification; no automatic OS/model/memory matrix,
