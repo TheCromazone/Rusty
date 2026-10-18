@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 thread_local! { static ACTIVE_FOOTER: RefCell<Weak<RefCell<crate::footer::Footer>>> = const { RefCell::new(Weak::new()) }; }
 
 pub fn refresh_input() {
-    if !crate::ui::tty() {
+    if !crate::ui::interactive() {
         return;
     }
     ACTIVE_FOOTER.with(|f| {

@@ -149,6 +149,10 @@ fn level() -> u8 {
     })
 }
 
+pub fn interactive() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 pub fn tty() -> bool {
     level() > 0
 }
@@ -519,7 +523,7 @@ pub fn fit(s: &str, cells: usize) -> String {
 /// A short separator survives reflow down to 24 columns without becoming a
 /// stack of rules. It stays outside the native multiline line editor.
 pub fn input_rule() {
-    if tty() {
+    if interactive() {
         println!("{}", dim(&"─".repeat(width().saturating_sub(1).min(20))));
     }
 }
@@ -641,13 +645,13 @@ pub fn truncate(s: &str, max: usize) -> &str {
 
 /// Keep the composer at the bottom without erasing existing scrollback.
 pub fn dock_input() {
-    if tty() {
+    if interactive() {
         print!("\x1b[999B\r\n");
     }
 }
 
 pub fn clear_input_hint() {
-    if tty() {
+    if interactive() {
         print!("\x1b[J");
     }
 }
