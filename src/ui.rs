@@ -516,10 +516,11 @@ pub fn fit(s: &str, cells: usize) -> String {
         .collect()
 }
 
-/// A separator outside the line editor keeps multiline input and selection native.
+/// A short separator survives reflow down to 24 columns without becoming a
+/// stack of rules. It stays outside the native multiline line editor.
 pub fn input_rule() {
     if tty() {
-        println!("{}", dim(&"─".repeat(width().saturating_sub(1).min(88))));
+        println!("{}", dim(&"─".repeat(width().saturating_sub(1).min(20))));
     }
 }
 

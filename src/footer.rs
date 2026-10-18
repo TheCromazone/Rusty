@@ -11,25 +11,13 @@ pub struct Footer {
 }
 
 impl Footer {
-    /// The cursor lives on the final panel row, never one row beyond it.
+    /// Keep the cursor at the start of this transient row. Terminal reflow then
+    /// preserves its anchor when the pane contracts; erase its wrapped tail too.
     pub fn clear(&mut self, out: &mut impl Write) {
-        if self.rows == 0 {
-            return;
+        if self.rows > 0 {
+            let _ = write!(out, "\r\x1b[J");
+            self.rows = 0;
         }
-        let _ = write!(out, "\r");
-        if self.rows > 1 {
-            let _ = write!(out, "\x1b[{}A", self.rows - 1);
-        }
-        for row in 0..self.rows {
-            let _ = write!(out, "\x1b[2K");
-            if row + 1 < self.rows {
-                let _ = write!(out, "\x1b[1B\r");
-            }
-        }
-        if self.rows > 1 {
-            let _ = write!(out, "\x1b[{}A", self.rows - 1);
-        }
-        self.rows = 0;
     }
 
     pub fn draw(&mut self, out: &mut impl Write, frame: usize, verb: &str, status: &str, secs: u64) {
@@ -41,6 +29,7 @@ impl Footer {
             }
             let _ = write!(out, "{}", ui::info(line));
         }
+        let _ = write!(out, "\r");
         self.rows = lines.len();
     }
 }
