@@ -30,7 +30,10 @@ so a user's config cannot silently change the tool's flags. Results now include
 filenames even when the scope is a single file. There is no per-file match or
 column limit; the first 28,000 output bytes are retained while both output and
 diagnostics are drained to EOF. All subprocess diagnostics survive partial
-success, up to a separate 2,000-byte prefix with an omission marker.
+success, up to a separate 2,000-byte prefix with an omission marker. Lossy UTF-8
+conversion can temporarily expand invalid raw bytes up to threefold. The retained
+rendered prefixes are capped again at the same byte limits on a UTF-8 boundary,
+and any additional omission sets `output_truncated` or the diagnostic marker.
 
 Only failure to find the ripgrep executable selects grep. The legacy grep
 fallback uses case-insensitive extended regex and build-directory exclusions;
@@ -43,11 +46,11 @@ On Unix, query subprocesses have owned process groups and a 30-second deadline.
 The coordinator drains both pipes with nonblocking reads and bounded prefixes;
 it starts no reader threads. A per-iteration read budget prevents chatty stdout
 from starving stderr or deadline checks. Normal exit kills any ordinary
-remaining descendants and reaps the child. Timeout and I/O/setup failures also
+remaining descendants and reaps the child. Timeout, caller cancellation, and I/O/setup failures also
 kill/reap through the same owner. An exited child gets at most 100 milliseconds
 to close inherited pipes before the coordinator closes its descriptors. Escaped
 process groups are outside containment, but cannot strand a query reader thread.
-`termination=deadline`, `descendants_killed`, or `inherited_pipes` always makes a
+`termination=deadline`, `cancelled`, `descendants_killed`, or `inherited_pipes` makes a
 search incomplete. Only `termination=exited` can report complete. OS scheduling
 and uninterruptible kernel operations prevent a hard real-time guarantee.
 Non-Unix search fails before spawning until bounded pipe support is implemented.
@@ -93,8 +96,12 @@ separate Git worktrees. Error fixtures cover partial results with unreadable
 files, missing roots, invalid regex, directory symlinks, dangling symlinks,
 enumeration budgets, and grep fallback. Tool checks exercise glob mutation and
 outline/listing completeness at their integration point. Cleanup checks exercise
-a chatty deadline, repeated child reaping, ordinary descendant pipe holders,
-and escaped pipe holders without background reader threads.
+a chatty deadline, run-scoped cancellation, repeated child reaping, ordinary descendant pipe holders,
+and escaped pipe holders without background reader threads. A real-CLI offline
+fixture sends SIGINT during a scripted search, checks the query leader is reaped,
+and verifies the exported result says cancelled/incomplete with no verification
+receipt. Raw terminal key-byte handling remains owned by the UI coordinator;
+this fixture proves the signal-handler and run-cancellation path.
 
 The opt-in benchmark alternates old and current execution order over the same
 400-file fixture. Every pair must return the same match set. It reports one
