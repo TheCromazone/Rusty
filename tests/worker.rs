@@ -1150,3 +1150,114 @@ fn completed_background_activity_clears_its_durable_flight() {
     assert_eq!(server.join().unwrap().len(), 3);
     assert_eq!(std::fs::read_to_string(root.join("activity-effect.txt")).unwrap(), "one");
 }
+
+// Replace only this test's pipe endpoint so truncated input reaches EOF. The
+// Worker helper keeps a valid, inert ChildStdin for its existing Drop behavior;
+// no unsafe close/double-close or second process is needed.
+fn close_worker_input(worker: &mut Worker) {
+    let null: std::os::fd::OwnedFd = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap().into();
+    drop(std::mem::replace(&mut worker.input, ChildStdin::from(null)));
+}
+
+fn assert_protocol_error_closes(worker: &mut Worker, expect_completion: bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut error, mut snapshot, mut completion) = (false, false, false);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "protocol shutdown deadline elapsed");
+        let event = worker.events.recv_timeout(remaining).unwrap();
+        match event["kind"].as_str().unwrap() {
+            "protocol.error" => error = true,
+            "session.snapshot" => snapshot = true,
+            "run.completed" => {
+                assert_eq!(event["payload"]["state"], "interrupted");
+                completion = true;
+            }
+            "worker.closing" => {
+                assert_eq!(event["payload"]["reason"], "protocol_error");
+                break;
+            }
+            _ => (),
+        }
+    }
+    assert!(error && snapshot, "protocol error suppressed its final state");
+    assert_eq!(completion, expect_completion);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = worker.child.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(74));
+            break;
+        }
+        assert!(Instant::now() < deadline, "protocol-error worker did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_protocol_session_lease_released(root: &std::path::Path, home: &std::path::Path, url: &str, id: &str) {
+    let mut resumed = Worker::start(root, home, url, &["--continue", id]);
+    resumed.until("session.ready");
+    resumed.send("stop", "shutdown", json!({}));
+    resumed.until("worker.closing");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = resumed.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "resumed worker did not release its lease");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn invalid_input_drains_final_state_and_exits_nonzero_without_provider_calls() {
+    for (label, bytes) in [
+        ("malformed", "{broken JSON}\n"),
+        ("unknown", "{\"protocol\":1,\"request_id\":\"bad\",\"method\":\"unknown.control\",\"params\":{}}\n"),
+        ("truncated", "{\"protocol\":1,\"request_id\":\"partial\""),
+    ] {
+        let tmp = support::TempDir::new(&format!("native-input-{label}"));
+        let root = tmp.path().join("project");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        support::git_repo(&root, &[("keep.txt", "before\n")]);
+        // Any attempted provider connection remains observable in this local
+        // listener's accept queue; no server response or paid endpoint exists.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let mut worker = Worker::start(&root, &home, &url, &[]);
+        let id = worker.until("session.snapshot")["payload"]["session_id"].as_str().unwrap().to_string();
+        worker.input.write_all(bytes.as_bytes()).unwrap();
+        worker.input.flush().unwrap();
+        if label == "truncated" {
+            close_worker_input(&mut worker);
+        }
+        assert_protocol_error_closes(&mut worker, false);
+        assert_protocol_session_lease_released(&root, &home, &url, &id);
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "an idle protocol-error journey contacted a provider"
+        );
+    }
+}
+
+#[test]
+fn invalid_input_cancels_pending_approval_and_drains_completion() {
+    let tmp = support::TempDir::new("native-input-pending-approval");
+    let root = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    support::git_repo(&root, &[("keep.txt", "before\n")]);
+    let (url, server) = provider(vec![tool("write_file", json!({"path":"keep.txt","content":"never"}))]);
+    let mut worker = Worker::start(&root, &home, &url, &["--permissions", "ask"]);
+    let id = worker.until("session.snapshot")["payload"]["session_id"].as_str().unwrap().to_string();
+    worker.send("pending", "message.submit", json!({"text":"update keep"}));
+    worker.until("approval.requested");
+    worker.input.write_all(b"{broken JSON}\n").unwrap();
+    worker.input.flush().unwrap();
+    assert_protocol_error_closes(&mut worker, true);
+    assert_eq!(std::fs::read_to_string(root.join("keep.txt")).unwrap(), "before\n");
+    assert_eq!(server.join().unwrap().len(), 1, "only the initial scripted request is allowed");
+    assert_protocol_session_lease_released(&root, &home, "http://127.0.0.1:9/v1", &id);
+}

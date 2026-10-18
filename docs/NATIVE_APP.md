@@ -22,7 +22,10 @@ must drain diagnostics continuously and retain only a bounded tail.
 
 The wire format is newline-delimited JSON, capped at 4 MiB including newline.
 An incomplete final frame, incompatible version, unknown command, or malformed
-control closes the connection. The first event is `hello`, with protocol,
+control is fatal to the input stream. With healthy output, the worker cancels
+pending work, drains a final snapshot and `worker.closing` with reason
+`protocol_error`, then exits 74. A failed output transport can prevent those
+final frames. The first event is `hello`, with protocol,
 schema hash, protocol capabilities, phase `starting`, and random worker instance identity.
 `session.ready` follows initialization; startup failures carry a typed
 `startup.failed` code (including `lease_busy`). Subsequent event sequences

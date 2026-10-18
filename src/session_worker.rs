@@ -910,6 +910,10 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
     let reader_receipts = receipts.clone();
     let receipt_path = path.clone();
     let (tx, rx) = mpsc::sync_channel::<(String, String, String)>(16);
+    // Invalid input is fatal to the session, but does not mean its output
+    // transport failed. Preserve the final durable state and closing reason.
+    let protocol_failed = Arc::new(AtomicBool::new(false));
+    let reader_protocol_failed = protocol_failed.clone();
     std::thread::spawn(move || {
         let mut input = BufReader::new(transport.input);
         loop {
@@ -917,8 +921,8 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
                 Ok(Some(r)) => r,
                 Ok(None) => break,
                 Err(e) => {
+                    reader_protocol_failed.store(true, Ordering::Release);
                     reader_shared.events.emit("protocol.error", json!({"error":e.to_string()}));
-                    reader_shared.events.fail();
                     break;
                 }
             };
@@ -1030,9 +1034,17 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
         save_receipts(&path, &ledger)?;
     }
     shared.events.emit("session.snapshot", receipt_snapshot(&shared, &receipts.lock().unwrap()));
-    let reason = if shared.events.closed.load(Ordering::Acquire) { "transport_failed" } else { "shutdown" };
+    let failed_input = protocol_failed.load(Ordering::Acquire);
+    let reason = if shared.events.closed.load(Ordering::Acquire) {
+        "transport_failed"
+    } else if failed_input {
+        "protocol_error"
+    } else {
+        "shutdown"
+    };
     shared.events.emit("worker.closing", json!({"reason":reason}));
-    Ok(if shared.events.finish() { 0 } else { 74 })
+    let drained = shared.events.finish();
+    Ok(if drained && !failed_input { 0 } else { 74 })
 }
 
 /// Fault injection is absent from release builds and never invokes a provider.
