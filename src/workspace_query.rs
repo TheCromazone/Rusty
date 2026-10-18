@@ -291,7 +291,8 @@ impl SearchResult {
             ("rg", Mode::Content) => format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible),
             ("rg", Mode::Files) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; names of matching files, most recently modified first]\n".into(),
             ("rg", Mode::Count) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; matches per file, sorted by path]\n".into(),
-            _ => "[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n".into(),
+            ("git-grep", _) => "[scope: git grep fallback; tracked and untracked files with .gitignore applied, smart case ERE; ripgrep hidden/glob/regex parity unavailable]\n".into(),
+            _ => "[scope: grep fallback; smart case ERE, build directories excluded, ignore files not applied; ripgrep ignore/glob/regex parity unavailable]\n".into(),
         };
         let body = if self.output.text.trim().is_empty() {
             if self.scan_complete {
@@ -440,8 +441,10 @@ fn search_with(
     })
 }
 
-/// Without ripgrep, grep: case-insensitive extended regex, build directories
-/// excluded. It lacks rg's semantics, so it never reports a complete scan.
+/// Without ripgrep: `git grep` inside the repository around the working
+/// directory, so ignored files stay out as they do with rg, else plain grep.
+/// Both use rg's smart case. Neither has rg's exact semantics, so neither
+/// reports a complete scan.
 fn fallback(
     pattern: &str,
     path: &str,
@@ -450,13 +453,50 @@ fn fallback(
     mode: Mode,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SearchResult> {
-    let mut grep = Command::new("grep");
-    grep.arg("-rEiIH");
-    match mode {
-        Mode::Content => grep.args(["-n", "-C", context]),
-        Mode::Files => grep.arg("-l"),
-        Mode::Count => grep.arg("-c"),
+    let ignore_case = !pattern.chars().any(char::is_uppercase);
+    let flags = |cmd: &mut Command| {
+        if ignore_case {
+            cmd.arg("-i");
+        }
+        match mode {
+            Mode::Content => cmd.args(["-n", "-C", context]),
+            Mode::Files => cmd.arg("-l"),
+            Mode::Count => cmd.arg("-c"),
+        };
     };
+    if Path::new(path).is_dir() && in_cwd_repo(Path::new(path)) {
+        let mut git = Command::new("git");
+        // Pin the settings that change the output's shape.
+        git.args([
+            "-c",
+            "grep.fullName=false",
+            "-c",
+            "grep.column=false",
+            "grep",
+            "--no-color",
+            "--untracked",
+            "-I",
+            "-E",
+        ]);
+        flags(&mut git);
+        git.args(["-e", pattern, "--"]).args(pathspecs(path, glob));
+        match spawn_query(&mut git) {
+            Ok(child) => {
+                let (output, diagnostics, exit_code, termination) =
+                    collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, None)?;
+                // 128 is git refusing to search at all, as in a repository it
+                // won't read; grep can still try.
+                if exit_code != Some(128) {
+                    return Ok(unaudited("git-grep", mode, output, diagnostics, exit_code, termination));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("cannot start git grep fallback"),
+        }
+    }
+    let mut grep = Command::new("grep");
+    grep.arg("-rEIH");
+    flags(&mut grep);
     for d in SKIP_DIRS {
         grep.arg(format!("--exclude-dir={d}"));
     }
@@ -497,9 +537,31 @@ fn unaudited(
     }
 }
 
+/// `git grep` pathspecs for a search path and an rg-style glob: the glob is
+/// taken relative to the path, and a leading `!` excludes.
+fn pathspecs(path: &str, glob: Option<&str>) -> Vec<String> {
+    let join = |g: &str| if path == "." { g.to_string() } else { format!("{}/{g}", path.trim_end_matches('/')) };
+    match glob {
+        None => vec![path.to_string()],
+        Some(g) => match g.strip_prefix('!') {
+            Some(excluded) => vec![path.to_string(), format!(":(exclude){}", join(excluded))],
+            None => vec![join(g)],
+        },
+    }
+}
+
 /// The top of the git work tree holding `dir`, found by its `.git` entry.
 pub fn repo_root(dir: &Path) -> Option<&Path> {
     dir.ancestors().find(|d| d.join(".git").exists())
+}
+
+/// Whether `path` lies in the work tree around the current directory, the
+/// one `git grep` searches when run from here.
+fn in_cwd_repo(path: &Path) -> bool {
+    let (Ok(cwd), Ok(target)) = (std::env::current_dir().and_then(|d| d.canonicalize()), path.canonicalize()) else {
+        return false;
+    };
+    repo_root(&cwd).is_some_and(|root| target.starts_with(root))
 }
 
 /// Matching file names, most recently modified first as `glob` lists them.
@@ -1093,21 +1155,16 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
 
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
-        let result = search_with(
-            "/rusty/nonexistent-rg",
-            &"pub fn search".to_uppercase(),
-            file!(),
-            None,
-            0,
-            Mode::Content,
-            &|| false,
-        )
-        .unwrap();
+        let missing = "/rusty/nonexistent-rg";
+        let result = search_with(missing, "PUB fn search", file!(), None, 0, Mode::Content, &|| false).unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
-        assert!(!result.output.text.is_empty());
         assert!(result.render().contains("parity unavailable"));
-        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0, Mode::Content, &|| false).unwrap();
+        // Smart case, as with rg: lower case matches any case, upper case is exact.
+        let any_case = search_with(missing, "pub fn search", file!(), None, 0, Mode::Content, &|| false).unwrap();
+        assert!(!any_case.output.text.is_empty());
+        let exact = &"pub fn search".to_uppercase();
+        let empty = search_with(missing, exact, file!(), None, 0, Mode::Content, &|| false).unwrap();
         assert!(empty.render().contains("no matches observed; search incomplete"));
     }
 
@@ -1390,5 +1447,35 @@ esac
         assert!(Mode::parse(None).is_ok_and(|m| m == Mode::Content));
         assert!(Mode::parse(Some("files_with_matches")).is_ok_and(|m| m == Mode::Files));
         assert!(Mode::parse(Some("lines")).is_err());
+    }
+
+    #[test]
+    fn fallback_in_a_repository_uses_git_grep_and_leaves_ignored_files_out() {
+        if Command::new("git").arg("--version").output().is_err()
+            || repo_root(&std::env::current_dir().unwrap()).is_none()
+        {
+            return;
+        }
+        // target/ is ignored by the repository's .gitignore.
+        let token = format!("ignoredprobe{}", std::process::id());
+        let dir = PathBuf::from("target").join(format!("rusty-fallback-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("probe.rs"), &token).unwrap();
+        let hidden = search_with("/rusty/nonexistent-rg", &token, ".", None, 0, Mode::Files, &|| false).unwrap();
+        let shown = search_with("/rusty/nonexistent-rg", "fn search_with", "src", None, 0, Mode::Files, &|| false);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(hidden.engine, "git-grep");
+        assert!(hidden.output.text.is_empty(), "{}", hidden.output.text);
+        let shown = shown.unwrap();
+        assert_eq!(shown.output.text, "src/workspace_query.rs\n");
+        assert!(!shown.scan_complete && shown.render().contains(".gitignore applied"));
+    }
+
+    #[test]
+    fn git_grep_pathspecs_follow_the_path_and_glob() {
+        assert_eq!(pathspecs(".", None), ["."]);
+        assert_eq!(pathspecs(".", Some("*.rs")), ["*.rs"]);
+        assert_eq!(pathspecs("src/", Some("*.rs")), ["src/*.rs"]);
+        assert_eq!(pathspecs("src", Some("!*.md")), ["src", ":(exclude)src/*.md"]);
     }
 }

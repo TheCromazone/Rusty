@@ -67,10 +67,17 @@ response also has a 30,000-byte cap, preserving its completeness header and
 bounded diagnostics and setting `output_truncated=true` when clipped. Outlines
 retain at most 160 bytes from each definition signature.
 
-Only failure to find the ripgrep executable selects grep. The legacy grep
-fallback uses case-insensitive extended regex and build-directory exclusions;
-it cannot promise ripgrep ignore, glob, or regex parity. Its results always say
-`scan_complete=false`, including when grep exits successfully or finds nothing.
+Only failure to find the ripgrep executable selects a fallback. When the search
+path is a directory inside the git work tree around the current directory, it
+is `git grep --untracked`, which searches tracked and untracked files and
+leaves `.gitignore`'d ones out, as ripgrep would; a `-g` glob becomes a
+pathspec under the search path, and `!glob` an exclude. Otherwise, or when git
+is missing or refuses the repository (exit 128), it is grep with
+build-directory exclusions and no ignore rules. Both use extended regex with
+ripgrep's smart case: a pattern with no upper case ignores case. Neither can
+promise ripgrep's hidden-file, glob or regex parity, so their results always
+say `scan_complete=false`, including when they exit successfully or find
+nothing.
 An invalid regex, unreadable path, or failed ripgrep process never becomes a
 complete empty result.
 
