@@ -77,7 +77,7 @@ pub fn set_view(name: &str) -> bool {
     }
 }
 
-pub const READ_TOOLS: &[&str] = &["read_file", "list_files", "search", "glob", "outline", "recall"];
+pub const READ_TOOLS: &[&str] = &["read_file", "list_files", "search", "locate", "glob", "outline", "recall"];
 
 /// What happened in a turn; feeds the recap and the token tips.
 #[derive(Default, Clone, Debug)]
@@ -307,7 +307,7 @@ impl Display {
                 self.stats.reads += 1;
                 *self.stats.file_reads.entry(label.clone()).or_default() += 1;
             }
-            "search" | "glob" | "outline" | "list_files" | "recall" => self.stats.searches += 1,
+            "search" | "locate" | "glob" | "outline" | "list_files" | "recall" => self.stats.searches += 1,
             "edit_file" | "write_file" => self.stats.edits += 1,
             "bash" | "bash_start" => self.stats.commands += 1,
             "task" | "swarm" => self.stats.delegated += 1,
@@ -417,6 +417,7 @@ impl Display {
         for (tool, verb) in [
             ("read_file", "read"),
             ("search", "searched"),
+            ("locate", "located"),
             ("glob", "found"),
             ("outline", "outlined"),
             ("list_files", "listed"),
@@ -434,7 +435,7 @@ impl Display {
                     "search" => {
                         ui::truncate(l.split("/ in ").next().unwrap_or(l).trim_start_matches('/'), 30).to_string()
                     }
-                    "glob" | "recall" => ui::truncate(l, 30).to_string(),
+                    "glob" | "locate" | "recall" => ui::truncate(l, 30).to_string(),
                     _ => short(l),
                 })
                 .collect();
@@ -518,6 +519,7 @@ fn activity(name: &str, label: &str) -> String {
         "read_file" => format!("reading {what}"),
         "search" => format!("searching {}", ui::truncate(label, 40)),
         "glob" => format!("finding {}", ui::truncate(label, 40)),
+        "locate" => format!("locating {}", ui::truncate(label, 40)),
         "outline" => format!("outlining {what}"),
         "list_files" => format!("listing {what}"),
         "recall" => "remembering".into(),

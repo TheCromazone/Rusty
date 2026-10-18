@@ -673,8 +673,8 @@ impl Agent {
             let s = format!(
                 "You are a research worker for a coding agent, working in {}. Investigate the task you are given \
                  with read-only tools and report back: findings first, with path:line references, then anything \
-                 uncertain. You cannot edit files. Prefer search, glob and outline over reading whole files. Stop \
-                 as soon as you can answer; your report should be under 400 words.\n{}",
+                 uncertain. You cannot edit files. Prefer search, locate, glob and outline over reading whole \
+                 files. Stop as soon as you can answer; your report should be under 400 words.\n{}",
                 self.cwd.display(),
                 if self.board.is_some() {
                     "Other workers are investigating other parts at the same time. When you find something they \
@@ -697,8 +697,9 @@ impl Agent {
         );
         s.push_str(
             "How to work:\n\
-             - Look before you change. Find code with search, glob and outline; read only the ranges you need. \
-             Read a file before editing it.\n\
+             - Look before you change. When you don't know where something lives, start with locate; use search \
+             for exact text and glob and outline for structure. Read only the ranges you need. Read a file before \
+             editing it.\n\
              - Make the smallest change that fully solves the task, in the project's existing style.\n\
              - Verify with a build, the tests, or by running the code. Never claim something works without evidence.\n\
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n",
@@ -1659,6 +1660,7 @@ impl Agent {
                 "read_file"
                     | "list_files"
                     | "search"
+                    | "locate"
                     | "glob"
                     | "outline"
                     | "bash"
@@ -1677,7 +1679,7 @@ impl Agent {
         if self.is_worker
             && !matches!(
                 call.name.as_str(),
-                "read_file" | "list_files" | "search" | "glob" | "outline" | "bash" | "share"
+                "read_file" | "list_files" | "search" | "locate" | "glob" | "outline" | "bash" | "share"
             )
         {
             return DispatchResult::refused(

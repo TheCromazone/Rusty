@@ -185,6 +185,8 @@ fn serve(stream: TcpStream) -> Result<()> {
         pause(0.35);
         if tools == 0 {
             sse.call("call0", "write_file", r#"{"path": "capture-note.txt", "content": "verified\n"}"#)?;
+        } else if tools == 1 {
+            sse.call("call1", "locate", r#"{"query": "where is the capture note verified"}"#)?;
         } else if tools < 12 {
             // Writes as well as prints: rusty stops a turn after five
             // commands that only print text.

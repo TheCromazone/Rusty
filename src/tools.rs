@@ -1,4 +1,4 @@
-//! The agent's tools: read, write, edit, list, search and run shell commands.
+//! The agent's tools: read, write, edit, list, search, locate and run shell commands.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -49,6 +49,10 @@ fn build_definitions() -> Value {
             "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
             "context": {"type": "integer", "description": "Lines of context around each match (default 0)"}
         }), &["pattern"]),
+        tool("locate", "Find code from a description when you don't know the names to search for: plain words, identifiers or an error message. Ranks files by the rarer words they share with it and shows each file's best-matching lines with line numbers. Reads the files search would read, fresh on every call; never indexes secrets, lock files, binaries or files over 1 MB. For exact text, use search.", json!({
+            "query": {"type": "string", "description": "What the code does or says, e.g. 'retry when the stream drops'"},
+            "path": {"type": "string", "description": "Only look under this directory (default .)"}
+        }), &["query"]),
         tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents. Skips build directories; includes hidden files; does not apply ignore files. Reports incomplete enumeration and skipped paths.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory to search (default .)"}
@@ -110,6 +114,7 @@ pub fn summary(name: &str, args: &Value) -> String {
         }
         "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".")),
         "glob" => s("pattern"),
+        "locate" => s("query"),
         "outline" => s("path"),
         "swarm" => format!("{} tasks", args["tasks"].as_array().map_or(0, Vec::len)),
         "list_files" => args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".").to_string(),
@@ -173,6 +178,7 @@ pub fn execute(name: &str, args: &Value) -> Result<String> {
         "edit_file" => edit_file(args),
         "list_files" => list_files(args),
         "search" => search(args),
+        "locate" => locate(args),
         "bash" => bash(args),
         other => bail!("unknown tool `{other}`"),
     }
@@ -756,44 +762,25 @@ const SOURCE_EXT: &[&str] = &[
     "scala", "ex", "exs", "lua", "sh", "zig",
 ];
 
-const DEF_PREFIXES: &[&str] = &[
-    "pub fn ",
-    "fn ",
-    "pub(crate) fn ",
-    "async fn ",
-    "pub async fn ",
-    "pub struct ",
-    "struct ",
-    "pub enum ",
-    "enum ",
-    "pub trait ",
-    "trait ",
-    "impl ",
-    "impl<",
-    "pub mod ",
-    "mod ",
-    "macro_rules!",
-    "pub type ",
-    "pub const ",
-    "def ",
-    "async def ",
-    "class ",
-    "function ",
-    "async function ",
-    "export function ",
-    "export async function ",
-    "export default ",
-    "export class ",
-    "export const ",
-    "export interface ",
-    "export type ",
-    "interface ",
-    "func ",
-    "public ",
-    "private ",
-    "protected ",
-    "module ",
-];
+/// Ranked search: the files a search of `path` would read are read and
+/// indexed for this call only, so the answer is as fresh as a grep's.
+fn locate(args: &Value) -> Result<String> {
+    let query = arg(args, "query")?;
+    let path = Path::new(args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or("."));
+    if path.is_file() {
+        bail!("{} is a file; use search or read_file for one file", path.display());
+    }
+    let mut scan = workspace_query::search_files(path);
+    let index = rusty::locate::index(&mut scan);
+    let hits = index.search(query, 8);
+    let body = match (hits.is_empty(), scan.incomplete) {
+        (false, _) => rusty::locate::render(&index, &hits, query),
+        (true, false) => "no matches".into(),
+        (true, true) => "(no matches observed; scan incomplete)".into(),
+    };
+    let truncated = body.len() > workspace_query::OUTPUT_BYTES;
+    Ok(scan.render(truncate(&body, workspace_query::OUTPUT_BYTES), truncated))
+}
 
 fn outline(args: &Value) -> Result<String> {
     let path = Path::new(arg(args, "path")?);
@@ -842,18 +829,9 @@ fn outline(args: &Value) -> Result<String> {
 fn outline_file(path: &Path) -> Result<String> {
     let text = fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let mut out = String::new();
-    for (i, line) in text.lines().enumerate() {
+    for (i, line) in text.lines().enumerate().filter(|(_, l)| rusty::locate::is_definition(l)) {
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
-        if indent > 8 || !DEF_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
-            continue;
-        }
-        // Skip `public`/`private` lines that are fields rather than methods.
-        if (trimmed.starts_with("public ") || trimmed.starts_with("private ") || trimmed.starts_with("protected "))
-            && !trimmed.contains('(')
-        {
-            continue;
-        }
         let sig = trimmed.trim_end_matches(['{', ':', ' ']);
         let _ = writeln!(out, "{:>5}: {}{}", i + 1, " ".repeat(indent.min(8)), truncate(sig, 160));
     }

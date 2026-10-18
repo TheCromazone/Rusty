@@ -2223,6 +2223,30 @@ fn a_repeated_read_with_the_same_result_is_not_sent_again() {
 }
 
 #[test]
+fn locate_finds_code_from_a_description_and_never_shows_secrets() {
+    let s = Sandbox::new("locate");
+    std::fs::create_dir_all(s.project.join("app")).unwrap();
+    std::fs::write(
+        s.project.join("app/store.py"),
+        "def flush_entries(entries):\n    tmp = path + '.tmp'\n    os.replace(tmp, path)  # atomic write to disk\n",
+    )
+    .unwrap();
+    std::fs::write(s.project.join("app/client.py"), "def fetch(url):\n    return session.get(url)\n").unwrap();
+    std::fs::write(s.project.join(".env"), "DISK_WRITE_TOKEN=atomic-disk-secret\n").unwrap();
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--mode", "standard", "--memory", "off", "where do we write to disk?"],
+        vec![tool_reply("locate", serde_json::json!({"query": "write to disk atomically"})), text_reply("found it")],
+    );
+    let result = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
+    // Without ripgrep on the sandbox's PATH, the listing falls back to glob's
+    // rules and says so in a header; the ranking is the same.
+    assert!(result.contains("app/store.py\n"), "{result}");
+    assert!(result.contains("    1: def flush_entries(entries):\n    3:     os.replace(tmp, path)"), "{result}");
+    assert!(!result.contains("client.py") && !result.contains("secret"), "{result}");
+}
+
+#[test]
 fn careful_goal_keeps_its_single_checker_budget_after_resume() {
     use serde_json::json;
     let s = Sandbox::new("resumed-checker");

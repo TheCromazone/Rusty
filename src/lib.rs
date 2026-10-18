@@ -2,6 +2,7 @@
 //! The cloud launcher (`rusty-cloud`) reaches Daytona over its REST API.
 pub mod advisor;
 pub mod cloud;
+pub mod locate;
 pub mod privacy;
 pub mod recall;
 pub mod workspace_query;

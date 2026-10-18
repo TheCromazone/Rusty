@@ -32,6 +32,7 @@ const TOOLS: &[&str] = &[
     "bash",
     "list_files",
     "search",
+    "locate",
     "glob",
     "outline",
     "plan",
