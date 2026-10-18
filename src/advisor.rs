@@ -299,6 +299,8 @@ pub struct Hooks {
     tx: mpsc::SyncSender<Work>,
     #[cfg(test)]
     wait: Option<HookWait>,
+    #[cfg(test)]
+    worker_life: std::sync::Weak<()>,
     pub level: Level,
     scope: String,
     session: String,
@@ -342,7 +344,13 @@ impl Hooks {
             }
         }
         let (tx, rx) = mpsc::sync_channel::<Work>(8);
+        #[cfg(test)]
+        let live = std::sync::Arc::new(());
+        #[cfg(test)]
+        let worker_life = std::sync::Arc::downgrade(&live);
         std::thread::spawn(move || {
+            #[cfg(test)]
+            let _live = live;
             for (req, reply) in rx {
                 let _ = reply.send(rpc(&socket, &req));
             }
@@ -351,6 +359,8 @@ impl Hooks {
             tx,
             #[cfg(test)]
             wait: None,
+            #[cfg(test)]
+            worker_life,
             level,
             scope: scope(cwd),
             session: format!("{}-{}", std::process::id(), now()),
