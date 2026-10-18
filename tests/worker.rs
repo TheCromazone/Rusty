@@ -1213,7 +1213,7 @@ fn assert_protocol_session_lease_released(root: &std::path::Path, home: &std::pa
 fn invalid_input_drains_final_state_and_exits_nonzero_without_provider_calls() {
     for (label, bytes) in [
         ("malformed", "{broken JSON}\n"),
-        ("unknown", "{\"protocol\":1,\"request_id\":\"bad\",\"method\":\"unknown.control\",\"params\":{}}\n"),
+        ("version", "{\"protocol\":2,\"request_id\":\"bad\",\"method\":\"snapshot\",\"params\":{}}\n"),
         ("truncated", "{\"protocol\":1,\"request_id\":\"partial\""),
     ] {
         let tmp = support::TempDir::new(&format!("native-input-{label}"));
@@ -1259,5 +1259,100 @@ fn invalid_input_cancels_pending_approval_and_drains_completion() {
     assert_protocol_error_closes(&mut worker, true);
     assert_eq!(std::fs::read_to_string(root.join("keep.txt")).unwrap(), "before\n");
     assert_eq!(server.join().unwrap().len(), 1, "only the initial scripted request is allowed");
+    assert_protocol_session_lease_released(&root, &home, "http://127.0.0.1:9/v1", &id);
+}
+
+#[test]
+fn rejected_controls_preserve_approval_lease_and_exact_request_ids() {
+    let tmp = support::TempDir::new("native-recoverable-controls");
+    let root = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    support::git_repo(&root, &[("keep.txt", "before\n")]);
+    let (url, server) =
+        provider(vec![tool("write_file", json!({"path":"keep.txt","content":"never"})), text("Denied.")]);
+    let mut worker = Worker::start(&root, &home, &url, &["--permissions", "ask"]);
+    worker.until("session.snapshot");
+    worker.send("submit", "message.submit", json!({"text":"update keep"}));
+    let approval = worker.until("approval.requested")["payload"].clone();
+    for (control, expected_id, code) in [
+        (
+            json!({"protocol":1,"request_id":"exact.id:1","method":"unknown","params":{}}),
+            json!("exact.id:1"),
+            "invalid_command",
+        ),
+        (
+            json!({"protocol":1,"request_id":"invalid-params","method":"approval.decide","params":{"allowed":true}}),
+            json!("invalid-params"),
+            "invalid_command",
+        ),
+        (json!({"protocol":1,"method":"snapshot","params":{}}), Value::Null, "invalid_request_id"),
+        (json!({"protocol":1,"request_id":"a/b","method":"snapshot","params":{}}), Value::Null, "invalid_request_id"),
+        (
+            json!({"protocol":1,"request_id":"x".repeat(129),"method":"snapshot","params":{}}),
+            Value::Null,
+            "invalid_request_id",
+        ),
+        (json!({"protocol":1,"request_id":42,"method":"snapshot","params":{}}), Value::Null, "invalid_request_id"),
+        (json!({"protocol":1,"request_id":"missing-method","params":{}}), json!("missing-method"), "invalid_command"),
+    ] {
+        writeln!(worker.input, "{control}").unwrap();
+        worker.input.flush().unwrap();
+        let reply = loop {
+            let reply = worker.until("reply")["payload"].clone();
+            if reply["request_id"] != "submit" {
+                break reply;
+            }
+        };
+        assert_eq!(reply["request_id"], expected_id);
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["code"], code);
+        worker.send("same-control-id", "snapshot", json!({}));
+        let snapshot = worker.response("same-control-id")["result"].clone();
+        assert_eq!(snapshot["pending_approval"]["approval_id"], approval["approval_id"]);
+        assert_eq!(snapshot["pending_approval"]["operation_digest"], approval["operation_digest"]);
+        assert_eq!(snapshot["phase"], "running");
+        assert!(worker.child.try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read_to_string(root.join("keep.txt")).unwrap(), "before\n");
+    }
+    worker.send(
+        "deny",
+        "approval.decide",
+        json!({"approval_id":approval["approval_id"],"operation_digest":approval["operation_digest"],"allowed":false}),
+    );
+    worker.until("run.completed");
+    worker.send("submit", "message.submit", json!({"text":"update keep"}));
+    assert_eq!(worker.response("submit")["result"]["duplicate"], true);
+    worker.send("submit", "message.submit", json!({"text":"different text"}));
+    assert_eq!(worker.response("submit")["ok"], false);
+    worker.send("stop", "shutdown", json!({}));
+    worker.until("worker.closing");
+    assert!(worker.child.wait().unwrap().success());
+    assert_eq!(std::fs::read_to_string(root.join("keep.txt")).unwrap(), "before\n");
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn consecutive_invalid_controls_are_bounded_and_valid_controls_reset_the_limit() {
+    let tmp = support::TempDir::new("native-invalid-control-bound");
+    let root = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    support::git_repo(&root, &[("keep.txt", "before\n")]);
+    let mut worker = Worker::start(&root, &home, "http://127.0.0.1:9/v1", &[]);
+    let id = worker.until("session.snapshot")["payload"]["session_id"].as_str().unwrap().to_string();
+    for _ in 0..2 {
+        for _ in 0..63 {
+            worker.send("bad", "unknown", json!({}));
+            assert_eq!(worker.response("bad")["ok"], false);
+        }
+        worker.send("reset", "snapshot", json!({}));
+        assert_eq!(worker.response("reset")["ok"], true);
+    }
+    for _ in 0..64 {
+        worker.send("bad", "unknown", json!({}));
+        assert_eq!(worker.response("bad")["ok"], false);
+    }
+    assert_protocol_error_closes(&mut worker, false);
     assert_protocol_session_lease_released(&root, &home, "http://127.0.0.1:9/v1", &id);
 }

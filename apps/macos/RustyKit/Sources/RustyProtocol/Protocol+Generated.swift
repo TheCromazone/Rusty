@@ -347,15 +347,17 @@ public struct ToolCompletedPayload: Codable, Equatable, Sendable {
 }
 
 public struct ReplyPayload: Codable, Equatable, Sendable {
-    public var `request_id`: String
+    public var `request_id`: String?
     public var `ok`: Bool
     public var `result`: JSONValue?
     public var `error`: String?
-    public init(`request_id`: String, `ok`: Bool, `result`: JSONValue?, `error`: String?) {
+    public var `code`: String?
+    public init(`request_id`: String?, `ok`: Bool, `result`: JSONValue?, `error`: String?, `code`: String?) {
         self.request_id = `request_id`
         self.ok = `ok`
         self.result = `result`
         self.error = `error`
+        self.code = `code`
     }
 }
 
@@ -520,4 +522,4 @@ public enum JSONValue: Codable, Equatable, Sendable {
     }
 }
 
-public let protocolSchemaHash = "aaff2e880ffd13a88ffda4e263beddb78c15518a97905387de5fe2b1fe38d9ff"
+public let protocolSchemaHash = "c6b09ba349dd23a385363466abfb01e6ac7e28cd7fb95fb49b0ca4e836f7cc63"

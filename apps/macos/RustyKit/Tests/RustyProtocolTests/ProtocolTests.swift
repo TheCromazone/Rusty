@@ -13,7 +13,7 @@ final class ProtocolTests: XCTestCase {
             frames += try parser.feed(data[offset..<min(offset + 3, data.count)])
         }
         try parser.finish()
-        XCTAssertEqual(frames.count, 9)
+        XCTAssertEqual(frames.count, 10)
         let hello = try JSONDecoder().decode(Event.self, from: frames[0])
         guard case .object(let helloPayload) = hello.payload else { return XCTFail("hello payload") }
         XCTAssertEqual(helloPayload["schema_hash"], .string(protocolSchemaHash))
@@ -33,6 +33,19 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(params.operation_digest, "sha256:fixture-operation")
         XCTAssertEqual(params.typed, "yes")
         XCTAssertTrue(params.allowed)
+    }
+    func testRecoverableControlReplyPreservesCorrelation() throws {
+        let ids: [String?] = [nil, "exact.valid-id:1"]
+        for id in ids {
+            let reply = ReplyPayload(request_id: id, ok: false, result: nil, error: "invalid control", code: "invalid_request_id")
+            let payload = try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(reply))
+            let event = Event(protocol: 1, instance_id: "host", seq: 1, kind: "reply", payload: payload)
+            guard case .event(let decoded) = try WireFrame.decode(WireFrame.event(event).encoded().dropLast()),
+                  case .ReplyPayload(let result) = try decoded.decodedPayload() else { return XCTFail("typed reply required") }
+            XCTAssertEqual(result.request_id, id)
+            XCTAssertFalse(result.ok)
+            XCTAssertEqual(result.code, "invalid_request_id")
+        }
     }
     func testAdditiveEnvelopeAndMissingOptionalFields() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "forward-compat", withExtension: "ndjson", subdirectory: "Fixtures"))

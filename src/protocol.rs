@@ -62,7 +62,7 @@ wire_struct!(RunCompletedPayload { run_id:String => "String", request_id:String 
 wire_struct!(ToolProposedPayload { name:String => "String", arguments:Value => "JSONValue" });
 wire_struct!(ToolStartedPayload { name:String => "String", arguments:Value => "JSONValue", requester:String => "String", tool_id:String => "String" });
 wire_struct!(ToolCompletedPayload { name:String => "String", arguments:Value => "JSONValue", text:String => "String", ok:bool => "Bool" });
-wire_struct!(ReplyPayload { request_id:String => "String", ok:bool => "Bool", result:Option<Value> => "JSONValue?", error:Option<String> => "String?" });
+wire_struct!(ReplyPayload { request_id:Option<String> => "String?", ok:bool => "Bool", result:Option<Value> => "JSONValue?", error:Option<String> => "String?", code:Option<String> => "String?" });
 wire_struct!(ResyncPayload { reason:String => "String" });
 wire_struct!(MessageDeltaPayload { text:String => "String" });
 wire_struct!(ReasoningDeltaPayload { text:String => "String" });
@@ -120,7 +120,7 @@ macro_rules! commands {
         impl Request {
             pub fn command(&self) -> Result<Command, ProtocolError> {
                 if self.protocol != VERSION { return Err(ProtocolError::Invalid("unsupported protocol version".into())); }
-                if self.request_id.is_empty() || self.request_id.len() > 128 || !self.request_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b)) { return Err(ProtocolError::Invalid("request_id must contain 1..128 ASCII letters, digits, . _ : or -".into())); }
+                if !valid_request_id(&self.request_id) { return Err(ProtocolError::Invalid("request_id must contain 1..128 ASCII letters, digits, . _ : or -".into())); }
                 match self.method.as_str() {
                     $($method => serde_json::from_value(self.params.clone()).map(Command::$variant).map_err(|e|ProtocolError::Invalid(e.to_string())),)*
                     _ => Err(ProtocolError::Invalid("unknown method".into())),
@@ -177,6 +177,44 @@ pub fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>, Protoc
     request.command()?;
     Ok(Some(request))
 }
+/// A complete, version-matching JSON command can be rejected without losing the
+/// session. Errors use fixed strings; attacker-controlled fields are never echoed.
+pub enum ControlInput {
+    Request(Request),
+    Rejected { request_id: Option<String>, code: &'static str },
+}
+pub const MAX_INVALID_CONTROLS: usize = 64;
+fn valid_request_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+}
+pub fn read_control(reader: &mut impl BufRead) -> Result<Option<ControlInput>, ProtocolError> {
+    let Some(bytes) = read_frame(reader)? else { return Ok(None) };
+    let request = match serde_json::from_slice::<Request>(&bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|_| ProtocolError::Invalid("invalid JSON or UTF-8".into()))?;
+            if value.get("protocol").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
+                return Err(ProtocolError::Invalid("missing or unsupported protocol version".into()));
+            }
+            let request_id =
+                value.get("request_id").and_then(Value::as_str).filter(|id| valid_request_id(id)).map(str::to_owned);
+            let code = if request_id.is_some() { "invalid_command" } else { "invalid_request_id" };
+            return Ok(Some(ControlInput::Rejected { request_id, code }));
+        }
+    };
+    if request.protocol != VERSION {
+        return Err(ProtocolError::Invalid("unsupported protocol version".into()));
+    }
+    if !valid_request_id(&request.request_id) {
+        return Ok(Some(ControlInput::Rejected { request_id: None, code: "invalid_request_id" }));
+    }
+    if request.command().is_err() {
+        return Ok(Some(ControlInput::Rejected { request_id: Some(request.request_id), code: "invalid_command" }));
+    }
+    Ok(Some(ControlInput::Request(request)))
+}
+
 pub fn read_frame(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut frame = Vec::new();
     loop {
@@ -247,7 +285,7 @@ fn computed_schema_hash() -> String {
 pub fn fixture_frames() -> Vec<String> {
     use serde_json::json;
     let values = vec![
-        json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":1,"kind":"hello","payload":{"protocol":VERSION,"schema_hash":computed_schema_hash(),"worker_instance_id":"fixture-host-1","inspect_only":false,"phase":"starting","protocol_capabilities":["message.submit","run.cancel","snapshot","approval.decide","shutdown"]}}),
+        json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":1,"kind":"hello","payload":{"protocol":VERSION,"schema_hash":computed_schema_hash(),"worker_instance_id":"fixture-host-1","inspect_only":false,"phase":"starting","protocol_capabilities":["message.submit","run.cancel","snapshot","approval.decide","shutdown","recoverable_controls"]}}),
         json!({"protocol":VERSION,"request_id":"submit-1","method":"message.submit","params":{"text":"Fix café 🦀\nthen test"}}),
         json!({"protocol":VERSION,"request_id":"cancel-1","method":"run.cancel","params":{"run_id":"run-1"}}),
         json!({"protocol":VERSION,"request_id":"approve-1","method":"approval.decide","params":{"approval_id":"approval-1","allowed":true,"operation_digest":"sha256:fixture-operation","typed":"yes"}}),
@@ -256,6 +294,7 @@ pub fn fixture_frames() -> Vec<String> {
         json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":2,"kind":"approval.requested","payload":{"approval_id":"approval-1","operation_digest":"sha256:fixture-operation","operation":{"name":"bash","arguments":{"command":"git clean -fdx"},"requester":"lead"},"expires_at":1792275000u64,"typed_phrase":"yes","sensitive":true}}),
         json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":3,"kind":"session.snapshot","payload":{"worker_instance_id":"fixture-host-1","snapshot_watermark":2,"session_id":"fixture-session","run_id":null,"phase":"uncertain","live_text":"","live_reasoning":"","live_truncated":false,"last_tool":null,"pending_approval":null,"history":{"messages":[],"truncated":false},"cost_usd":null,"receipts":{},"receipts_truncated":false,"uncertain_run_count":1,"uncertain_runs":[{"request_id":"submit-1","run_id":"run-1"}],"uncertain_runs_truncated":false,"uncertain_tools":[],"uncertain_tool_count":0,"uncertain_tools_truncated":false,"in_flight_tools":[],"in_flight_tools_truncated":false}}),
         json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":4,"kind":"future.optional.notice","payload":{"extension":{"diagnostic":true}}}),
+        json!({"protocol":VERSION,"instance_id":"fixture-host-1","seq":5,"kind":"reply","payload":{"request_id":null,"ok":false,"result":null,"error":"invalid control","code":"invalid_request_id"}}),
     ];
     values.into_iter().map(|v| serde_json::to_string(&v).expect("fixture serialization")).collect()
 }
@@ -415,6 +454,28 @@ mod tests {
             assert!(read_request(&mut Cursor::new(value.to_string() + "\n")).is_err());
         }
         assert!(read_request(&mut Cursor::new(b"{broken}\n")).is_err());
+    }
+    #[test]
+    fn recoverable_decoder_keeps_framing_and_version_errors_fatal() {
+        for bytes in [
+            b"{broken}\n".as_slice(),
+            b"{\"protocol\":1,\"request_id\":\"\xff\"}\n".as_slice(),
+            b"{\"request_id\":\"r\",\"method\":\"snapshot\",\"params\":{}}\n".as_slice(),
+            b"{\"protocol\":2,\"request_id\":\"r\",\"method\":\"snapshot\",\"params\":{}}\n".as_slice(),
+            b"{}".as_slice(),
+        ] {
+            assert!(read_control(&mut Cursor::new(bytes)).is_err());
+        }
+        assert!(read_control(&mut Cursor::new(vec![b'x'; MAX_FRAME_BYTES + 1])).is_err());
+    }
+    #[test]
+    fn duplicate_envelope_fields_cannot_execute_a_control() {
+        let line =
+            b"{\"protocol\":1,\"request_id\":\"r\",\"method\":\"shutdown\",\"method\":\"snapshot\",\"params\":{}}\n";
+        assert!(matches!(
+            read_control(&mut Cursor::new(line)).unwrap(),
+            Some(ControlInput::Rejected { code: "invalid_command", .. })
+        ));
     }
     #[test]
     fn every_command_rejects_unknown_parameter_keys() {

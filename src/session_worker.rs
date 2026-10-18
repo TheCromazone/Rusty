@@ -61,7 +61,7 @@ impl Transport {
         let protocol_capabilities: &[&str] = if inspect_only {
             &["inspect", "snapshot"]
         } else {
-            &["message.submit", "run.cancel", "approval.decide", "snapshot", "shutdown"]
+            &["message.submit", "run.cancel", "approval.decide", "snapshot", "shutdown", "recoverable_controls"]
         };
         let mut transport = Self { input, output, instance };
         crate::protocol::write_frame(
@@ -910,15 +910,34 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
     let reader_receipts = receipts.clone();
     let receipt_path = path.clone();
     let (tx, rx) = mpsc::sync_channel::<(String, String, String)>(16);
-    // Invalid input is fatal to the session, but does not mean its output
-    // transport failed. Preserve the final durable state and closing reason.
+    // Framing/version failure is fatal, but schema-invalid controls preserve
+    // the session. A fatal input error still drains final durable state.
     let protocol_failed = Arc::new(AtomicBool::new(false));
     let reader_protocol_failed = protocol_failed.clone();
     std::thread::spawn(move || {
         let mut input = BufReader::new(transport.input);
+        let mut invalid_controls = 0;
         loop {
-            let request = match crate::protocol::read_request(&mut input) {
-                Ok(Some(r)) => r,
+            let request = match crate::protocol::read_control(&mut input) {
+                Ok(Some(crate::protocol::ControlInput::Request(request))) => {
+                    invalid_controls = 0;
+                    request
+                }
+                Ok(Some(crate::protocol::ControlInput::Rejected { request_id, code })) => {
+                    reader_shared.events.emit(
+                        "reply",
+                        json!({"request_id":request_id,"ok":false,"error":"invalid control","code":code}),
+                    );
+                    invalid_controls += 1;
+                    if invalid_controls < crate::protocol::MAX_INVALID_CONTROLS {
+                        continue;
+                    }
+                    reader_protocol_failed.store(true, Ordering::Release);
+                    reader_shared
+                        .events
+                        .emit("protocol.error", json!({"error":"too many consecutive invalid controls"}));
+                    break;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     reader_protocol_failed.store(true, Ordering::Release);

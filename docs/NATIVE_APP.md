@@ -21,8 +21,19 @@ No listening TCP server or new authentication surface is created. The parent
 must drain diagnostics continuously and retain only a bounded tail.
 
 The wire format is newline-delimited JSON, capped at 4 MiB including newline.
-An incomplete final frame, incompatible version, unknown command, or malformed
-control is fatal to the input stream. With healthy output, the worker cancels
+An incomplete final frame, invalid UTF-8/JSON, or missing/incompatible protocol
+version is fatal to the input stream. The writable session worker advertises
+`recoverable_controls`: complete version-matching JSON with an unknown method,
+invalid parameters/envelope, or invalid request ID receives a bounded
+`reply{ok:false,error:"invalid control",code:...}` without changing the active
+run, pending approval, or lease. Codes are `invalid_command` and
+`invalid_request_id`; valid IDs are echoed exactly, missing/malformed IDs are
+null. The 64th consecutive schema-invalid control receives its reply then
+closes through the fatal path; a schema-valid control resets the counter.
+Controls are handled serially and settle before the next is admitted, so there
+is no pending-control ID history to retain: a settled ID may be reused. Durable
+message submission idempotency remains separate. Inspect-worker and invalid-ledger
+read-only recovery channels retain strict decoding. With healthy output, the worker cancels
 pending work, drains a final snapshot and `worker.closing` with reason
 `protocol_error`, then exits 74. A failed output transport can prevent those
 final frames. The first event is `hello`, with protocol,
