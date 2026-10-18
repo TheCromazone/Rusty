@@ -423,6 +423,11 @@ fn search_with(
     })
 }
 
+/// The top of the git work tree holding `dir`, found by its `.git` entry.
+pub fn repo_root(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|d| d.join(".git").exists())
+}
+
 /// Audit every drained frame independently of the retained display prefix.
 /// Both an unfinished frame and retained per-file keys have a fixed byte budget.
 struct RgAudit {
@@ -538,6 +543,8 @@ pub struct Enumeration {
     pub incomplete: bool,
     pub diagnostics: Vec<String>,
     pub skipped: usize,
+    /// The root is in a git repository, so `.gitignore` rules were applied.
+    pub ignores_applied: bool,
     visited: usize,
 }
 
@@ -563,7 +570,11 @@ impl Enumeration {
             "[query scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true skipped={}]\n",
             !self.incomplete, output_truncated, self.skipped
         );
-        let scope = "[scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n";
+        let scope = if self.ignores_applied {
+            "[scope: build/dependency directories and .gitignore'd paths excluded; hidden files included; descendant directory symlinks skipped; not an atomic snapshot]\n"
+        } else {
+            "[scope: build/dependency directories excluded; hidden files included; ignore files not applied (not a git repository); descendant directory symlinks skipped; not an atomic snapshot]\n"
+        };
         let mut diagnostics = String::new();
         for diagnostic in &self.diagnostics {
             let _ = write!(diagnostics, "\n[skipped] {diagnostic}");
@@ -579,13 +590,102 @@ impl Enumeration {
     }
 }
 
+/// `.gitignore` rules as git applies them inside a repository: each file's
+/// rules are relative to its directory, a later match overrides an earlier
+/// one, and `!` re-includes. `.git/info/exclude` counts; global excludes
+/// would need git's configuration and are not read.
+#[derive(Default)]
+struct Ignores {
+    active: bool,
+    rules: Vec<IgnoreRule>,
+}
+
+struct IgnoreRule {
+    /// The directory the rule's file sits in, as the walk spells it.
+    base: PathBuf,
+    /// For a file above the walk's root: the root's path below that file's
+    /// directory, so anchored rules still match from where they were written.
+    above: String,
+    glob: String,
+    negate: bool,
+    dir_only: bool,
+    anchored: bool,
+}
+
+impl Ignores {
+    fn load(&mut self, from: &Path, base: &Path, above: &str) {
+        for file in [from.join(".gitignore"), from.join(".git").join("info").join("exclude")] {
+            let Ok(text) = fs::read_to_string(&file) else { continue };
+            for line in text.lines().map(str::trim_end) {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (negate, line) = line.strip_prefix('!').map_or((false, line), |l| (true, l));
+                let line = line.strip_prefix('\\').unwrap_or(line);
+                let (dir_only, line) = line.strip_suffix('/').map_or((false, line), |l| (true, l));
+                // A slash anywhere but the end ties the rule to its directory.
+                let anchored = line.contains('/');
+                let glob = line.trim_start_matches('/');
+                if !glob.is_empty() {
+                    self.rules.push(IgnoreRule {
+                        base: base.to_path_buf(),
+                        above: above.to_string(),
+                        glob: glob.to_string(),
+                        negate,
+                        dir_only,
+                        anchored,
+                    });
+                }
+            }
+        }
+    }
+
+    fn ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let mut ignored = false;
+        for rule in &self.rules {
+            // Only an ignoring rule can ignore, and only a `!` rule re-include.
+            if ignored != rule.negate || (rule.dir_only && !is_dir) {
+                continue;
+            }
+            let hit = if rule.anchored {
+                path.strip_prefix(&rule.base).is_ok_and(|rel| {
+                    let rel = rel.to_string_lossy();
+                    let rel = if rule.above.is_empty() { rel.into_owned() } else { format!("{}/{rel}", rule.above) };
+                    wildcard(rule.glob.as_bytes(), rel.as_bytes())
+                })
+            } else {
+                wildcard(rule.glob.as_bytes(), name.as_bytes())
+            };
+            if hit {
+                ignored = !rule.negate;
+            }
+        }
+        ignored
+    }
+}
+
 pub fn files_under(root: &Path) -> Enumeration {
     let mut scan = Enumeration::default();
-    enumerate(root, 0, ENTRY_LIMIT, &mut scan);
+    let mut ignores = Ignores::default();
+    if let Ok(canonical) = root.canonicalize() {
+        if let Some(top) = repo_root(&canonical) {
+            ignores.active = true;
+            // Rules in the directories from the repository's top down to the root.
+            let mut above: Vec<&Path> = canonical.ancestors().skip(1).take_while(|d| d.starts_with(top)).collect();
+            above.reverse();
+            for dir in above {
+                let below = canonical.strip_prefix(dir).unwrap_or(&canonical).to_string_lossy().into_owned();
+                ignores.load(dir, root, &below);
+            }
+        }
+    }
+    scan.ignores_applied = ignores.active;
+    enumerate(root, 0, ENTRY_LIMIT, &mut scan, &mut ignores);
     scan
 }
 
-fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
+fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration, ignores: &mut Ignores) {
     if depth >= 128 || scan.visited >= limit {
         scan.skip(dir, "enumeration budget reached; subtree not scanned");
         return;
@@ -611,6 +711,11 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
         }
     }
     items.sort_by_key(|e| e.file_name());
+    // This directory's rules hold for everything beneath it, and no further.
+    let inherited = ignores.rules.len();
+    if ignores.active {
+        ignores.load(dir, dir, "");
+    }
     for entry in items {
         let path = entry.path();
         let metadata = match fs::metadata(&path) {
@@ -620,13 +725,16 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
                 continue;
             }
         };
+        if ignores.ignored(&path, metadata.is_dir()) {
+            continue;
+        }
         if metadata.is_dir() {
             if SKIP_DIRS.iter().any(|d| entry.file_name() == *d) {
                 continue;
             }
             match entry.file_type() {
                 Ok(t) if t.is_symlink() => scan.skip(&path, "directory symlink not followed"),
-                Ok(_) => enumerate(&path, depth + 1, limit, scan),
+                Ok(_) => enumerate(&path, depth + 1, limit, scan, ignores),
                 Err(e) => scan.skip(&path, e),
             }
         } else if metadata.is_file() {
@@ -634,6 +742,33 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
         } else {
             scan.skip(&path, "not a regular file");
         }
+    }
+    ignores.rules.truncate(inherited);
+}
+
+/// Glob matching: `*` and `?` stay within one path segment, `**` crosses them.
+pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
+    if p.starts_with(b"**/") {
+        return (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && wildcard(&p[3..], &s[i..]));
+    }
+    if p.starts_with(b"**") {
+        return (0..=s.len()).any(|i| wildcard(&p[2..], &s[i..]));
+    }
+    match p.first() {
+        None => s.is_empty(),
+        Some(b'*') => {
+            for i in 0..=s.len() {
+                if wildcard(&p[1..], &s[i..]) {
+                    return true;
+                }
+                if i < s.len() && s[i] == b'/' {
+                    break;
+                }
+            }
+            false
+        }
+        Some(b'?') => !s.is_empty() && s[0] != b'/' && wildcard(&p[1..], &s[1..]),
+        Some(c) => s.first() == Some(c) && wildcard(&p[1..], &s[1..]),
     }
 }
 
@@ -1005,10 +1140,54 @@ os._exit(0)
             fs::write(dir.join(format!("{i}.rs")), "").unwrap();
         }
         let mut scan = Enumeration::default();
-        enumerate(&dir, 0, 2, &mut scan);
+        enumerate(&dir, 0, 2, &mut scan, &mut Ignores::default());
         assert_eq!(scan.files.len(), 2);
         assert!(scan.incomplete && scan.skipped > 0);
         assert!(scan.render("no files observed", false).contains("remaining entries not scanned"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn enumeration_applies_gitignore_rules_inside_a_repository() {
+        let root = std::env::temp_dir().join(format!("rusty-enumeration-ignores-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in [".git/info", "build-out", "src/build-out", "sub", "other"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let files = [
+            (".gitignore", "# comment\n*.log\n!keep.log\n/build-out/\nsub/deep.txt\n"),
+            (".git/info/exclude", "secret.txt\n"),
+            ("sub/.gitignore", "local.rs\n"),
+            ("a.log", ""),
+            ("keep.log", ""),
+            ("secret.txt", ""),
+            ("build-out/x.rs", ""),
+            ("src/build-out/y.rs", ""),
+            ("sub/deep.txt", ""),
+            ("sub/local.rs", ""),
+            ("sub/kept.rs", ""),
+            ("other/local.rs", ""),
+        ];
+        for (path, text) in files {
+            fs::write(root.join(path), text).unwrap();
+        }
+        let listed = |from: &Path| {
+            let scan = files_under(from);
+            assert!(scan.ignores_applied && !scan.incomplete);
+            let mut names: Vec<String> =
+                scan.files.iter().map(|f| f.strip_prefix(from).unwrap().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            listed(&root),
+            [".gitignore", "keep.log", "other/local.rs", "src/build-out/y.rs", "sub/.gitignore", "sub/kept.rs"]
+        );
+        // Rules written above the root still apply, anchored ones included.
+        assert_eq!(listed(&root.join("sub")), [".gitignore", "kept.rs"]);
+        fs::remove_dir_all(root.join(".git")).unwrap();
+        let plain = files_under(&root);
+        assert!(!plain.ignores_applied && plain.files.len() == files.len() - 1);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

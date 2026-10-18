@@ -103,9 +103,10 @@ fn fixed_regex_case_glob_context_and_visibility_match_reference() {
     }
     let enumeration = files_under(&f.0);
     assert!(!enumeration.incomplete);
-    // Glob/outline intentionally retain their prior visibility policy, unlike rg.
+    // Glob/outline show hidden files, unlike rg, but leave out what git ignores.
     assert!(enumeration.files.contains(&f.0.join(".hidden.rs")));
-    assert!(enumeration.files.contains(&f.0.join("ignored/no.rs")));
+    assert!(!enumeration.files.contains(&f.0.join("ignored/no.rs")));
+    assert!(enumeration.ignores_applied);
     assert!(!enumeration.files.iter().any(|p| p.starts_with(f.0.join(".git"))));
 }
 

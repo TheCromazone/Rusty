@@ -83,9 +83,16 @@ search incomplete. Only `termination=exited` can report complete. OS scheduling
 and uninterruptible kernel operations prevent a hard real-time guarantee.
 Non-Unix search fails before spawning until bounded pipe support is implemented.
 
-Glob and outline retain their separate existing policy: include hidden files,
-do not apply ignore files, and exclude `.git`, `target`, `node_modules`, `.venv`,
-`venv`, `__pycache__`, `dist`, `build`, and `.next` directory names. Globs retain
+Glob and outline include hidden files and exclude `.git`, `target`,
+`node_modules`, `.venv`, `venv`, `__pycache__`, `dist`, `build`, and `.next`
+directory names. Inside a git repository they also leave out what `.gitignore`
+files ignore, read in process (glob runs on read-ahead threads, which must not
+start a process): each file's rules are relative to its directory, rules in
+directories above the search root count, a later rule overrides an earlier one,
+`!` re-includes and a trailing `/` matches only directories.
+`.git/info/exclude` is read; global excludes, which need git's configuration,
+are not. Outside a repository no ignore files apply, and the result's scope
+says so. Glob lists matches most recently modified first, then by path. Globs retain
 the tool's `*`, `?`, `**` matcher. A basename-only pattern matches basenames;
 a pattern with `/` matches relative paths. No approximate candidate filter is
 used. Descendant directory symlinks are reported as skipped rather than

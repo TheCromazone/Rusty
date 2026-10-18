@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::signal;
 use crate::ui::{self, truncate};
 
-use rusty::workspace_query::{self, SKIP_DIRS};
+use rusty::workspace_query::{self, wildcard, SKIP_DIRS};
 
 const MAX_OUTPUT: usize = workspace_query::RENDER_BYTES;
 
@@ -49,7 +49,7 @@ fn build_definitions() -> Value {
             "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
             "context": {"type": "integer", "description": "Lines of context around each match (default 0)"}
         }), &["pattern"]),
-        tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents. Skips build directories; includes hidden files; does not apply ignore files. Reports incomplete enumeration and skipped paths.", json!({
+        tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents, most recently modified first. Skips build directories and, in a git repository, .gitignore'd paths; includes hidden files. Reports incomplete enumeration and skipped paths.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory to search (default .)"}
         }), &["pattern"]),
@@ -701,16 +701,20 @@ fn glob(args: &Value) -> Result<String> {
     let pattern = arg(args, "pattern")?;
     let root = args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".");
     let scan = workspace_query::files_under(Path::new(root));
-    let hits: Vec<String> = scan
+    let mut hits: Vec<(Option<std::time::SystemTime>, String)> = scan
         .files
         .iter()
         .filter_map(|p| {
             let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().trim_start_matches("./").to_string();
             let target =
                 if pattern.contains('/') { rel.clone() } else { rel.rsplit('/').next().unwrap_or(&rel).to_string() };
-            wildcard(pattern.as_bytes(), target.as_bytes()).then_some(rel)
+            wildcard(pattern.as_bytes(), target.as_bytes())
+                .then(|| (fs::metadata(p).and_then(|m| m.modified()).ok(), rel))
         })
         .collect();
+    // The files touched most recently are usually the ones that matter.
+    hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let hits: Vec<String> = hits.into_iter().map(|(_, rel)| rel).collect();
     if hits.is_empty() {
         return Ok(scan.render(
             if scan.incomplete { "no files observed; enumeration incomplete" } else { "no files match" },
@@ -723,32 +727,6 @@ fn glob(args: &Value) -> Result<String> {
     }
     let truncated = hits.len() > 300 || out.len() > workspace_query::OUTPUT_BYTES;
     Ok(scan.render(truncate(&out, workspace_query::OUTPUT_BYTES), truncated))
-}
-
-/// Glob matching: `*` and `?` stay within one path segment, `**` crosses them.
-pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
-    if p.starts_with(b"**/") {
-        return (0..=s.len()).any(|i| (i == 0 || s[i - 1] == b'/') && wildcard(&p[3..], &s[i..]));
-    }
-    if p.starts_with(b"**") {
-        return (0..=s.len()).any(|i| wildcard(&p[2..], &s[i..]));
-    }
-    match p.first() {
-        None => s.is_empty(),
-        Some(b'*') => {
-            for i in 0..=s.len() {
-                if wildcard(&p[1..], &s[i..]) {
-                    return true;
-                }
-                if i < s.len() && s[i] == b'/' {
-                    break;
-                }
-            }
-            false
-        }
-        Some(b'?') => !s.is_empty() && s[0] != b'/' && wildcard(&p[1..], &s[1..]),
-        Some(c) => s.first() == Some(c) && wildcard(&p[1..], &s[1..]),
-    }
 }
 
 pub(crate) const SOURCE_EXT: &[&str] = &[
