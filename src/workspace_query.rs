@@ -74,6 +74,9 @@ impl BoundedPipe {
             text.truncate(end);
             truncated = true;
         }
+        if text.capacity() > self.limit {
+            text.shrink_to_fit();
+        }
         Capture { text, truncated }
     }
 }
@@ -439,7 +442,12 @@ mod tests {
         assert_eq!(reader.position(), 100_000);
         let result = bounded.finish();
         assert_eq!(result.text, "\u{fffd}".repeat(5));
-        assert!(result.text.len() <= 17 && result.truncated);
+        assert!(result.text.len() <= 17 && result.text.capacity() <= 17 && result.truncated);
+        let mut short = BoundedPipe::new(100);
+        short.read_available(&mut Cursor::new(vec![0xff; 30])).unwrap();
+        let result = short.finish();
+        assert_eq!(result.text.len(), 90);
+        assert!(result.text.capacity() <= 100 && !result.truncated);
     }
 
     #[test]
