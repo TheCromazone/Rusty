@@ -100,7 +100,10 @@ impl Ssh {
             if Instant::now() >= deadline {
                 bail!("SSH connection queue timed out; no command started");
             }
-            if self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 4).then_some(n + 1)).is_ok() {
+            let active = self.active.load(Ordering::Acquire);
+            if active < 4
+                && self.active.compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
                 return Ok(ConnectionSlot(&self.active));
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -171,7 +174,7 @@ impl Drop for ConnectionSlot<'_> {
     }
 }
 
-fn nonblocking(fd: impl AsRawFd) -> std::io::Result<()> {
+fn nonblocking(fd: &impl AsRawFd) -> std::io::Result<()> {
     let fd = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
