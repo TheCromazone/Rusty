@@ -240,6 +240,8 @@ rusty --goal "fix the discount tests" --verify "python3 -m unittest -q"
 The fixed check runs after remaining work and any required careful review.
 Failure or an unconfirmed result keeps the goal open. `/goal status` shows
 progress, `/goal resume` continues, and `/goal clear` drops the objective.
+Resuming a goal that is already done shows its evidence and does no work;
+`/goal reopen` picks it back up.
 Each explicit goal run or resume gets up to `RUSTY_GOAL_MAX_TURNS` turns
 (default 25); zero pauses before work. Status shows this run and lifetime
 counts and the saved stop reason. Interrupted or failed attempts count as

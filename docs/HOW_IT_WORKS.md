@@ -132,6 +132,8 @@ refused.
 A goal can also report that it is blocked, pause at a limit, or be interrupted.
 Those outcomes do not mean success. `/goal resume` continues it; `/goal clear`
 drops it. Resuming a goal with fixed verification runs verification again.
+A goal that is already done stays done on `/goal resume`, which shows its
+evidence instead; `/goal reopen` works on it again.
 A passing check establishes what that particular check covers. A goal started
 without `--verify` has no pinned acceptance command.
 

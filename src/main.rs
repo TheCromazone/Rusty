@@ -1169,29 +1169,8 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 agent.goal_check = Some(check.pin_files(cwd, &[PathBuf::from(&value[6..])])?);
                 println!("  acceptance file pinned for future goals");
             }
-            "" | "status" => match &agent.goal {
-                Some(g) => {
-                    let status = match &g.status {
-                        GoalStatus::Active => "active".to_string(),
-                        GoalStatus::Done(e) => {
-                            format!("{}: {e}", agent.goal_outcome().unwrap_or("completed_unverified"))
-                        }
-                        GoalStatus::Blocked(e) => format!("blocked: {e}"),
-                    };
-                    println!(
-                        "  goal {}\n  {}",
-                        ui::bold(&g.objective),
-                        ui::dim(&format!(
-                            "{status} · {}/{} turns this run · {} lifetime turns{}",
-                            g.run_turns,
-                            g.run_limit,
-                            g.turns,
-                            g.stop_reason
-                                .map(|reason| format!(" · last stop: {}", reason.name().replace('_', " ")))
-                                .unwrap_or_default()
-                        ))
-                    );
-                }
+            "" | "status" => match agent.goal_status() {
+                Some(status) => println!("{status}"),
                 None => println!("{}", ui::dim("  no goal. /goal <objective> to start one")),
             },
             "clear" | "off" => {
@@ -1199,7 +1178,10 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 println!("{}", ui::dim("  goal cleared"));
             }
             objective => {
-                let objective = (!matches!(objective, "resume" | "continue")).then_some(objective);
+                if objective == "reopen" {
+                    agent.reopen_goal();
+                }
+                let objective = (!matches!(objective, "resume" | "continue" | "reopen")).then_some(objective);
                 ping::turn_started();
                 let result = agent.run_goal(objective);
                 ping::notify(ping::Outcome::of_goal(agent.goal_outcome(), result.is_err()), cwd);

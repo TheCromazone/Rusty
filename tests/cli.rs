@@ -2338,6 +2338,63 @@ fn a_repeated_read_with_the_same_result_is_not_sent_again() {
 }
 
 #[test]
+fn resuming_a_done_goal_shows_it_and_only_reopen_works_on_it_again() {
+    let s = Sandbox::new("resume-done-goal");
+    let done = tool_reply("goal_done", serde_json::json!({"evidence":"tests pass"}));
+    let (url, server) = scripted_endpoint(vec![done.clone()]);
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--goal", "inspect"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(20),
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 1);
+
+    let session = |input: &str, replies: Vec<serde_json::Value>, name: &str| {
+        let (url, server) = scripted_endpoint(replies);
+        let trace = s.home.join(name);
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_RETRY_SECS", "1")
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--continue", "--trajectory"])
+            .arg(&trace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{input}\n/exit").unwrap();
+        let out = wait(child, Duration::from_secs(20));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(trace).unwrap()).unwrap();
+        (String::from_utf8_lossy(&out.stdout).into_owned(), server.join().unwrap().len(), trace)
+    };
+
+    let (shown, requests, trace) = session("/goal resume", vec![], "resumed.json");
+    assert_eq!(requests, 0, "a done goal is not re-verified on resume");
+    assert!(
+        shown.contains("tests pass") && shown.contains("already done") && shown.contains("/goal reopen"),
+        "{shown}"
+    );
+    assert!(trace["goal"]["status"].get("Done").is_some(), "{}", trace["goal"]);
+    assert_eq!(trace["goal"]["turns"], 1);
+    assert_eq!(trace["claims"]["accepted"], 0, "no second acceptance is counted");
+
+    let (_, requests, trace) = session("/goal reopen", vec![done], "reopened.json");
+    assert_eq!(requests, 1);
+    assert!(trace["goal"]["status"].get("Done").is_some(), "{}", trace["goal"]);
+    assert_eq!(trace["goal"]["turns"], 2);
+    assert_eq!(trace["claims"]["accepted"], 1);
+}
+
+#[test]
 fn careful_goal_keeps_its_single_checker_budget_after_resume() {
     use serde_json::json;
     let s = Sandbox::new("resumed-checker");
