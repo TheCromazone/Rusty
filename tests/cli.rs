@@ -1055,6 +1055,85 @@ fn completion_contract_fixed_goal_accepts_a_correct_patch_with_fresh_executed_ev
     assert!(requests[0]["messages"].to_string().contains("Fixed acceptance command"));
 }
 
+/// In careful mode a plan step's expectation is written before its check
+/// and kept when the plan is rewritten without it; completion is refused
+/// while the step is untested or its result failed, and the record keeps
+/// both sides.
+#[test]
+fn a_careful_goal_closes_only_when_each_stated_expectation_has_a_passing_result() {
+    use serde_json::json;
+    let s = Sandbox::new("goal-expectations");
+    let plan = |expect: Option<&str>| {
+        let mut item = json!({"text": "fix add", "status": "done"});
+        if let Some(e) = expect {
+            item["expect"] = json!(e);
+        }
+        tool_reply("plan", json!({"items": [item]}))
+    };
+    let done =
+        |results: serde_json::Value| tool_reply("goal_done", json!({"evidence": "add fixed", "results": results}));
+    let (url, server) = scripted_endpoint(vec![
+        plan(Some("add(2,3) prints 5")),
+        plan(None),
+        done(json!([])),
+        text_reply("No problems found."),
+        done(json!([])),
+        plan(Some("python3 -c 'print(add(2,3))' prints 5")),
+        tool_reply(
+            "plan",
+            json!({"items": [{"text": "fix add", "status": "done"}, {"text": "add docs", "status": "done", "expect": "README mentions add"}]}),
+        ),
+        tool_reply("plan", json!({"items": [{"text": "fix add", "status": "done"}]})),
+        done(json!([{"step": 1, "status": "failed", "observed": "printed -1"}])),
+        done(json!([{"step": 1, "status": "passed", "observed": "printed 5"}])),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args([
+            "--yolo",
+            "--mode",
+            "careful",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--goal",
+            "fix add",
+            "--trajectory",
+        ])
+        .arg(s.home.join("t.json"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 10);
+    assert!(requests[0]["messages"].to_string().contains("write in its expect field"));
+    assert!(requests[0]["tools"].to_string().contains("\"expect\":"));
+    let seen = |i: usize| requests[i]["messages"].to_string();
+    // The checker sees the plan as the runtime holds it, not only the last
+    // plan call, which left the expectation out.
+    assert!(seen(3).contains("expect: add(2,3) prints 5"), "{}", seen(3));
+    assert!(seen(5).contains("step 1 (fix add) is untested; expected: add(2,3) prints 5"), "{}", seen(5));
+    assert!(seen(5).contains("expect: add(2,3) prints 5"), "a plan rewritten without it keeps the expectation");
+    assert!(seen(6).contains("the expectation changed for: fix add"), "{}", seen(6));
+    assert!(seen(8).contains("the expectation changed for: add docs (dropped)"), "{}", seen(8));
+    assert!(seen(9).contains("step 1 (fix add) failed: printed -1"), "{}", seen(9));
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("t.json")).unwrap()).unwrap();
+    let claims = &trace["claims"];
+    assert_eq!((claims["unverified"].as_u64(), claims["accepted"].as_u64()), (Some(2), Some(1)), "{claims}");
+    assert_eq!((claims["revised_expectations"].as_u64(), claims["sent_to_review"].as_u64()), (Some(2), Some(1)));
+    let evidence = trace["goal"]["status"]["Done"].as_str().unwrap();
+    assert!(
+        evidence
+            .contains("1. fix add · expected: python3 -c 'print(add(2,3))' prints 5 · observed: printed 5 · passed"),
+        "{evidence}"
+    );
+}
+
 /// The memory daemon beside the rusty under test, run in the sandbox project.
 fn memoryd(s: &Sandbox, args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
@@ -2168,6 +2247,7 @@ fn a_worker_gets_its_brief_and_the_lead_hears_about_bad_references() {
         "{worker}"
     );
     assert!(worker.contains("Start with References"), "{worker}");
+    assert!(!requests[0]["tools"].to_string().contains("\"expect\":"), "only careful mode asks for expectations");
     let report = requests[2]["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string();
     assert!(report.contains("2 of the 3 path:line references"), "{report}");
     assert!(

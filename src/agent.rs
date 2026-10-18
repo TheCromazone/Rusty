@@ -144,12 +144,21 @@ pub struct Completion {
     /// Claims discarded when their turn stalled, was interrupted or hit the
     /// output limit.
     pub discarded: u64,
+    /// Claims refused because a plan step's stated expectation had no passing
+    /// result, or a result said a check failed.
+    pub unverified: u64,
+    /// Expectations rewritten after they were first set.
+    pub revised_expectations: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanItem {
     pub text: String,
     pub status: String,
+    /// The check for this step and the result it should give, written before
+    /// the check runs, so an unexpected result can't be read as success.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expect: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -598,8 +607,9 @@ impl Agent {
              concrete bugs, regressions, and security or data-integrity problems where they matter. You may read \
              and run read-only commands, never change anything. Report actionable findings with file and line \
              references, or say you found none and name what you could not verify. Keep it short.\n\n\
-             Task: {query}\n\nWhat the user asked for:\n{constraints}\n\nWorking set:\n{working}\n\n\
+             Task: {query}\n\nWhat the user asked for:\n{constraints}\n\nWorking set:\n{working}\n\n{}\n\
              Recent steps and the proposed completion:\n{}",
+            self.plan_text(),
             ui::truncate(&recent, 24_000)
         );
         let denied = self.client.budget.denied();
@@ -807,13 +817,24 @@ impl Agent {
         if !active.is_empty() {
             s.push_str(&format!("Owned shell activities (live runtime state; not a completion claim): {}\nWait for or cancel these before proposing completion. Commands are cancelled when the turn ends.\n", serde_json::to_string(&active).unwrap()));
         }
-        if !self.plan.is_empty() {
-            s.push_str("Current plan:\n");
-            for p in &self.plan {
-                s.push_str(&format!("- [{}] {}\n", p.status, p.text));
+        s.push_str(&self.plan_text());
+        (!s.is_empty()).then(|| s.trim_end().to_string())
+    }
+
+    /// The plan as the runtime holds it, with each step's expectation, which
+    /// later plan calls may leave out of their own arguments.
+    fn plan_text(&self) -> String {
+        if self.plan.is_empty() {
+            return String::new();
+        }
+        let mut s = String::from("Current plan:\n");
+        for p in &self.plan {
+            s.push_str(&format!("- [{}] {}\n", p.status, p.text));
+            if !p.expect.is_empty() {
+                s.push_str(&format!("  expect: {}\n", p.expect));
             }
         }
-        (!s.is_empty()).then(|| s.trim_end().to_string())
+        s
     }
 
     /// What `--toolset shell` offers: a shell, plus the control calls that
@@ -891,14 +912,21 @@ impl Agent {
                 &["reason"],
             ));
         }
+        // Expectations cost tokens on every plan and goal_done; only careful
+        // mode, which exists to check its work twice, asks for them.
+        let careful = self.execution_mode == ExecutionMode::Careful;
+        let mut step = json!({
+            "text": {"type": "string"},
+            "status": {"type": "string", "enum": ["pending", "in_progress", "done"]}
+        });
+        if careful {
+            step["expect"] = json!({"type": "string", "description": "For a step you can check: the check you will run and the result you expect, written now, before running it. Kept when you resend the same step text without it"});
+        }
         defs.push(t(
             "plan",
             "Replace the task plan. Use it for any work with more than two steps.",
             json!({
-                "items": {"type": "array", "items": {"type": "object", "properties": {
-                    "text": {"type": "string"},
-                    "status": {"type": "string", "enum": ["pending", "in_progress", "done"]}
-                }, "required": ["text", "status"]}}
+                "items": {"type": "array", "items": {"type": "object", "properties": step, "required": ["text", "status"]}}
             }),
             &["items"],
         ));
@@ -925,13 +953,21 @@ impl Agent {
             ));
         }
         if self.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active) {
+            let mut props = json!({
+                "evidence": {"type": "string", "description": "For each requirement in the goal, the check you ran just now and what it showed; or what you need from the user"},
+                "blocked": {"type": "boolean"}
+            });
+            if careful || self.plan.iter().any(|p| !p.expect.is_empty()) {
+                props["results"] = json!({"type": "array", "description": "One per plan step with an expectation: what its check showed just now. A failed or untested step keeps the goal open", "items": {"type": "object", "properties": {
+                    "step": {"type": "integer", "description": "The plan step's number, from 1"},
+                    "status": {"type": "string", "enum": ["passed", "failed", "untested"]},
+                    "observed": {"type": "string"}
+                }, "required": ["step", "status", "observed"]}});
+            }
             defs.push(t(
                 "goal_done",
                 "Propose completion after all calls in this reply. A fixed user acceptance command, if set, must pass. Use blocked=true only when you need the user.",
-                json!({
-                    "evidence": {"type": "string", "description": "For each requirement in the goal, the check you ran just now and what it showed; or what you need from the user"},
-                    "blocked": {"type": "boolean"}
-                }),
+                props,
                 &["evidence"],
             ));
         }
@@ -1726,8 +1762,8 @@ impl Agent {
                 Ok(self.forget_memory(id))
             }
             "plan" => {
-                self.plan = serde_json::from_value(args["items"].clone()).unwrap_or_default();
-                Ok("plan updated".into())
+                let items: Vec<PlanItem> = serde_json::from_value(args["items"].clone()).unwrap_or_default();
+                Ok(self.replace_plan(items))
             }
             "compact" => Ok(self.request_compaction(&args, d)),
             "task" => Ok(self.run_workers(vec![job(&args)], d, "worker")),
@@ -2309,9 +2345,95 @@ impl Agent {
         "completion proposed; acceptance happens after this reply's remaining calls and any required review".into()
     }
 
+    /// Takes a new plan. A step that comes back without an expectation keeps
+    /// the one it had; one whose expectation changed, or that was dropped
+    /// with its expectation, is counted and named, since dropping a step
+    /// whose check would fail moves the target as surely as rewording it.
+    fn replace_plan(&mut self, mut items: Vec<PlanItem>) -> String {
+        let mut revised = Vec::new();
+        for item in &mut items {
+            let Some(old) = self.plan.iter().find(|p| p.text == item.text && !p.expect.is_empty()) else { continue };
+            if item.expect.trim().is_empty() {
+                item.expect = old.expect.clone();
+            } else if item.expect != old.expect {
+                revised.push(item.text.trim_end_matches('.').to_string());
+            }
+        }
+        for old in self.plan.iter().filter(|p| !p.expect.is_empty()) {
+            if !items.iter().any(|i| i.text == old.text) {
+                revised.push(format!("{} (dropped)", old.text.trim_end_matches('.')));
+            }
+        }
+        self.plan = items;
+        if revised.is_empty() {
+            return "plan updated".into();
+        }
+        self.completion.revised_expectations += revised.len() as u64;
+        format!(
+            "plan updated; the expectation changed for: {}. If a check surprised you, say so in goal_done rather than \
+             moving the expectation to fit it.",
+            revised.join("; ")
+        )
+    }
+
+    /// Why a completion claim can't stand on the plan's own expectations:
+    /// a step that stated one needs a passing result, and no result may say
+    /// its check failed. None when nothing is missing.
+    fn unmet_expectations(&self, results: &Value) -> Option<String> {
+        let results = results.as_array().map(Vec::as_slice).unwrap_or_default();
+        let result = |n: usize| results.iter().find(|r| r["step"].as_u64() == Some(n as u64));
+        let mut gaps = Vec::new();
+        for (i, p) in self.plan.iter().enumerate() {
+            let r = result(i + 1);
+            let status = r.and_then(|r| r["status"].as_str()).unwrap_or("untested");
+            let observed = r.and_then(|r| r["observed"].as_str()).unwrap_or("");
+            match status {
+                "failed" => gaps.push(format!("step {} ({}) failed: {observed}", i + 1, p.text)),
+                "passed" => {}
+                _ if !p.expect.is_empty() => {
+                    gaps.push(format!("step {} ({}) is untested; expected: {}", i + 1, p.text, p.expect))
+                }
+                _ => {}
+            }
+        }
+        (!gaps.is_empty()).then(|| {
+            format!(
+                "{}. Run each check now and give its result in goal_done's results, or fix what failed.",
+                gaps.join("; ")
+            )
+        })
+    }
+
+    /// The plan's expectations next to what was observed, for the record.
+    fn expectation_record(&self, results: &Value) -> String {
+        let results = results.as_array().map(Vec::as_slice).unwrap_or_default();
+        let mut out = String::new();
+        for (i, p) in self.plan.iter().enumerate().filter(|(_, p)| !p.expect.is_empty()) {
+            let r = results.iter().find(|r| r["step"].as_u64() == Some(i as u64 + 1));
+            let (status, observed) = r.map_or(("untested", ""), |r| {
+                (r["status"].as_str().unwrap_or("untested"), r["observed"].as_str().unwrap_or(""))
+            });
+            out.push_str(&format!(
+                "\n{}. {} · expected: {} · observed: {observed} · {status}",
+                i + 1,
+                p.text,
+                p.expect
+            ));
+        }
+        out
+    }
+
     fn close_goal(&mut self, args: &Value, d: &mut Display) -> String {
-        let evidence = args["evidence"].as_str().unwrap_or("").to_string();
+        let mut evidence = args["evidence"].as_str().unwrap_or("").to_string();
         if !args["blocked"].as_bool().unwrap_or(false) {
+            if let Some(gap) = self.unmet_expectations(&args["results"]) {
+                self.completion.unverified += 1;
+                return gap;
+            }
+            let record = self.expectation_record(&args["results"]);
+            if !record.is_empty() {
+                evidence.push_str(&format!("\n\nChecks against the plan:{record}"));
+            }
             let check = self.goal.as_ref().and_then(|g| g.check.clone());
             if let Some(check) = check {
                 match self.check_goal(&check, d) {
@@ -2415,6 +2537,12 @@ impl Agent {
             let (mode, why) = self.pick_mode(&self.goal.as_ref().unwrap().objective.clone());
             self.apply_profile(mode, why);
             self.show_pick(&mut Display::new(false));
+        }
+        if objective.is_some() && self.execution_mode == ExecutionMode::Careful {
+            prompt.push_str(
+                " For each plan step you can check, write in its expect field the check you will run and the result \
+                 you expect, before you run it, and give goal_done a result for each such step.",
+            );
         }
         self.checker_owed =
             self.execution_mode == ExecutionMode::Careful && !self.goal.as_ref().is_some_and(|g| g.checker_used);
@@ -3497,7 +3625,11 @@ mod stable_prompt_tests {
         let system = agent.system_prompt();
         let initial_estimate = agent.fixed_estimate();
 
-        agent.plan.push(PlanItem { text: "plan detail ".repeat(100), status: "in_progress".into() });
+        agent.plan.push(PlanItem {
+            text: "plan detail ".repeat(100),
+            status: "in_progress".into(),
+            expect: String::new(),
+        });
         let plan_estimate = agent.fixed_estimate();
         let plan_state = agent.live_state().unwrap();
         assert!(plan_state.contains("Current plan:") && plan_state.contains("plan detail"));
