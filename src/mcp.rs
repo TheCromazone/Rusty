@@ -4,8 +4,9 @@
 //! Newline-delimited JSON-RPC 2.0 over the server's stdin/stdout, per the MCP
 //! stdio transport. Only tools are supported; resources and prompts are not.
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -24,6 +25,8 @@ const PREFIX: &str = "mcp__";
 const MAX_NAME: usize = 64;
 const MAX_PAGES: usize = 100;
 const MAX_TOOLS: usize = 1000;
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+const QUEUED_FRAMES: usize = 4;
 const HANDSHAKE: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -65,7 +68,7 @@ struct Server {
     name: String,
     child: Child,
     stdin: ChildStdin,
-    lines: Receiver<String>,
+    lines: Receiver<Result<String, String>>,
     next_id: u64,
     tools: Vec<Tool>,
     /// Features the server offers that rusty doesn't use.
@@ -265,6 +268,7 @@ impl Server {
             .args(&cfg.args)
             .envs(expand_env(&cfg.env)?)
             .current_dir(cwd)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -273,16 +277,32 @@ impl Server {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         // A reader thread, so a silent server can never block past a deadline.
-        let (tx, lines) = mpsc::channel();
+        let (tx, lines) = mpsc::sync_channel(QUEUED_FRAMES);
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let line = read_frame(&mut reader);
+                let done = !matches!(&line, Ok(Some(_)));
+                let message = match line {
+                    Ok(Some(line)) => Ok(line),
+                    Ok(None) => break,
+                    Err(e) => Err(e.to_string()),
+                };
+                // Backpressure bounds retained output; dropping the receiver
+                // unblocks the reader even when the queue is full.
+                if tx.send(message).is_err() || done {
                     break;
                 }
             }
         });
-        Ok(Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new(), ignored: Vec::new() })
+        let server =
+            Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new(), ignored: Vec::new() };
+        let fd = server.stdin.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("setting MCP input nonblocking");
+        }
+        Ok(server)
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -318,6 +338,9 @@ impl Server {
                 if !schema.is_object() {
                     schema = json!({"type": "object", "properties": {}});
                 }
+                if self.tools.len() >= MAX_TOOLS {
+                    bail!("tools/list exceeded {MAX_TOOLS} tools");
+                }
                 self.tools.push(Tool {
                     exposed: String::new(),
                     name: tool.to_string(),
@@ -338,23 +361,53 @@ impl Server {
         Ok(())
     }
 
-    fn send(&mut self, message: &Value) -> Result<()> {
-        writeln!(self.stdin, "{message}").and_then(|()| self.stdin.flush()).context("the MCP server closed its input")
+    fn send(&mut self, message: &Value, deadline: Instant) -> Result<()> {
+        let mut bytes = serde_json::to_vec(message)?;
+        if bytes.len() >= MAX_FRAME {
+            bail!("MCP request exceeds 4 MiB");
+        }
+        bytes.push(b'\n');
+        let mut rest = bytes.as_slice();
+        while !rest.is_empty() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("MCP input timed out");
+            }
+            match self.stdin.write(rest) {
+                Ok(0) => bail!("the MCP server closed its input"),
+                Ok(n) => rest = &rest[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd { fd: self.stdin.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+                    let status =
+                        unsafe { libc::poll(&mut fd, 1, left.as_millis().max(1).min(i32::MAX as u128) as i32) };
+                    if status < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        return Err(std::io::Error::last_os_error()).context("waiting for MCP input");
+                    }
+                }
+                Err(e) => return Err(e).context("the MCP server closed its input"),
+            }
+        }
+        Ok(())
     }
 
     fn notify(&mut self, method: &str) -> Result<()> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method}))
+        self.send(&json!({"jsonrpc": "2.0", "method": method}), Instant::now() + HANDSHAKE)
     }
 
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let deadline = Instant::now() + timeout;
+        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}), deadline)?;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("{method} timed out after {}s", timeout.as_secs());
+            }
             let line = match self.lines.recv_timeout(left) {
-                Ok(line) => line,
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => bail!("MCP output rejected: {error}"),
                 Err(RecvTimeoutError::Timeout) => bail!("{method} timed out after {}s", timeout.as_secs()),
                 Err(RecvTimeoutError::Disconnected) => bail!("the MCP server `{}` exited", self.name),
             };
@@ -371,8 +424,26 @@ impl Server {
     }
 }
 
+/// Limit before allocating or parsing, including output without a newline.
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    reader.take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_FRAME {
+        bail!("MCP frame exceeds 4 MiB");
+    }
+    Ok(Some(String::from_utf8(bytes).context("MCP output is not UTF-8")?))
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
+        // A launcher may exit before its server. Reap the child and stop its
+        // owned process group so descendants cannot retain stdout/readers.
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -750,7 +821,6 @@ mod tests {
         assert!(matches!(tool_class("drop", &json!({"destructiveHint": false})), Class::Destructive(_)));
         assert_eq!(tool_class("get", &json!({})), Class::ReadOnly);
     }
-
     #[test]
     fn env_references_come_from_the_environment_and_literals_pass_through() {
         let env = BTreeMap::from([("A".to_string(), "${PATH}".to_string()), ("B".to_string(), "plain".to_string())]);
@@ -796,5 +866,112 @@ mod tests {
         assert_eq!(after, saved);
         assert!(!dir.join(".mcp.json.pending").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_and_unterminated_mcp_frames_are_bounded_before_parsing() {
+        for terminated in [false, true] {
+            let mut bytes = vec![b'x'; MAX_FRAME + 1];
+            if terminated {
+                bytes.push(b'\n');
+            }
+            let mut reader = std::io::Cursor::new(bytes);
+            assert!(read_frame(&mut reader).unwrap_err().to_string().contains("4 MiB"));
+            assert_eq!(reader.position(), (MAX_FRAME + 1) as u64);
+        }
+        let mut reader = std::io::Cursor::new(b"one\ntwo\n");
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("one\n"));
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("two\n"));
+        assert!(read_frame(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_notifications_cannot_extend_an_expired_request_deadline() {
+        let cfg = ServerConfig { args: vec!["-c".into(), "sleep 60".into()], ..ServerConfig::default() };
+        let mut server = Server::spawn("deadline", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(json!({"method":"notifications/progress"}).to_string())).unwrap();
+        tx.send(Ok(json!({"id":1,"result":{"late":true}}).to_string())).unwrap();
+        server.lines = rx;
+        let error = server.request("probe", json!({}), Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let pid = server.child.id();
+        drop(server);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "MCP child was not reaped");
+    }
+    #[test]
+    fn closing_a_launcher_stops_its_owned_descendants() {
+        let path = std::env::temp_dir().join(format!("rusty-mcp-child-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = ServerConfig {
+            args: vec![
+                "-c".into(),
+                "sleep 60 & echo $! > \"$1\"; wait".into(),
+                "fixture".into(),
+                path.display().to_string(),
+            ],
+            ..ServerConfig::default()
+        };
+        let server = Server::spawn("launcher", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < end, "launcher did not publish child PID");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(server);
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = Command::new("ps").args(["-o", "stat=", "-p", &child.to_string()]).output().unwrap();
+            let state = String::from_utf8_lossy(&out.stdout);
+            // An orphan zombie awaits init's reap but retains no live process.
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < end, "MCP descendant still running: {state}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn an_unread_mcp_input_cannot_hold_a_request_past_its_deadline() {
+        let cfg = ServerConfig { args: vec!["-c".into(), "sleep 3".into()], ..ServerConfig::default() };
+        let mut server = Server::spawn("blocked-input", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let error =
+            server.request("probe", json!({"data":"x".repeat(1024 * 1024)}), Duration::from_millis(20)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+    #[test]
+    fn a_real_notification_flood_respects_the_request_deadline_and_drops_cleanly() {
+        let cfg = ServerConfig {
+            args: vec![
+                "-c".into(),
+                r#"while :; do printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress"}'; done"#.into(),
+            ],
+            ..ServerConfig::default()
+        };
+        let mut server = Server::spawn("flood", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let first = server.lines.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+        assert!(first.contains("notifications/progress"));
+        let pid = server.child.id();
+        let (done, stop) = mpsc::channel();
+        // A regression must fail rather than leave an infinite fixture behind.
+        let guard = std::thread::spawn(move || {
+            if matches!(stop.recv_timeout(Duration::from_secs(60)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        });
+        let result = server.request("probe", json!({}), Duration::from_millis(50));
+        let _ = done.send(());
+        guard.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        drop(server);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     }
 }
