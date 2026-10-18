@@ -419,7 +419,7 @@ fn search_with(
     let mut output = match mode {
         Mode::Content => present_rg(output),
         Mode::Files => present_files(output, '\0'),
-        Mode::Count => present_counts(output, '\0'),
+        Mode::Count => present_counts(output, '\0', false),
     };
     output.truncated |= match_limit_possible || column_limit_possible;
     let scan_complete = termination == "exited"
@@ -472,6 +472,8 @@ fn fallback(
             "grep.fullName=false",
             "-c",
             "grep.column=false",
+            "-c",
+            "core.quotePath=false",
             "grep",
             "--no-color",
             "--untracked",
@@ -479,6 +481,13 @@ fn fallback(
             "-E",
         ]);
         flags(&mut git);
+        // A NUL after each name keeps any name intact. In line output it also
+        // replaces the `:`/`-` that tells a match from context, so with context
+        // the names come unquoted (quotePath off) but newline-delimited.
+        let nul = mode != Mode::Content || context == "0";
+        if nul {
+            git.arg("-z");
+        }
         git.args(["-e", pattern, "--"]).args(pathspecs(path, glob));
         match spawn_query(&mut git) {
             Ok(child) => {
@@ -487,7 +496,8 @@ fn fallback(
                 // 128 is git refusing to search at all, as in a repository it
                 // won't read; grep can still try.
                 if exit_code != Some(128) {
-                    return Ok(unaudited("git-grep", mode, output, diagnostics, exit_code, termination));
+                    let output = if nul && mode == Mode::Content { from_git_nul(output) } else { output };
+                    return Ok(unaudited("git-grep", mode, nul, output, diagnostics, exit_code, termination));
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -507,21 +517,34 @@ fn fallback(
     let child = spawn_query(&mut grep).context("cannot start grep fallback")?;
     let (output, diagnostics, exit_code, termination) =
         collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, None)?;
-    Ok(unaudited("grep", mode, output, diagnostics, exit_code, termination))
+    Ok(unaudited("grep", mode, false, output, diagnostics, exit_code, termination))
 }
 
+/// git grep's `-z` line output, `path\0line\0text`, in the `path:line:text`
+/// form the other engines show.
+fn from_git_nul(raw: Capture) -> Capture {
+    let mut text = String::with_capacity(raw.text.len());
+    for line in raw.text.split_inclusive('\n') {
+        text.push_str(&line.replacen('\0', ":", 2));
+    }
+    Capture { text, truncated: raw.truncated }
+}
+
+/// `nul`: names in `output` end with a NUL rather than a newline or `:`.
 fn unaudited(
     engine: &'static str,
     mode: Mode,
+    nul: bool,
     output: Capture,
     diagnostics: Capture,
     exit_code: Option<i32>,
     termination: &'static str,
 ) -> SearchResult {
+    // Both fallbacks' -c counts matching lines, not matches.
     let output = match mode {
         Mode::Content => output,
-        Mode::Files => present_files(output, '\n'),
-        Mode::Count => present_counts(output, ':'),
+        Mode::Files => present_files(output, if nul { '\0' } else { '\n' }),
+        Mode::Count => present_counts(output, if nul { '\0' } else { ':' }, true),
     };
     SearchResult {
         engine,
@@ -537,17 +560,40 @@ fn unaudited(
     }
 }
 
-/// `git grep` pathspecs for a search path and an rg-style glob: the glob is
-/// taken relative to the path, and a leading `!` excludes.
+/// `git grep` pathspecs for a search path and an rg-style glob. As with rg,
+/// the glob is relative to the path, a glob without a slash matches a name at
+/// any depth, `{a,b}` offers alternatives, and a leading `!` excludes.
 fn pathspecs(path: &str, glob: Option<&str>) -> Vec<String> {
-    let join = |g: &str| if path == "." { g.to_string() } else { format!("{}/{g}", path.trim_end_matches('/')) };
-    match glob {
-        None => vec![path.to_string()],
-        Some(g) => match g.strip_prefix('!') {
-            Some(excluded) => vec![path.to_string(), format!(":(exclude){}", join(excluded))],
-            None => vec![join(g)],
-        },
+    let Some(glob) = glob else { return vec![path.to_string()] };
+    let (exclude, glob) = glob.strip_prefix('!').map_or((false, glob), |g| (true, g));
+    let base = path.trim_end_matches('/');
+    let magic = if exclude { ":(glob,exclude)" } else { ":(glob)" };
+    let mut specs: Vec<String> = alternatives(glob)
+        .into_iter()
+        .map(|g| {
+            let g = if g.contains('/') { g } else { format!("**/{g}") };
+            if base.is_empty() || base == "." {
+                format!("{magic}{g}")
+            } else {
+                format!("{magic}{base}/{g}")
+            }
+        })
+        .collect();
+    if exclude {
+        specs.insert(0, path.to_string());
     }
+    specs
+}
+
+/// A glob's `{a,b}` groups expanded, which git's globs lack: `*.{rs,py}` is
+/// `*.rs` and `*.py`.
+fn alternatives(glob: &str) -> Vec<String> {
+    let Some(open) = glob.find('{') else { return vec![glob.to_string()] };
+    let Some(close) = glob[open..].find('}').map(|i| open + i) else { return vec![glob.to_string()] };
+    glob[open + 1..close]
+        .split(',')
+        .flat_map(|alt| alternatives(&format!("{}{alt}{}", &glob[..open], &glob[close + 1..])))
+        .collect()
 }
 
 /// The top of the git work tree holding `dir`, found by its `.git` entry.
@@ -586,15 +632,16 @@ fn present_files(raw: Capture, sep: char) -> Capture {
 }
 
 /// `path:count` for each file with a match, sorted by path, then the total.
-/// `sep` divides a path from its count in the engine's output.
-fn present_counts(raw: Capture, sep: char) -> Capture {
+/// `sep` divides a path from its count in the engine's output; `lines` says
+/// the engine counted matching lines rather than matches.
+fn present_counts(raw: Capture, sep: char, lines: bool) -> Capture {
     let mut truncated = raw.truncated;
-    let mut lines: Vec<&str> = raw.text.lines().collect();
+    let mut rows: Vec<&str> = raw.text.lines().collect();
     if raw.truncated && !raw.text.ends_with('\n') {
-        lines.pop();
+        rows.pop();
     }
-    let mut counts = Vec::with_capacity(lines.len());
-    for line in lines {
+    let mut counts = Vec::with_capacity(rows.len());
+    for line in rows {
         match line.rsplit_once(sep).and_then(|(path, n)| Some((path, n.parse::<u64>().ok()?))) {
             // grep -c names every file it read, matching or not.
             Some((_, 0)) => {}
@@ -609,14 +656,19 @@ fn present_counts(raw: Capture, sep: char) -> Capture {
     }
     if !counts.is_empty() {
         let total: u64 = counts.iter().map(|c| c.1).sum();
-        let plural = |n: usize| if n == 1 { "" } else { "s" };
-        let _ = writeln!(
-            text,
-            "{total} match{} in {} file{}",
-            if total == 1 { "" } else { "es" },
-            counts.len(),
-            plural(counts.len())
-        );
+        let unit = match (lines, total == 1) {
+            (true, true) => "matching line",
+            (true, false) => "matching lines",
+            (false, true) => "match",
+            (false, false) => "matches",
+        };
+        let files = format!("{} file{}", counts.len(), if counts.len() == 1 { "" } else { "s" });
+        // A cut-off capture only counted what it kept.
+        let _ = if truncated {
+            writeln!(text, "partial total: {total} {unit} in the {files} shown")
+        } else {
+            writeln!(text, "{total} {unit} in {files}")
+        };
     }
     Capture { text, truncated }
 }
@@ -764,7 +816,7 @@ impl Enumeration {
             !self.incomplete, output_truncated, self.skipped
         );
         let scope = if self.ignores_applied {
-            "[scope: build/dependency directories and .gitignore'd paths excluded; hidden files included; descendant directory symlinks skipped; not an atomic snapshot]\n"
+            "[scope: build/dependency directories, .gitignore'd paths and nested repositories excluded; hidden files included; descendant directory symlinks skipped; not an atomic snapshot]\n"
         } else {
             "[scope: build/dependency directories excluded; hidden files included; ignore files not applied (not a git repository); descendant directory symlinks skipped; not an atomic snapshot]\n"
         };
@@ -785,8 +837,9 @@ impl Enumeration {
 
 /// `.gitignore` rules as git applies them inside a repository: each file's
 /// rules are relative to its directory, a later match overrides an earlier
-/// one, and `!` re-includes. `.git/info/exclude` counts; global excludes
-/// would need git's configuration and are not read.
+/// one, and `!` re-includes. `.git/info/exclude` counts, below every
+/// `.gitignore`; global excludes would need git's configuration and are not
+/// read.
 #[derive(Default)]
 struct Ignores {
     active: bool,
@@ -806,29 +859,28 @@ struct IgnoreRule {
 }
 
 impl Ignores {
-    fn load(&mut self, from: &Path, base: &Path, above: &str) {
-        for file in [from.join(".gitignore"), from.join(".git").join("info").join("exclude")] {
-            let Ok(text) = fs::read_to_string(&file) else { continue };
-            for line in text.lines().map(str::trim_end) {
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let (negate, line) = line.strip_prefix('!').map_or((false, line), |l| (true, l));
-                let line = line.strip_prefix('\\').unwrap_or(line);
-                let (dir_only, line) = line.strip_suffix('/').map_or((false, line), |l| (true, l));
-                // A slash anywhere but the end ties the rule to its directory.
-                let anchored = line.contains('/');
-                let glob = line.trim_start_matches('/');
-                if !glob.is_empty() {
-                    self.rules.push(IgnoreRule {
-                        base: base.to_path_buf(),
-                        above: above.to_string(),
-                        glob: glob.to_string(),
-                        negate,
-                        dir_only,
-                        anchored,
-                    });
-                }
+    /// One ignore file's rules, after (so overriding) those already loaded.
+    fn load(&mut self, file: &Path, base: &Path, above: &str) {
+        let Ok(text) = fs::read_to_string(file) else { return };
+        for line in text.lines().map(str::trim_end) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (negate, line) = line.strip_prefix('!').map_or((false, line), |l| (true, l));
+            let line = line.strip_prefix('\\').unwrap_or(line);
+            let (dir_only, line) = line.strip_suffix('/').map_or((false, line), |l| (true, l));
+            // A slash anywhere but the end ties the rule to its directory.
+            let anchored = line.contains('/');
+            let glob = line.trim_start_matches('/');
+            if !glob.is_empty() {
+                self.rules.push(IgnoreRule {
+                    base: base.to_path_buf(),
+                    above: above.to_string(),
+                    glob: glob.to_string(),
+                    negate,
+                    dir_only,
+                    anchored,
+                });
             }
         }
     }
@@ -864,12 +916,14 @@ pub fn files_under(root: &Path) -> Enumeration {
     if let Ok(canonical) = root.canonicalize() {
         if let Some(top) = repo_root(&canonical) {
             ignores.active = true;
-            // Rules in the directories from the repository's top down to the root.
+            let below = |dir: &Path| canonical.strip_prefix(dir).unwrap_or(&canonical).to_string_lossy().into_owned();
+            // .git/info/exclude ranks below every .gitignore, so it goes first.
+            ignores.load(&top.join(".git").join("info").join("exclude"), root, &below(top));
+            // Then the directories from the repository's top down to the root.
             let mut above: Vec<&Path> = canonical.ancestors().skip(1).take_while(|d| d.starts_with(top)).collect();
             above.reverse();
             for dir in above {
-                let below = canonical.strip_prefix(dir).unwrap_or(&canonical).to_string_lossy().into_owned();
-                ignores.load(dir, root, &below);
+                ignores.load(&dir.join(".gitignore"), root, &below(dir));
             }
         }
     }
@@ -907,7 +961,7 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration, ign
     // This directory's rules hold for everything beneath it, and no further.
     let inherited = ignores.rules.len();
     if ignores.active {
-        ignores.load(dir, dir, "");
+        ignores.load(&dir.join(".gitignore"), dir, "");
     }
     for entry in items {
         let path = entry.path();
@@ -923,6 +977,11 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration, ign
         }
         if metadata.is_dir() {
             if SKIP_DIRS.iter().any(|d| entry.file_name() == *d) {
+                continue;
+            }
+            // A nested repository or worktree is its own project, as git sees
+            // it, and usually a second copy of files already listed.
+            if ignores.active && path.join(".git").exists() {
                 continue;
             }
             match entry.file_type() {
@@ -961,8 +1020,38 @@ pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
             false
         }
         Some(b'?') => !s.is_empty() && s[0] != b'/' && wildcard(&p[1..], &s[1..]),
+        Some(b'[') => match class(&p[1..], s.first().copied()) {
+            Some((hit, rest)) => hit && wildcard(rest, &s[1..]),
+            // A class that never closes is a literal `[`.
+            None => s.first() == Some(&b'[') && wildcard(&p[1..], &s[1..]),
+        },
         Some(c) => s.first() == Some(c) && wildcard(&p[1..], &s[1..]),
     }
+}
+
+/// A `[...]` class, given the pattern just past its `[`: whether `c` is in it
+/// (never `/`), and the pattern after its `]`. `!` or `^` first negates, `a-z`
+/// is a range, and a `]` first is a member. None when the class never closes.
+fn class(p: &[u8], c: Option<u8>) -> Option<(bool, &[u8])> {
+    let (negated, body) = match p.first() {
+        Some(b'!' | b'^') => (true, &p[1..]),
+        _ => (false, p),
+    };
+    let end = 1 + body.get(1..)?.iter().position(|&b| b == b']')?;
+    let (set, rest) = (&body[..end], &body[end + 1..]);
+    let Some(c) = c.filter(|&c| c != b'/') else { return Some((false, rest)) };
+    let mut found = false;
+    let mut i = 0;
+    while i < set.len() {
+        if i + 2 < set.len() && set[i + 1] == b'-' {
+            found |= (set[i]..=set[i + 2]).contains(&c);
+            i += 3;
+        } else {
+            found |= set[i] == c;
+            i += 1;
+        }
+    }
+    Some((found != negated, rest))
 }
 
 #[cfg(test)]
@@ -1351,12 +1440,17 @@ os._exit(0)
     fn enumeration_applies_gitignore_rules_inside_a_repository() {
         let root = std::env::temp_dir().join(format!("rusty-enumeration-ignores-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        for dir in [".git/info", "build-out", "src/build-out", "sub", "other"] {
+        for dir in [".git/info", "build-out", "src/build-out", "sub", "other", "nested/.git"] {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
         let files = [
-            (".gitignore", "# comment\n*.log\n!keep.log\n/build-out/\nsub/deep.txt\n"),
-            (".git/info/exclude", "secret.txt\n"),
+            (".gitignore", "# comment\n*.log\n!keep.log\n/build-out/\nsub/deep.txt\n*.py[cod]\n!kept.tmp\n"),
+            // Every .gitignore outranks info/exclude, whatever the order read.
+            (".git/info/exclude", "secret.txt\n*.tmp\n"),
+            ("x.pyc", ""),
+            ("x.py", ""),
+            ("dropped.tmp", ""),
+            ("kept.tmp", ""),
             ("sub/.gitignore", "local.rs\n"),
             ("a.log", ""),
             ("keep.log", ""),
@@ -1367,6 +1461,8 @@ os._exit(0)
             ("sub/local.rs", ""),
             ("sub/kept.rs", ""),
             ("other/local.rs", ""),
+            // A worktree or nested repository inside the root is not entered.
+            ("nested/n.rs", ""),
         ];
         for (path, text) in files {
             fs::write(root.join(path), text).unwrap();
@@ -1381,7 +1477,16 @@ os._exit(0)
         };
         assert_eq!(
             listed(&root),
-            [".gitignore", "keep.log", "other/local.rs", "src/build-out/y.rs", "sub/.gitignore", "sub/kept.rs"]
+            [
+                ".gitignore",
+                "keep.log",
+                "kept.tmp",
+                "other/local.rs",
+                "src/build-out/y.rs",
+                "sub/.gitignore",
+                "sub/kept.rs",
+                "x.py"
+            ]
         );
         // Rules written above the root still apply, anchored ones included.
         assert_eq!(listed(&root.join("sub")), [".gitignore", "kept.rs"]);
@@ -1438,8 +1543,11 @@ esac
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(shown.text, format!("{}\n{}\n", new.display(), old.display()));
         assert!(shown.truncated);
-        let counts = present_counts(Capture { text: "a.rs:0\nb.rs:1\n".into(), truncated: false }, ':');
-        assert_eq!(counts.text, "b.rs:1\n1 match in 1 file\n");
+        let counts = present_counts(Capture { text: "a.rs:0\nb.rs:1\n".into(), truncated: false }, ':', true);
+        assert_eq!(counts.text, "b.rs:1\n1 matching line in 1 file\n");
+        // A cut-off capture says its total is partial, and drops the cut row.
+        let cut = present_counts(Capture { text: "a.rs\x002\nb.rs\x003\nc.r".into(), truncated: true }, '\0', false);
+        assert_eq!(cut.text, "a.rs:2\nb.rs:3\npartial total: 5 matches in the 2 files shown\n");
     }
 
     #[test]
@@ -1458,6 +1566,16 @@ esac
         }
         // target/ is ignored by the repository's .gitignore.
         let token = format!("ignoredprobe{}", std::process::id());
+        // An untracked file with a name git would otherwise quote.
+        let odd = PathBuf::from("tests").join(format!("caf\u{e9}-probe-{}.txt", std::process::id()));
+        fs::write(&odd, format!("named{token}")).unwrap();
+        let named =
+            search_with("/rusty/nonexistent-rg", &format!("named{token}"), "tests", None, 0, Mode::Files, &|| false);
+        let line =
+            search_with("/rusty/nonexistent-rg", &format!("named{token}"), "tests", None, 0, Mode::Content, &|| false);
+        fs::remove_file(&odd).unwrap();
+        assert_eq!(named.unwrap().output.text, format!("{}\n", odd.display()));
+        assert_eq!(line.unwrap().output.text, format!("{}:1:named{token}\n", odd.display()));
         let dir = PathBuf::from("target").join(format!("rusty-fallback-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("probe.rs"), &token).unwrap();
@@ -1472,10 +1590,21 @@ esac
     }
 
     #[test]
+    fn wildcard_classes_match_as_git_does() {
+        assert!(wildcard(b"*.py[cod]", b"x.pyc") && !wildcard(b"*.py[cod]", b"x.py"));
+        assert!(wildcard(b"[Bb]in", b"bin") && wildcard(b"[Bb]in", b"Bin") && !wildcard(b"[Bb]in", b"pin"));
+        assert!(wildcard(b"*.[a-c]", b"x.b") && !wildcard(b"*.[a-c]", b"x.d"));
+        assert!(wildcard(b"[!a]x", b"bx") && wildcard(b"[^a]x", b"bx") && !wildcard(b"[!a]x", b"ax"));
+        assert!(wildcard(b"[]]", b"]") && !wildcard(b"a[/]b", b"a/b"));
+        assert!(wildcard(b"a[b", b"a[b"), "a class that never closes is literal");
+    }
+
+    #[test]
     fn git_grep_pathspecs_follow_the_path_and_glob() {
         assert_eq!(pathspecs(".", None), ["."]);
-        assert_eq!(pathspecs(".", Some("*.rs")), ["*.rs"]);
-        assert_eq!(pathspecs("src/", Some("*.rs")), ["src/*.rs"]);
-        assert_eq!(pathspecs("src", Some("!*.md")), ["src", ":(exclude)src/*.md"]);
+        assert_eq!(pathspecs(".", Some("*.rs")), [":(glob)**/*.rs"]);
+        assert_eq!(pathspecs("src/", Some("src/**/*.rs")), [":(glob)src/src/**/*.rs"]);
+        assert_eq!(pathspecs(".", Some("*.{rs,py}")), [":(glob)**/*.rs", ":(glob)**/*.py"]);
+        assert_eq!(pathspecs("src", Some("!*.md")), ["src", ":(glob,exclude)src/**/*.md"]);
     }
 }
