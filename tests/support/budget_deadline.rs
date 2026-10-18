@@ -176,16 +176,11 @@ impl Drop for FixtureDir {
 fn deadline_exit_closes_the_silent_transport() {
     use std::process::{Command, Stdio};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let root_path = std::env::var_os("RUSTY_UNIT_DEADLINE_FIXTURE")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!(
-                "rusty-deadline-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ))
-        });
+    let root_path = std::env::temp_dir().join(format!(
+        "rusty-deadline-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     // Own cleanup only after exclusive creation succeeds.
     std::fs::create_dir(&root_path).unwrap();
     let root = FixtureDir(root_path);
@@ -197,7 +192,14 @@ fn deadline_exit_closes_the_silent_transport() {
     let output = std::fs::File::create(root.0.join("child.log")).unwrap();
     let mut child = ChildFixture(
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "agent::budget_deadline_tests::deadline_child", "--nocapture", "--test-threads", "1"])
+            .args([
+                "--exact",
+                "agent::budget_deadline_tests::deadline_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &root.0)
@@ -206,7 +208,6 @@ fn deadline_exit_closes_the_silent_transport() {
             .env("RUSTY_NO_DOTENV", "1")
             .env("RUSTY_STREAM_IDLE_SECS", "300")
             .env("RUSTY_RETRY_SECS", "1")
-            .env("RUSTY_UNIT_DEADLINE_HOLD", std::env::var_os("RUSTY_UNIT_DEADLINE_HOLD").unwrap_or_default())
             .env("RUSTY_UNIT_DEADLINE_CLOCK", &clock)
             .env("RUSTY_UNIT_DEADLINE_URL", url)
             .current_dir(&root.0)
@@ -302,21 +303,15 @@ fn deadline_exit_closes_the_silent_transport() {
     assert_eq!(trace["deadline_reached"], true);
 }
 
-// Executed in isolation by the transport test. In an ordinary suite this is
-// inert. Its file-clock configuration exists only in this cfg(test) module.
+// The parent transport test invokes this helper as its only ignored test.
 #[test]
+#[ignore = "subprocess helper invoked by deadline_exit_closes_the_silent_transport"]
 fn deadline_child() {
-    let Some(clock) = std::env::var_os("RUSTY_UNIT_DEADLINE_CLOCK") else { return };
-    let clock = PathBuf::from(clock);
+    let clock =
+        PathBuf::from(std::env::var_os("RUSTY_UNIT_DEADLINE_CLOCK").expect("transport parent supplies the clock"));
     let outcome = clock.with_file_name("outcome.json");
     let process = json!({"pid":std::process::id(), "pgid":unsafe { libc::getpgrp() }});
     std::fs::write(clock.with_file_name("process.json"), serde_json::to_vec(&process).unwrap()).unwrap();
-    if let Some(ready) = std::env::var_os("RUSTY_UNIT_DEADLINE_HOLD").filter(|value| !value.is_empty()) {
-        std::fs::write(ready, serde_json::to_vec(&process).unwrap()).unwrap();
-        loop {
-            std::thread::park();
-        }
-    }
     let budget = Budget::new_with_clock(
         Limits { seconds: 600, ..Limits::default() },
         Arc::new(move || Duration::from_millis(std::fs::read_to_string(&clock).unwrap().parse().unwrap())),
