@@ -721,7 +721,11 @@ impl Agent {
         if let Some(g) = &self.goal {
             s.push_str(&format!("\nCurrent goal (keep working until it is done and verified): {}\n", g.objective));
             if let Some(check) = &g.check {
-                s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. Keep verification inputs unchanged while it runs.\n", check.command()));
+                s.push_str(&format!("\nFixed acceptance command: {}\nThe runtime executes it when you propose goal_done. You cannot replace this criterion with evidence text. User-pinned verification files must retain their original contents and modes. Keep verification inputs unchanged while it runs.\n", check.command()));
+                let pins = check.pinned_paths();
+                if !pins.is_empty() {
+                    s.push_str(&format!("Pinned acceptance files (restore originals if changed): {pins}\n"));
+                }
             }
         }
         if display::view() == View::Adhd {
@@ -1765,12 +1769,14 @@ impl Agent {
         if let Authorization::Refused { message, .. } = self.authorize("bash", &args, d)? {
             bail!("{message}");
         }
+        check.validate_files(&self.cwd)?;
         let before = verification::fingerprint(&self.cwd)?;
         d.tool("bash", &args);
         let started = Instant::now();
         let (status, stdout, stderr) = self.backend.shell(check.command(), check.timeout())?;
         let output = infra::redact(&format!("stdout:\n{stdout}\nstderr:\n{stderr}")).0;
         let after = verification::fingerprint(&self.cwd)?;
+        check.validate_files(&self.cwd)?;
         let record = CheckRecord::observed(
             check,
             before,

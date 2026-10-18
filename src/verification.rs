@@ -19,6 +19,15 @@ const GENERATED: &[&str] = &[".git", "target", "__pycache__", ".pytest_cache"];
 pub struct CheckSpec {
     command: String,
     timeout_secs: u64,
+    /// User-selected acceptance files, captured before the first model call.
+    #[serde(default)]
+    pinned_files: Vec<PinnedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PinnedFile {
+    path: PathBuf,
+    sha256: String,
 }
 
 impl CheckSpec {
@@ -29,11 +38,48 @@ impl CheckSpec {
         if crate::infra::redact(command).1 != 0 {
             bail!("verification commands must use environment variables for credentials");
         }
-        Ok(Self { command: command.into(), timeout_secs })
+        Ok(Self { command: command.into(), timeout_secs, pinned_files: Vec::new() })
     }
 
     pub fn validate(&self) -> Result<()> {
         Self::new(&self.command, self.timeout_secs).map(|_| ())
+    }
+
+    pub fn pin_files(mut self, root: &Path, paths: &[PathBuf]) -> Result<Self> {
+        for path in paths {
+            let sha256 = pinned_file_hash(root, path)?;
+            self.pinned_files.push(PinnedFile { path: path.clone(), sha256 });
+        }
+        Ok(self)
+    }
+
+    pub fn validate_files(&self, root: &Path) -> Result<()> {
+        for pin in &self.pinned_files {
+            let current = pinned_file_hash(root, &pin.path)
+                .with_context(|| format!("pinned verification file unavailable: {}", pin.path.display()))?;
+            if current != pin.sha256 {
+                bail!(
+                    "pinned verification file changed: {}. Restore the original acceptance file before completion",
+                    pin.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn pinned_paths(&self) -> String {
+        self.pinned_files.iter().map(|p| p.path.display().to_string()).collect::<Vec<_>>().join(", ")
+    }
+
+    fn digest(&self) -> String {
+        let mut context = Context::new(&SHA256);
+        field(&mut context, self.command.as_bytes());
+        field(&mut context, &self.timeout_secs.to_le_bytes());
+        for pin in &self.pinned_files {
+            field(&mut context, pin.path.as_os_str().as_encoded_bytes());
+            field(&mut context, pin.sha256.as_bytes());
+        }
+        hex(context.finish().as_ref())
     }
 
     pub fn command(&self) -> &str {
@@ -57,6 +103,7 @@ pub enum CheckOutcome {
 #[derive(Debug, Serialize)]
 pub struct CheckRecord {
     command_sha256: String,
+    criterion_sha256: String,
     input_sha256: String,
     final_sha256: String,
     exit_code: Option<i32>,
@@ -90,6 +137,7 @@ impl CheckRecord {
         };
         Self {
             command_sha256: hash(spec.command.as_bytes()),
+            criterion_sha256: spec.digest(),
             input_sha256: input,
             final_sha256: final_input,
             exit_code: status.flatten(),
@@ -120,6 +168,50 @@ impl CheckRecord {
             self.outcome, self.exit_code, self.seconds, self.output
         )
     }
+}
+
+/// Explicit files only: no path traversal, symlink ancestors or directory walks.
+/// Include the workspace identity and mode so saved pins cannot silently move.
+fn pinned_file_hash(root: &Path, relative: &Path) -> Result<String> {
+    use std::path::Component;
+    if relative.as_os_str().is_empty() || relative.components().any(|c| !matches!(c, Component::Normal(_))) {
+        bail!("pinned verification files must be workspace-relative file paths: {}", relative.display());
+    }
+    let root = root.canonicalize()?;
+    let mut path = root.clone();
+    for part in relative.components() {
+        path.push(part);
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            bail!("pinned verification file contains a symlink: {}", relative.display());
+        }
+    }
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        bail!("pinned verification input must be a regular file under 128 MiB: {}", relative.display());
+    }
+    let mut context = Context::new(&SHA256);
+    field(&mut context, root.as_os_str().as_encoded_bytes());
+    field(&mut context, relative.as_os_str().as_encoded_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        field(&mut context, &metadata.permissions().mode().to_le_bytes());
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0; 16 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > MAX_BYTES {
+            bail!("pinned verification file exceeds 128 MiB");
+        }
+        context.update(&buffer[..n]);
+    }
+    Ok(hex(context.finish().as_ref()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -280,6 +372,43 @@ mod tests {
             );
             assert_eq!(r.passed(), expected, "{}", r.summary());
         }
+    }
+
+    #[test]
+    fn completion_contract_pins_survive_serialization_without_rebaselining() {
+        let w = Workspace::new();
+        fs::write(w.0.join("check.py"), "assert False").unwrap();
+        let spec =
+            CheckSpec::new("python3 check.py", 1).unwrap().pin_files(&w.0, &[PathBuf::from("check.py")]).unwrap();
+        let loaded: CheckSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert!(loaded.validate_files(&w.0).is_ok());
+        assert_eq!(spec.digest(), loaded.digest());
+        fs::write(w.0.join("check.py"), "pass").unwrap();
+        assert!(loaded.validate_files(&w.0).is_err());
+        fs::write(w.0.join("check.py"), "assert False").unwrap();
+        assert!(loaded.validate_files(&w.0).is_ok());
+        let other = Workspace::new();
+        fs::write(other.0.join("check.py"), "assert False").unwrap();
+        assert!(loaded.validate_files(&other.0).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completion_contract_pins_reject_escapes_symlinks_and_mode_changes() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let w = Workspace::new();
+        fs::write(w.0.join("check.py"), "pass").unwrap();
+        let spec = CheckSpec::new("python3 check.py", 1).unwrap();
+        for path in ["", "..", "../check.py", "/tmp/check.py", "missing"] {
+            assert!(spec.clone().pin_files(&w.0, &[path.into()]).is_err(), "{path}");
+        }
+        symlink(&w.0, w.0.join("linked")).unwrap();
+        assert!(spec.clone().pin_files(&w.0, &["linked/check.py".into()]).is_err());
+        let pinned = spec.pin_files(&w.0, &["check.py".into()]).unwrap();
+        let path = w.0.join("check.py");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+        assert!(pinned.validate_files(&w.0).is_err());
     }
 
     #[test]
