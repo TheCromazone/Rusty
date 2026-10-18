@@ -47,8 +47,10 @@ automatically; name them explicitly when they belong to the fixed criterion.
 - `proposed` and `blocked` count `goal_done` calls;
 - `accepted` counts claims that closed the goal;
 - the refusals are `check_failed`, `check_error`, `commands_running`,
-  `sent_to_review` (careful mode's one review) and `discarded` (the turn
-  stalled, was interrupted or hit the output limit).
+  `sent_to_review` (careful mode's one review), `discarded` (the turn
+  stalled, was interrupted or hit the output limit) and `unverified` (a plan
+  step's stated expectation had no passing result, or a result said failed);
+- `revised_expectations` counts expectations rewritten after they were set.
 
 The counts cover the whole process. They measure the runtime, not the work: a
 lower accepted false-completion rate shows the gate refusing claims, not
@@ -467,6 +469,10 @@ one), a compaction is forced between the decision and the step that depends
 on it, and the check reads that dependent step. It is predeclared the same
 way.
 
+**Reopened (2026-10-18).** `compaction-decision` is that task, and a loss
+was observed; see [Handoffs measured](#handoffs-measured-2026-10-18). The
+fix carries each turn's closing reply instead of adding `DECISION:` lines.
+
 ### Predeclared: a lesson whose anchor is gone (2026-10-13)
 
 In `memory-only-fact`, session 1 captured the seed command in every `learn`
@@ -854,6 +860,72 @@ matches #102's (five of ten against one of ten), though those runs are not
 pooled. The requests and wall time for `memory-changed-fact` vary widely with
 how late the lesson is offered, as before, and are not read as an effect of
 the wording.
+
+### Handoffs measured (2026-10-18)
+
+Three changes taken from how Cognition describes Devin, each against its
+baseline (main at 66bad02) on the same tasks. These were written up after
+the runs, not predeclared. Models: `nvidia/nemotron-3-super-120b-a12b` and
+`gpt-6-astra` through a Codex sign-in, memory off. Cells are 3 to 15 runs,
+so read them as direction, not effect sizes.
+
+**What a compaction keeps.** `compaction-decision` has the agent choose a
+release codename that nothing else restates, fills a small window, and asks
+for the codename afterwards. In the first batch (26k window, standard
+compaction) three of five baseline runs compacted between the choice and its
+use, and two of those three lost the word: the summary dropped it and the
+agent wrote a different bird. With compactions forced (6k history cap,
+aggressive mode, long replies the trimmer can't shorten), baseline kept it in
+8 of 8 Nemotron runs and 5 of 5 Codex runs, and so did the fix. Across 22
+baseline runs with a compaction in between (including six with a manual
+`/compact`), the loss happened twice. Two Nemotron fix runs and one baseline run timed out after writing the
+right codename. Codex chose "kestrel" almost every time, so on that model a
+dropped word could pass by being guessed again; the printed `summary_kept`
+was true in every Codex run. A forced `/compact` was tried and dropped: a
+manual summary of the whole history kept the word every time.
+
+The fix carries each turn's closing reply, trimmed to 400 characters, with
+the user message it answered, in the block that every compaction carries word
+for word. That holds while the block fits its budget; when it doesn't,
+replies are the first thing cut, oldest first, before any of the user's own
+text. The cost could not be separated from noise in these runs.
+
+**Worker briefs and references.** `delegate-*` asks the lead to delegate one
+lookup over a copy of rusty's own `src/`.
+
+| | Nemotron baseline | Nemotron branch | Codex baseline | Codex branch |
+|---|---|---|---|---|
+| runs that delegated | 2 of 15 | 6 of 15 | 9 of 9 | 9 of 9 |
+| path:line references | 0 | 11 | 21 | 26 |
+| references pointing at nothing | – | 0 | 0 | 0 |
+| tokens | 1,206k (14 runs) | 1,026k (15) | 190k | 211k |
+
+All runs answered correctly. Nemotron rarely calls `task` even when told to;
+its baseline worker wrote "in `src/execution.rs` at line 88", which nothing
+can check. On Codex the branch's reports ran about 30% longer, so the report
+instruction was cut to the answer in a few sentences under 250 words; rerun
+three times per task, reports averaged 630 characters (590 on baseline, 770
+before the cut) and the runs used 207k tokens, all 20 references valid.
+Codex filled in `scope` and `done_when` in 9 of 9 briefs, Nemotron `scope` in
+6 of 6 and `done_when` in 1. No reference was wrong in either model, so the
+check's value is not shown here; it costs nothing until it fires.
+
+**Whole suite.** Every eval task once on Codex, with memory at its default:
+35 of 35 on main at 428d63b and 35 of 35 on this branch at 5937774 (before
+its last fixups, which touch careful-mode bookkeeping, the checker's input,
+reply trimming and reference paths); tokens 1,466k and 1,497k, and the same
+claim counts, none accepted and then graded failing.
+
+**Expectations before checks.** On Codex, `verified-index`,
+`verified-invoice`, `verified-repair` and `goal-todo-cli`, three runs each:
+12 of 12 passed in both arms, with no claim accepted and then graded failing.
+The branch wrote an expectation on 33 of 126 plan steps; none was untested at
+completion and none was revised, so the gate never refused a claim. Prompt
+tokens rose from 512k to 640k (+25%). With no false completion to prevent
+and a real cost, expectations are asked for only in careful mode, which
+exists to check its work twice. Cognition reports that stating the
+expectation first makes Devin "lie less", with no figure; whether it does
+here needs tasks where the baseline does claim false success.
 
 ## Combined architecture and next increments
 
