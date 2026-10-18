@@ -297,3 +297,11 @@ for a reviewer-readable transcript, and `--stats` for token accounting. The
 trajectory keeps every message, including the ones compaction summarised away
 (`archived_messages` counts them), and is refreshed at most every 30 seconds
 during a run, so a harness that kills rusty at its timeout still gets a record.
+
+### Preparation memory
+
+File hashes and uploads stream bounded buffers. Each build-context archive is
+spooled to a private, immediately unlinked temporary file through a 64 KiB
+buffer. The payload hash is computed during writing, and the buffer is flushed
+before the archive is rewound for upload. Allow temporary disk space for the
+largest context. Archive bytes and context identifiers remain compatible.

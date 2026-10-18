@@ -245,17 +245,20 @@ fn read_file(args: &Value) -> Result<String> {
     let text = fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(800).max(1) as usize;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
+    // Count delimiters directly so LLVM can vectorize the full-file scan.
+    // str::lines excludes the empty segment after a final newline.
+    let line_count =
+        text.bytes().filter(|&b| b == b'\n').count() + usize::from(!text.is_empty() && !text.ends_with('\n'));
+    if line_count == 0 {
         return Ok("(empty file)".into());
     }
     let mut out = String::new();
-    for (i, l) in lines.iter().enumerate().skip(offset - 1).take(limit) {
+    for (i, l) in text.lines().enumerate().skip(offset - 1).take(limit) {
         let _ = writeln!(out, "{:>6}\t{}", i + 1, truncate(l, 2000));
     }
-    let shown_to = (offset - 1 + limit).min(lines.len());
-    if shown_to < lines.len() {
-        let _ = writeln!(out, "… {} more lines (use offset={})", lines.len() - shown_to, shown_to + 1);
+    let shown_to = (offset - 1).saturating_add(limit).min(line_count);
+    if shown_to < line_count {
+        let _ = writeln!(out, "… {} more lines (use offset={})", line_count - shown_to, shown_to + 1);
     }
     Ok(cap(out))
 }
@@ -424,10 +427,17 @@ fn search(args: &Value) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Ok(if stderr.trim().is_empty() { "no matches".into() } else { format!("error: {}", stderr.trim()) });
     }
-    let lines: Vec<&str> = stdout.lines().collect();
-    let mut out = lines.iter().take(200).copied().collect::<Vec<_>>().join("\n");
-    if lines.len() > 200 {
-        let _ = write!(out, "\n… {} more matches", lines.len() - 200);
+    let mut lines = stdout.lines();
+    let mut out = String::new();
+    for (i, line) in lines.by_ref().take(200).enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    let remaining = lines.count();
+    if remaining > 0 {
+        let _ = write!(out, "\n… {remaining} more matches");
     }
     Ok(cap(out))
 }
@@ -753,6 +763,37 @@ pub fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_ranges_match_the_previous_formatter() {
+        let dir = std::env::temp_dir().join(format!("rusty-read-ranges-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input");
+        for text in [String::new(), "\n".into(), "a\r\nb\nlast\r".into(), "é🙂\n".repeat(3000), "z".repeat(2500)] {
+            fs::write(&path, &text).unwrap();
+            for offset in [1, 2, 20, 4000] {
+                for limit in [1, 3, 800, 4000] {
+                    let lines: Vec<_> = text.lines().collect();
+                    let mut expected = String::new();
+                    if lines.is_empty() {
+                        expected.push_str("(empty file)");
+                    } else {
+                        for (i, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
+                            let _ = writeln!(expected, "{:>6}\t{}", i + 1, truncate(line, 2000));
+                        }
+                        let end = (offset - 1 + limit).min(lines.len());
+                        if end < lines.len() {
+                            let _ = writeln!(expected, "… {} more lines (use offset={})", lines.len() - end, end + 1);
+                        }
+                    }
+                    assert_eq!(read_file(&json!({"path":path,"offset":offset,"limit":limit})).unwrap(), cap(expected));
+                }
+            }
+        }
+        fs::write(&path, b"ok\n\xff").unwrap();
+        assert!(read_file(&json!({"path":path,"limit":1})).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn edits_that_break_a_parsing_file_are_rejected() {

@@ -2,6 +2,23 @@
 //! which the TLS stack already builds; MD5 is written out here because
 //! Daytona names build contexts by an MD5 of their contents.
 
+/// Feed a file to an incremental hash without allocating its entire contents.
+pub fn hash_file(path: &std::path::Path, mut update: impl FnMut(&[u8])) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buffer) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        update(&buffer[..n]);
+    }
+}
+
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -69,6 +86,18 @@ const S: [u32; 64] = [
     21,
 ];
 
+// RFC 1321 sine constants, computed once rather than for every input block.
+const K: [u32; 64] = [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8,
+    0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
+    0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87,
+    0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039,
+    0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92,
+    0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+    0xeb86d391,
+];
+
 impl Md5 {
     pub fn update(&mut self, mut data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u64);
@@ -103,7 +132,7 @@ impl Md5 {
     }
 
     fn block(&mut self, block: &[u8; 64]) {
-        let m: Vec<u32> = block.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let m: [u32; 16] = std::array::from_fn(|i| u32::from_le_bytes(block[i * 4..i * 4 + 4].try_into().unwrap()));
         let [mut a, mut b, mut c, mut d] = self.state;
         for (i, shift) in S.iter().enumerate() {
             let (f, g) = match i / 16 {
@@ -112,7 +141,7 @@ impl Md5 {
                 2 => (b ^ c ^ d, (3 * i + 5) % 16),
                 _ => (c ^ (b | !d), (7 * i) % 16),
             };
-            let k = ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32;
+            let k = K[i];
             let rotated = a.wrapping_add(f).wrapping_add(k).wrapping_add(m[g]).rotate_left(*shift);
             (a, d, c, b) = (d, c, b, b.wrapping_add(rotated));
         }
@@ -135,6 +164,7 @@ mod tests {
     #[test]
     fn md5_matches_rfc_1321_vectors() {
         assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5(&vec![b'a'; 1_000_000]), "7707d6ae4e027c70eea2a935c2296f21");
         assert_eq!(md5(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
         assert_eq!(md5(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
         assert_eq!(

@@ -453,7 +453,7 @@ impl Remote for Toolbox {
 
     /// `POST /files/upload-v2?path=...` with the raw bytes.
     fn upload(&self, local: &Path, path: &str) -> Result<()> {
-        let data = std::fs::read(local).with_context(|| format!("reading {}", local.display()))?;
+        let data = std::fs::File::open(local).with_context(|| format!("reading {}", local.display()))?;
         let url = self.file_url("/files/upload-v2", &self.path(path)?)?;
         let resp = auth(self.http.post(url), &self.key)
             .header("Content-Type", "application/octet-stream")
