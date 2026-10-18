@@ -1634,7 +1634,7 @@ impl Agent {
             || self.backend.name() != "local"
             || self.shell_only
             || self.side_meta.is_some()
-            || self.hooks.matches(HookEvent::PreToolUse, &call.name)
+            || self.hooked(HookEvent::PreToolUse, &call.name)
         {
             return None;
         }
@@ -1816,9 +1816,15 @@ impl Agent {
         DispatchResult { text, refusal, mcp_outcome }
     }
 
+    /// Whether the user's hooks cover this call. They run on this machine,
+    /// so with remote tools they would act on a checkout the tools never touch.
+    fn hooked(&self, event: HookEvent, name: &str) -> bool {
+        self.backend.name() == "local" && self.hooks.matches(event, name)
+    }
+
     /// The user's PreToolUse hooks for one call; an error when one blocked it.
     fn pre_tool_hooks(&self, name: &str, args: &Value, d: &mut Display) -> Result<()> {
-        if !self.hooks.matches(HookEvent::PreToolUse, name) {
+        if !self.hooked(HookEvent::PreToolUse, name) {
             return Ok(());
         }
         if let Some(why) = self.run_hooks(HookEvent::PreToolUse, name, args, None, d).into_iter().next() {
@@ -1842,7 +1848,7 @@ impl Agent {
         result: Option<(&str, bool)>,
         d: &mut Display,
     ) -> Vec<String> {
-        if !self.hooks.matches(event, name) {
+        if !self.hooked(event, name) {
             return Vec::new();
         }
         let mut input = json!({"event": event.name(), "tool": name, "args": args, "cwd": self.cwd});
@@ -1853,11 +1859,8 @@ impl Agent {
             input["result"] = text.into();
             input["ok"] = ok.into();
         }
-        // Hooks run on this machine: in the workspace, or where rusty started
-        // when the tools run elsewhere.
-        let dir = (self.backend.name() == "local").then_some(self.cwd.as_path());
         let mut said = Vec::new();
-        for outcome in self.hooks.run(event, name, &input, dir) {
+        for outcome in self.hooks.run(event, name, &input, &self.cwd) {
             let line = match outcome {
                 hooks::Outcome::Exit2(why) => {
                     said.push(why);

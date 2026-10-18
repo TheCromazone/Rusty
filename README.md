@@ -349,6 +349,8 @@ otherwise (at most 600). What the exit code means:
 PreToolUse hooks run before any permission prompt, so a call a hook blocks
 never asks you. Hooks run for every call, including workers' and side
 chats'. Notes for the model are redacted like any other tool output.
+Hooks run on your machine, so they only apply when the tools do: with
+remote tools (Daytona or SSH) they are off, and rusty says so at startup.
 Hooks are only read from `$HOME/.config/rusty/hooks.json`, never from the
 project, and `RUSTY_HOME` doesn't move them: a project's `.env` can set
 `RUSTY_HOME`, so honouring it would let a cloned repository run commands on

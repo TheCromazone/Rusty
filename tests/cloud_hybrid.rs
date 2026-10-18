@@ -581,6 +581,11 @@ fn the_hybrid_command_runs_local_rusty_against_remote_tools() {
     let h = Hybrid::new("cli");
     let (server, shared) = model();
     let trace = h.tmp.path().join("cli.json");
+    // Hooks run on this machine, so with remote tools they stay off.
+    let marker = h.tmp.path().join("hook-ran");
+    std::fs::create_dir_all(h.home.join(".config/rusty")).unwrap();
+    let hooks = json!({"PreToolUse": [{"command": format!("touch {}; exit 2", marker.display())}]});
+    std::fs::write(h.home.join(".config/rusty/hooks.json"), hooks.to_string()).unwrap();
     let out = h
         .api
         .cloud(&h.host)
@@ -600,6 +605,7 @@ fn the_hybrid_command_runs_local_rusty_against_remote_tools() {
     assert_model_ok(&shared);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("never creates, stops or deletes it"));
+    assert!(text(&out).contains("hooks off: they run on this machine") && !marker.exists(), "{}", text(&out));
     assert_eq!(std::fs::read_to_string(h.remote.join("result.txt")).unwrap(), "checked");
     assert!(!h.host.join("note.txt").exists());
     let trace: Value = serde_json::from_str(&std::fs::read_to_string(&trace).unwrap()).unwrap();

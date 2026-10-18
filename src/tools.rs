@@ -524,9 +524,9 @@ pub fn run_capture(command: &str, timeout: Duration) -> Result<ShellCapture> {
     run_owned(command, timeout, None, None)
 }
 
-/// Runs a user hook: `input` on its stdin, in `dir` (rusty's own working
-/// directory when None), otherwise exactly like a bash call.
-pub fn run_hook(command: &str, dir: Option<&Path>, input: &str, timeout: Duration) -> Result<ShellCapture> {
+/// Runs a user hook: `input` on its stdin, in `dir`, otherwise exactly like
+/// a bash call.
+pub fn run_hook(command: &str, dir: &Path, input: &str, timeout: Duration) -> Result<ShellCapture> {
     run_owned(command, timeout, None, Some((dir, input)))
 }
 
@@ -544,7 +544,7 @@ fn run_owned(
     command: &str,
     timeout: Duration,
     cancel: Option<&std::sync::atomic::AtomicBool>,
-    hook: Option<(Option<&Path>, &str)>,
+    hook: Option<(&Path, &str)>,
 ) -> Result<ShellCapture> {
     use std::sync::atomic::Ordering;
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
@@ -554,7 +554,7 @@ fn run_owned(
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command).stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if hook.is_some() { Stdio::piped() } else { Stdio::null() });
-    if let Some((Some(dir), _)) = hook {
+    if let Some((dir, _)) = hook {
         cmd.current_dir(dir);
     }
     // Secrets the model saw only as ${RUSTY_SECRET_n} handles.

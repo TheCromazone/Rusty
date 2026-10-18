@@ -112,13 +112,17 @@ impl Hooks {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.pre.is_empty() && self.post.is_empty()
+    }
+
     pub fn matches(&self, event: Event, tool: &str) -> bool {
         self.of(event).iter().any(|h| h.matches(tool))
     }
 
     /// Runs the event's hooks for `tool` in order, each with `input` as JSON
     /// on its stdin. Before a call, the first block ends the run.
-    pub fn run(&self, event: Event, tool: &str, input: &Value, dir: Option<&Path>) -> Vec<Outcome> {
+    pub fn run(&self, event: Event, tool: &str, input: &Value, dir: &Path) -> Vec<Outcome> {
         let input = input.to_string();
         let mut outcomes = Vec::new();
         for hook in self.of(event).iter().filter(|h| h.matches(tool)) {
@@ -217,7 +221,7 @@ mod tests {
             "PostToolUse": [{"command": "sleep 5", "timeout_secs": 1}, {"command": "exit 2"}],
         }));
         let input = json!({"event": "PreToolUse", "tool": "bash", "args": {"command": "rm -rf /"}});
-        let outcomes = h.run(Event::PreToolUse, "bash", &input, Some(&dir));
+        let outcomes = h.run(Event::PreToolUse, "bash", &input, &dir);
         assert_eq!(
             outcomes,
             [
@@ -228,8 +232,8 @@ mod tests {
         let seen: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("input.json")).unwrap()).unwrap();
         assert_eq!(seen, input, "the hook reads the call on stdin, in the given directory");
         assert!(!dir.join("never-ran").exists(), "a block ends the run");
-        assert!(h.run(Event::PreToolUse, "read_file", &input, Some(&dir)).is_empty());
-        let after = h.run(Event::PostToolUse, "bash", &input, Some(&dir));
+        assert!(h.run(Event::PreToolUse, "read_file", &input, &dir).is_empty());
+        let after = h.run(Event::PostToolUse, "bash", &input, &dir);
         assert_eq!(
             after,
             [Outcome::Failed("`sleep 5` failed (timed out after 1s)".into()), Outcome::Exit2("no reason given".into())]

@@ -340,7 +340,8 @@ back to the model as the reason. A PostToolUse hook runs once the call
 finishes; exit code 2 adds its stderr to the result as a note. Any other
 failure is a warning to you, never a failed call. Reads that a PreToolUse
 hook matches don't run ahead of their turn, so the hook always sees a call
-before it happens. Hooks are never read from the project, so opening a
+before it happens. Hooks run on your machine, so they are off when the
+tools run remotely. Hooks are never read from the project, so opening a
 repository can't run its commands. [Format and exit codes](../README.md#hooks-run-your-own-checks-around-tool-calls)
 
 ### Where the work runs
