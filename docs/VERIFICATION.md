@@ -1212,3 +1212,46 @@ no key, so a harness can refuse an unsupported setting before any model call.
 - a qualified live Daytona journey;
 - remote (HTTP/SSE) MCP transports, which are skipped;
 - that any memory level improves hard tasks.
+
+## Interactive goals and completion outcomes
+
+Configure a fixed check before starting an interactive goal:
+
+```text
+/goal verify python3 -B check_public.py
+/goal pin check_public.py
+/goal fix pagination while preserving ordering
+/goal status
+```
+
+`verify` replaces the check (and clears its pins) for future goals. `pin` adds
+one workspace-relative file, capturing its bytes immediately. The default
+check deadline is 120 seconds. `/goal verify off` disables checks for future
+goals. These commands never weaken an existing goal's criterion; `/goal resume`
+uses that goal's saved criterion and runs fresh verification. Pending settings
+are process-local; the criterion is saved once a goal starts. Local tools only.
+
+Stats and trajectories expose `goal_outcome`: `verified` means the fixed check
+passed during this process; `completed_unverified` means completion lacks a
+current passing receipt; `blocked` and `incomplete` cannot count as success.
+A restored completed goal has no fresh receipt and is therefore unverified.
+`goal_end` still provides the termination reason, including errors and limits.
+These are bounded check results, not a claim of comprehensive correctness.
+
+Headless goals that remain open or blocked exit 2 whether or not `--verify` was
+supplied. Runtime errors exit 1 and interruptions exit 130. Unchecked model
+completion still exits 0 for compatibility; automation requiring proof must
+select a fixed check and require `goal_outcome == "verified"`.
+
+A command that executes but invalidates its pinned files or makes the final
+workspace observation unavailable retains its output, exit code and receipt.
+Its `EvidenceUnavailable` outcome rejects completion; `observation_error`
+explains the missing evidence. A check refused before execution has no receipt.
+
+Run `cargo xtask eval-completion` for offline contract evals, including the
+interactive journey, unchecked completion, blocked and turn-limited goals,
+checker tampering, fresh acceptance, resume and independent hidden grading.
+Before comparing model quality, run the existing hidden-graded tasks with
+verification and careful review independently toggled, identical starting
+files/model/total budgets, and repeated trials. Report external pass rate,
+false completion, latency and total lead-plus-worker usage separately.
