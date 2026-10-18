@@ -1,15 +1,15 @@
 //! Private native-app transport. Each process owns one existing session lease.
 //! No UI toolkit, listener or provider logic is introduced here.
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1192,9 +1192,11 @@ fn receipt_snapshot(shared: &Shared, ledger: &BTreeMap<String, Receipt>) -> Valu
     snapshot["receipts_truncated"] = json!(ledger.len() > 100);
     let uncertain: Vec<_> = recent.iter().filter(|(_, r)| r.state == "uncertain").collect();
     snapshot["uncertain_run_count"] = json!(uncertain.len());
-    snapshot["uncertain_runs"] = json!(
-        uncertain.iter().take(100).map(|(id, r)| { json!({"request_id":id,"run_id":r.run_id}) }).collect::<Vec<_>>()
-    );
+    snapshot["uncertain_runs"] = json!(uncertain
+        .iter()
+        .take(100)
+        .map(|(id, r)| { json!({"request_id":id,"run_id":r.run_id}) })
+        .collect::<Vec<_>>());
     snapshot["uncertain_runs_truncated"] = json!(uncertain.len() > 100);
     let tools: Vec<_> = uncertain.iter().flat_map(|(_, r)| r.tools.iter().map(|tool| {
         json!({"run_id":r.run_id,"tool":tool.tool,"summary":tool.summary,"requester":tool.requester,"started_at":tool.started_at,"activity_id":tool.activity_id})
