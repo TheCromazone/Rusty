@@ -135,9 +135,9 @@ fn inspect_input(text: &str, cols: u16, plain: bool, indexed: bool) -> Result<()
     let wanted = if plain {
         Color::Default
     } else if indexed {
-        Color::Indexed(68)
+        Color::Indexed(111)
     } else {
-        Color::Rgb(64, 124, 208)
+        Color::Rgb(138, 190, 255)
     };
     for row in first..=last {
         for col in 0..cols as usize {
@@ -584,7 +584,10 @@ fn inspect_capture(path: &Path, cols: usize) -> Result<Inspection> {
         let r = s.row();
         match event {
             // The compact one-line footer of a narrow terminal.
-            Event::Reset if cols < 31 && s.line(r).starts_with("◇ rusty") => {
+            Event::Reset
+                if s.line(r).starts_with("◇ ")
+                    && (s.line(r).trim_end().ends_with("ctrl-c to stop") || s.line(r).trim_end().ends_with('s')) =>
+            {
                 if s.cell(r, cols - 1).ch != ' ' {
                     problem = Some("compact footer used wrap column".into());
                 } else if !coloured(s.cell(r, 0).pen) {
@@ -615,13 +618,16 @@ fn inspect_capture(path: &Path, cols: usize) -> Result<Inspection> {
         bail!("{cols} columns: {p}");
     }
     let last = screen.lines();
-    if last.iter().any(|l| l.contains('╭') || l.contains('╯')) {
+    if last.iter().any(|l| l.contains('╭') || l.contains('╯') || l.starts_with("◇ ")) {
         bail!("{cols} columns: transient panel left at exit");
     }
     if !text.contains("CAPTURE_COMPLETE") {
         bail!("{cols} columns: the capture never completed");
     }
-    if !frames.is_empty() {
+    if frames.is_empty() {
+        bail!("{cols} columns: no progress frames were captured");
+    }
+    {
         if screen.scrolled == 0 {
             bail!("{cols} columns: output never scrolled");
         }
@@ -705,6 +711,16 @@ mod tests {
         let i = check("clean", &capture(37, true, true)).unwrap();
         assert_eq!((i.frames.len(), i.scrolls), (1, 9));
         assert!(i.last.iter().any(|l| l.starts_with("CAPTURE_COMPLETE")));
+    }
+
+    #[test]
+    fn inspection_checks_compact_footer_and_cleanup() {
+        let prefix: String = (0..30).map(|i| format!("line {i}\r\n")).collect();
+        let frame = "\x1b[38;5;252m◇ Thinking · 2s · ctrl-c to stop\x1b[0m";
+        let clean = format!("{prefix}{frame}\r\x1b[2KCAPTURE_COMPLETE\r\n");
+        assert_eq!(check("compact-clean", &clean).unwrap().frames.len(), 1);
+        let dirty = format!("{prefix}{frame}\r\nCAPTURE_COMPLETE\r\n");
+        assert!(check("compact-dirty", &dirty).err().unwrap().to_string().contains("left at exit"));
     }
 
     #[test]

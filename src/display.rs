@@ -2,8 +2,8 @@
 //!
 //! Reads, searches and listings collapse into one "explored" line, so you
 //! see the shape of the work instead of a wall of tool calls. Edits and
-//! commands get their own lines. While the model works, a small geometric panel
-//! animates in place beneath the transcript. Every turn ends with a one-line recap.
+//! commands get their own lines. While the model works, a compact status row
+//! sits beneath the transcript. Every turn ends with a one-line recap.
 //!
 //! Views: `default` (as above), `verbose` (every call, every result, the
 //! reasoning stream) and `adhd` (one status line, short answers, nothing else).
@@ -119,7 +119,7 @@ impl Display {
         }
         Self {
             quiet,
-            verb: ui::VERBS[ui::rand(ui::VERBS.len())],
+            verb: "Thinking",
             started: now,
             last_draw: now - Duration::from_secs(1),
             frame: 0,
@@ -137,12 +137,12 @@ impl Display {
         }
     }
 
-    /// Advances only the geometric rail; completed output stays in scrollback.
+    /// Refreshes elapsed time; completed output stays in scrollback.
     pub fn tick(&mut self) {
         if self.quiet || !ui::tty() || self.in_reasoning {
             return;
         }
-        let cadence = if ui::animate() { 100 } else { 1000 };
+        let cadence = 1000;
         if self.last_draw.elapsed() < Duration::from_millis(cadence) {
             return;
         }
