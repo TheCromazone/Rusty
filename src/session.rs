@@ -49,6 +49,8 @@ pub struct Lease {
     marked: AtomicBool,
     /// The catalog matches the last transcript this writer published.
     indexed: AtomicBool,
+    /// The last compressed save's sealed history chunks (see [`gzip`]).
+    chunks: std::sync::Mutex<Vec<Chunk>>,
 }
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self> {
@@ -80,6 +82,7 @@ impl Lease {
                         transcript: transcript.to_path_buf(),
                         marked: AtomicBool::new(false),
                         indexed: AtomicBool::new(false),
+                        chunks: Default::default(),
                     }));
                 }
                 Ok(_) => continue,
@@ -106,27 +109,160 @@ impl Drop for Lease {
     }
 }
 
-pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
-    scrub(&mut body);
+pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
+    write(path, body, None)
+}
+
+/// Saves `body` through a temporary file, fsynced, then renamed over
+/// `path`. With `chunks`, a compressed save reuses the history chunks the
+/// last one compressed and leaves this save's in their place.
+fn write(path: &Path, mut body: serde_json::Value, chunks: Option<&std::sync::Mutex<Vec<Chunk>>>) -> Result<()> {
     let tmp = path.with_extension("pending");
     let result = (|| {
-        let json = serde_json::to_vec(&body)?;
+        let items = scrub(&mut body)?;
+        let (head, tail) = frame(&body, items.is_some())?;
+        let items = items.unwrap_or_default();
+        let commas = items.len().saturating_sub(1);
+        let len = head.len() + tail.len() + commas + items.iter().map(|i| i.json.len()).sum::<usize>();
         let mut writer = std::io::BufWriter::new(rusty::privacy::private_file(&tmp, false)?);
-        if json.len() >= COMPRESS_FROM {
-            let mut gzip = flate2::write::GzEncoder::new(&mut writer, flate2::Compression::new(3));
-            gzip.write_all(&json)?;
-            gzip.finish()?;
+        let mut kept = Vec::new();
+        if len >= COMPRESS_FROM {
+            let old = chunks.map(|c| std::mem::take(&mut *c.lock().unwrap_or_else(|p| p.into_inner())));
+            kept = gzip(&mut writer, &head, &items, &tail, old.unwrap_or_default())?;
         } else {
-            writer.write_all(&json)?;
+            writer.write_all(&head)?;
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    writer.write_all(b",")?;
+                }
+                writer.write_all(&item.json)?;
+            }
+            writer.write_all(&tail)?;
         }
         writer.into_inner().map_err(|error| error.into_error())?.sync_all()?;
         std::fs::rename(&tmp, path).context("publishing session")?;
+        // Only what this save wrote stays: a shorter history (cleared,
+        // compacted or resumed elsewhere) frees the chunks it no longer has.
+        if let Some(chunks) = chunks {
+            *chunks.lock().unwrap_or_else(|p| p.into_inner()) = kept;
+        }
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
     result
+}
+
+/// `body` as compact JSON, split around its history array when `split`:
+/// everything up to the array's `[`, and everything from its `]`. The
+/// pieces with the items between them are exactly `serde_json::to_vec`.
+fn frame(body: &serde_json::Value, split: bool) -> Result<(Vec<u8>, Vec<u8>)> {
+    let Some(map) = body.as_object().filter(|_| split) else { return Ok((serde_json::to_vec(body)?, Vec::new())) };
+    let (mut head, mut tail, mut done) = (vec![b'{'], Vec::new(), false);
+    for (i, (key, value)) in map.iter().enumerate() {
+        let out = if done { &mut tail } else { &mut head };
+        if i > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut *out, key)?;
+        out.push(b':');
+        if key == "history" && !done {
+            head.push(b'[');
+            tail.push(b']');
+            done = true;
+        } else {
+            serde_json::to_writer(out, value)?;
+        }
+    }
+    let end = if done { &mut tail } else { &mut head };
+    end.push(b'}');
+    Ok((head, tail))
+}
+
+/// One saved history message: its JSON and that JSON's SHA-256.
+struct Item {
+    digest: [u8; 32],
+    json: Vec<u8>,
+}
+
+/// History items, about this many bytes at a time, are compressed on their
+/// own. A long session's history only grows at the end, so every chunk
+/// but the last is the same as in the previous save and its compressed
+/// bytes are reused. Twice deflate's 32 KB window, so splitting it up
+/// costs next to nothing in size.
+const CHUNK: usize = 64 * 1024;
+
+/// A sealed chunk: what identifies its exact bytes, and those bytes deflated.
+pub(crate) struct Chunk {
+    key: [u8; 32],
+    deflated: Vec<u8>,
+}
+
+/// Writes one gzip member: the head, the history items and the tail, each
+/// chunk deflated on its own and ended with a full flush, so the pieces
+/// join into one stream any gzip reader takes. Chunks found in `old` are
+/// not compressed again. Returns this save's sealed chunks.
+fn gzip(out: &mut impl Write, head: &[u8], items: &[Item], tail: &[u8], mut old: Vec<Chunk>) -> Result<Vec<Chunk>> {
+    let mut crc = flate2::Crc::new();
+    // The header GzEncoder writes: no name, no time, unknown OS.
+    out.write_all(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff])?;
+    out.write_all(&deflate(head, false)?)?;
+    crc.update(head);
+    let mut kept = Vec::new();
+    let mut open = Vec::with_capacity(CHUNK * 2);
+    let mut key = chunk_key(true);
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            open.push(b',');
+        }
+        open.extend_from_slice(&item.json);
+        key.update(&item.digest);
+        if open.len() >= CHUNK {
+            let mut sealed = [0; 32];
+            sealed.copy_from_slice(std::mem::replace(&mut key, chunk_key(false)).finish().as_ref());
+            let deflated = match old.iter().position(|c| c.key == sealed) {
+                Some(at) => old.swap_remove(at).deflated,
+                None => deflate(&open, false)?,
+            };
+            out.write_all(&deflated)?;
+            crc.update(&open);
+            kept.push(Chunk { key: sealed, deflated });
+            open.clear();
+        }
+    }
+    open.extend_from_slice(tail);
+    out.write_all(&deflate(&open, true)?)?;
+    crc.update(&open);
+    out.write_all(&crc.sum().to_le_bytes())?;
+    out.write_all(&crc.amount().to_le_bytes())?;
+    Ok(kept)
+}
+
+/// A chunk's key hashes its items' digests and whether it opens the array,
+/// which decides whether its bytes start with a comma.
+fn chunk_key(first: bool) -> ring::digest::Context {
+    let mut key = ring::digest::Context::new(&ring::digest::SHA256);
+    key.update(&[first as u8]);
+    key
+}
+
+/// Raw deflate of `data`: ended with a full flush, which byte-aligns the
+/// output and lets the next piece start fresh, or with the final block.
+fn deflate(data: &[u8], last: bool) -> Result<Vec<u8>> {
+    use flate2::{Compress, Compression, FlushCompress, Status};
+    let mut compress = Compress::new(Compression::new(3), false);
+    let flush = if last { FlushCompress::Finish } else { FlushCompress::Full };
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    loop {
+        let status = compress.compress_vec(&data[compress.total_in() as usize..], &mut out, flush)?;
+        let consumed = compress.total_in() as usize == data.len();
+        // A flush is complete once it leaves room in the output.
+        if consumed && (status == Status::StreamEnd || (!last && out.len() < out.capacity())) {
+            return Ok(out);
+        }
+        out.reserve(out.capacity().max(64));
+    }
 }
 
 /// Transcripts this large are saved gzip-compressed. Tool output makes up
@@ -155,36 +291,50 @@ const MAX_CLEAN: usize = 1 << 16;
 /// since the last save, and redaction is a pure function of the text for
 /// the life of the process. A message is skipped only when the SHA-256 of
 /// its exact JSON is one that scrubbing left unchanged before.
-fn scrub(body: &mut serde_json::Value) {
+///
+/// History comes back serialized, one item per message, and out of `body`,
+/// which keeps a null in its place; None when `body` has no history array.
+fn scrub(body: &mut serde_json::Value) -> Result<Option<Vec<Item>>> {
     static CLEAN: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let history = body.get_mut("history").map(serde_json::Value::take);
     rusty::privacy::scrub(body);
-    let Some(mut history) = history else { return };
-    if let serde_json::Value::Array(items) = &mut history {
-        let mut clean = CLEAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if clean.len() > MAX_CLEAN {
-            clean.clear();
+    let digest = |raw: &[u8]| {
+        let mut digest = [0; 32];
+        digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, raw).as_ref());
+        digest
+    };
+    let mut items = match history {
+        Some(serde_json::Value::Array(items)) => items,
+        Some(mut other) => {
+            rusty::privacy::scrub(&mut other);
+            body["history"] = other;
+            return Ok(None);
         }
-        for item in items {
-            let Ok(raw) = serde_json::to_vec(item) else {
-                rusty::privacy::scrub(item);
-                continue;
-            };
-            let mut digest = [0; 32];
-            digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, &raw).as_ref());
-            if clean.contains(&digest) {
-                continue;
-            }
-            rusty::privacy::scrub(item);
-            if serde_json::to_vec(item).is_ok_and(|after| after == raw) {
-                clean.insert(digest);
-            }
-        }
-    } else {
-        rusty::privacy::scrub(&mut history);
+        None => return Ok(None),
+    };
+    let mut clean = CLEAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if clean.len() > MAX_CLEAN {
+        clean.clear();
     }
-    body["history"] = history;
+    let mut out = Vec::with_capacity(items.len());
+    for item in &mut items {
+        let raw = serde_json::to_vec(item)?;
+        let known = digest(&raw);
+        if clean.contains(&known) {
+            out.push(Item { digest: known, json: raw });
+            continue;
+        }
+        rusty::privacy::scrub(item);
+        let after = serde_json::to_vec(item)?;
+        if after == raw {
+            clean.insert(known);
+            out.push(Item { digest: known, json: raw });
+        } else {
+            out.push(Item { digest: digest(&after), json: after });
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Publish a parent transcript only once a durable catalog-recovery marker
@@ -206,7 +356,7 @@ pub fn publish_and_record(
         lease.marked.store(true, Ordering::Release);
     }
     lease.indexed.store(false, Ordering::Release);
-    save(transcript, body)?;
+    write(transcript, body, Some(&lease.chunks))?;
     record(dir, transcript, history, archived)?;
     lease.indexed.store(true, Ordering::Release);
     Ok(())
@@ -817,6 +967,99 @@ mod tests {
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(saved["history"].as_array().unwrap().len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// What a save must read back as: the scrubbed body, compact.
+    fn expected(body: &serde_json::Value) -> String {
+        let mut body = body.clone();
+        rusty::privacy::scrub(&mut body);
+        body.to_string()
+    }
+
+    fn turn(i: usize) -> [serde_json::Value; 2] {
+        let output = format!("{i:>6}\tfn step_{i}() {{ let total = {i} * 3; }}\n").repeat(60);
+        [
+            serde_json::json!({"role":"user","content":format!("turn {i}: read the next file")}),
+            serde_json::json!({"role":"tool","tool_call_id":format!("call{i}"),"content":output}),
+        ]
+    }
+
+    #[test]
+    fn compressed_saves_reuse_unchanged_chunks_and_read_back_exactly() {
+        let dir = temp_dir("chunks");
+        let path = dir.join("long.json");
+        let chunks = std::sync::Mutex::new(Vec::<Chunk>::new());
+        let keys = || chunks.lock().unwrap().iter().map(|c| c.key).collect::<Vec<_>>();
+        let mut history: Vec<serde_json::Value> = (0..100).flat_map(turn).collect();
+        history[3]["content"] = serde_json::json!("token = CHUNK_SECRET_CANARY_12");
+        let body = |history: &[serde_json::Value]| serde_json::json!({"model":"m","history":history,"plan":["p"]});
+
+        write(&path, body(&history), Some(&chunks)).unwrap();
+        assert!(std::fs::read(&path).unwrap().starts_with(&[0x1f, 0x8b]));
+        let text = read(&path).unwrap();
+        assert_eq!(text, expected(&body(&history)));
+        assert!(!text.contains("CHUNK_SECRET_CANARY_12"));
+        let first = keys();
+        assert!(first.len() > 2, "a long history is split into chunks");
+
+        // History grows at the end: every sealed chunk is kept as it was.
+        history.extend((100..110).flat_map(turn));
+        write(&path, body(&history), Some(&chunks)).unwrap();
+        assert_eq!(read(&path).unwrap(), expected(&body(&history)));
+        assert_eq!(keys()[..first.len()], first[..]);
+
+        // An old message rewritten in place (trimmed tool output) changes its chunk.
+        history[5]["content"] = serde_json::json!("[output trimmed]");
+        write(&path, body(&history), Some(&chunks)).unwrap();
+        assert_eq!(read(&path).unwrap(), expected(&body(&history)));
+        assert_ne!(keys()[0], first[0]);
+
+        // Compaction leaves a short history; only its chunks stay.
+        history.drain(..150);
+        write(&path, body(&history), Some(&chunks)).unwrap();
+        assert_eq!(read(&path).unwrap(), expected(&body(&history)));
+        let compacted = keys();
+        assert!(!compacted.is_empty() && compacted.iter().all(|k| !first.contains(k)));
+
+        // A cleared history is saved plain and drops every chunk.
+        write(&path, body(&[]), Some(&chunks)).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with('{'));
+        assert_eq!(read(&path).unwrap(), expected(&body(&[])));
+        assert!(keys().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_resumed_transcript_starts_with_no_chunks() {
+        let dir = temp_dir("chunks-resume");
+        let path = create(&dir).unwrap();
+        let history: Vec<serde_json::Value> = (0..100).flat_map(turn).collect();
+        {
+            let lease = Lease::acquire(&path).unwrap();
+            publish_and_record(&dir, &lease, serde_json::json!({"history":history}), &history, &[]).unwrap();
+            assert!(!lease.chunks.lock().unwrap().is_empty());
+        }
+        let lease = Lease::acquire(&path).unwrap();
+        assert!(lease.chunks.lock().unwrap().is_empty());
+        assert_eq!(read(&path).unwrap(), expected(&serde_json::json!({"history":history})));
+        drop(lease);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn framing_matches_serde_for_bodies_with_and_without_history() {
+        for body in [
+            serde_json::json!({"a":1,"history":[],"z":"x"}),
+            serde_json::json!({"history":[{"role":"user","content":"hi"}]}),
+            serde_json::json!({"history":"not an array","b":[1]}),
+            serde_json::json!({"only":"rest"}),
+        ] {
+            let dir = temp_dir("frame");
+            let path = dir.join("f.json");
+            save(&path, body.clone()).unwrap();
+            assert_eq!(read(&path).unwrap(), expected(&body));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
