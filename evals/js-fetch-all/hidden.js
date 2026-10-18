@@ -2,6 +2,20 @@ const assert = require("assert");
 const path = require("path");
 const { fetchAll } = require(path.resolve("fetch_all.js"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Turn the event loop until `ready()` holds, for a bounded number of turns,
+// so the check needs neither a wall-clock deadline nor one exact turn count.
+const turns = async (ready) => {
+  for (let i = 0; i < 1000 && !ready(); i++) await new Promise(setImmediate);
+};
+// An implementation that never settles would leave nothing for Node to wait
+// on, and Node would exit 0 without running the remaining assertions.
+let done = false;
+process.on("exit", (code) => {
+  if (code === 0 && !done) {
+    console.error("hidden check never finished: a promise never settled");
+    process.exitCode = 1;
+  }
+});
 
 (async () => {
   assert.deepStrictEqual(await fetchAll([], async () => 1), []);
@@ -22,12 +36,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     live--;
     return `r${i}`;
   }, { concurrency: 3 });
-  // setImmediate lets every queued promise continuation finish without a
-  // wall-clock threshold or assumptions about the order calls start in.
-  await new Promise(setImmediate);
+  // Wait until the pool has filled, then give it a few more turns to show
+  // that it does not overfill. No assumption about the order calls start in.
+  await turns(() => started.length >= 3);
+  for (let i = 0; i < 10; i++) await new Promise(setImmediate);
   assert.strictEqual(started.length, 3, "fill the available pool slots");
   gates[started[1]].release();
-  await new Promise(setImmediate);
+  await turns(() => started.length >= 4);
+  for (let i = 0; i < 10; i++) await new Promise(setImmediate);
   assert.strictEqual(started.length, 4, "refill while earlier calls are still pending (no fixed batches)");
   for (const gate of gates) gate.release();
   const out = await pending;
@@ -50,5 +66,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   );
   await sleep(60);
   assert.ok(calls.length <= 3, `started ${calls.length} calls after the failure`);
+  done = true;
   console.log("hidden ok");
 })().catch((e) => { console.error(e); process.exit(1); });
