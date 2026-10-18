@@ -329,9 +329,13 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
     let log = File::create(dest.join(format!("terminal-{cols}.ansi")))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
     if matches!(prompt, "aside-capture" | "side-capture" | "summary-capture") {
-        let end = Instant::now() + Duration::from_secs(5);
+        // Startup includes durable session creation. Wait for the actual tool
+        // witness within the same bounded deadline as other PTY readiness.
+        let end = Instant::now() + s.timeout;
         while !dest.join("main-started.txt").exists() && Instant::now() < end {
-            s.pump(Duration::from_millis(20))?;
+            if !s.pump(Duration::from_millis(20))? {
+                bail!("terminal closed before the main command started");
+            }
         }
         if !dest.join("main-started.txt").exists() {
             bail!("main command did not start");
