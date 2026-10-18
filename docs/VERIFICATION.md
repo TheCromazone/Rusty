@@ -355,8 +355,11 @@ The input digest covers the canonical workspace identity, inherited environment,
 file contents, paths, and Unix permission modes. Environment values and file
 contents are hashed rather than exported. It includes untracked files and
 lockfiles. Symlinks and special files are rejected. Enumeration is bounded at
-50,000 entries and 128 MiB of contents; exceeding either limit leaves the goal
-unverified rather than silently dropping inputs.
+50,000 enumerated entries and 128 MiB of contents; exceeding either limit leaves
+the goal unverified rather than silently dropping inputs. The entry budget is
+checked while reading each directory, includes excluded directory entries (but
+not their contents), and is shared across the traversal. Traversal is iterative
+so deeply nested inputs cannot exhaust the call stack.
 
 `.git`, `target`, `__pycache__`, and `.pytest_cache` are excluded. These generated
 artifacts often change during a check. This is a **source-input manifest**, not a

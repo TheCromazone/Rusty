@@ -249,7 +249,7 @@ pub fn fingerprint(root: &Path) -> Result<String> {
     field(&mut context, root.as_os_str().as_encoded_bytes());
     let mut count = 0;
     let mut bytes = 0;
-    walk(&root, &root, &mut context, &mut count, &mut bytes)?;
+    walk(&root, &mut context, &mut count, &mut bytes, MAX_ENTRIES)?;
     let mut env: Vec<_> = std::env::vars_os().collect();
     env.sort();
     for (key, value) in env {
@@ -259,10 +259,27 @@ pub fn fingerprint(root: &Path) -> Result<String> {
     Ok(hex(context.finish().as_ref()))
 }
 
-fn walk(root: &Path, dir: &Path, context: &mut Context, count: &mut usize, bytes: &mut u64) -> Result<()> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
-    entries.sort();
-    for path in entries {
+// Count entries while reading, before sorting or retaining an unbounded directory.
+// The budget is shared across the entire traversal, including ignored entries.
+fn entries(dir: &Path, count: &mut usize, limit: usize) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        if *count >= limit {
+            bail!("verification input exceeds {limit} entries");
+        }
+        paths.push(entry?.path());
+        *count += 1;
+    }
+    paths.sort();
+    paths.reverse();
+    Ok(paths)
+}
+
+fn walk(root: &Path, context: &mut Context, count: &mut usize, bytes: &mut u64, limit: usize) -> Result<()> {
+    // Reverse-sorted pending paths preserve the original depth-first hash order
+    // without retaining a Rust call frame for every nested directory.
+    let mut pending = entries(root, count, limit)?;
+    while let Some(path) = pending.pop() {
         // Reject symlinks even if named like a generated directory.
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
@@ -270,10 +287,6 @@ fn walk(root: &Path, dir: &Path, context: &mut Context, count: &mut usize, bytes
         }
         if GENERATED.iter().any(|name| path.file_name().is_some_and(|n| n == *name)) {
             continue;
-        }
-        *count += 1;
-        if *count > MAX_ENTRIES {
-            bail!("verification input exceeds {MAX_ENTRIES} entries");
         }
         field(context, path.strip_prefix(root)?.as_os_str().as_encoded_bytes());
         #[cfg(unix)]
@@ -283,7 +296,7 @@ fn walk(root: &Path, dir: &Path, context: &mut Context, count: &mut usize, bytes
         }
         if metadata.is_dir() {
             field(context, b"directory");
-            walk(root, &path, context, count, bytes)?;
+            pending.extend(entries(&path, count, limit)?);
         } else if metadata.is_file() {
             field(context, b"file");
             let mut file = fs::File::open(&path)?;
@@ -344,6 +357,30 @@ mod tests {
         assert_ne!(b, fingerprint(&w.0).unwrap());
         fs::remove_file(w.0.join("Cargo.lock")).unwrap();
         assert_eq!(b, fingerprint(&w.0).unwrap());
+    }
+
+    #[test]
+    fn completion_contract_enumeration_budget_is_global_and_fails_closed() {
+        let w = Workspace::new();
+        fs::create_dir(w.0.join("nested")).unwrap();
+        fs::write(w.0.join("nested/a"), "a").unwrap();
+        fs::write(w.0.join("nested/b"), "b").unwrap();
+        let mut count = 0;
+        let error = walk(&w.0, &mut Context::new(&SHA256), &mut count, &mut 0, 2).unwrap_err();
+        assert!(error.to_string().contains("exceeds 2 entries"));
+        assert_eq!(count, 2);
+        assert!(walk(&w.0, &mut Context::new(&SHA256), &mut 0, &mut 0, 3).is_ok());
+    }
+
+    #[test]
+    fn completion_contract_directory_capture_stops_at_budget() {
+        let w = Workspace::new();
+        for name in ["a", "b", "c"] {
+            fs::write(w.0.join(name), "").unwrap();
+        }
+        let mut count = 0;
+        assert!(entries(&w.0, &mut count, 2).is_err());
+        assert_eq!(count, 2);
     }
 
     #[test]
