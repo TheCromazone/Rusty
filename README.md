@@ -349,8 +349,10 @@ otherwise (at most 600). What the exit code means:
 PreToolUse hooks run before any permission prompt, so a call a hook blocks
 never asks you. Hooks run for every call, including workers' and side
 chats'. Notes for the model are redacted like any other tool output.
-Hooks are only read from your own config directory, never from the project:
-a cloned repository can't run commands on your machine just by being opened.
+Hooks are only read from `$HOME/.config/rusty/hooks.json`, never from the
+project, and `RUSTY_HOME` doesn't move them: a project's `.env` can set
+`RUSTY_HOME`, so honouring it would let a cloned repository run commands on
+your machine just by being opened.
 A `hooks.json` that doesn't parse gets one warning at startup and runs no hooks.
 
 ### Local or cloud tools: choose where commands land

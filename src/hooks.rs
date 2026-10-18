@@ -1,12 +1,16 @@
 //! User hooks: shell commands that run before and after tool calls.
 //!
-//! They come only from `~/.config/rusty/hooks.json`, never from the project,
-//! so opening a cloned repository can't run its commands on this machine.
+//! They come only from `$HOME/.config/rusty/hooks.json`, never from the
+//! project, so opening a cloned repository can't run its commands on this
+//! machine. `RUSTY_HOME` is ignored here: `rusty-cloud` loads the project's
+//! `.env` into the environment it hands a local rusty, so a repository could
+//! point `RUSTY_HOME` at hooks of its own. A `.env` never overrides a
+//! variable that is already set, and `HOME` always is.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::signal;
@@ -78,7 +82,7 @@ impl Hooks {
     /// The user's hooks. A file that can't be read or parsed is reported
     /// once and runs no hooks at all.
     pub fn user() -> Hooks {
-        let Some(path) = crate::config::config_dir().map(|d| d.join("hooks.json")) else {
+        let Some(path) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/rusty/hooks.json")) else {
             return Hooks::default();
         };
         Self::load(&path).unwrap_or_else(|e| {
