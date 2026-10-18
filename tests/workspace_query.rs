@@ -187,7 +187,7 @@ fn skipped_paths_and_partial_matches_keep_error_evidence() {
 
 /// Same-machine plumbing timing, not solve-rate evidence. Explicitly opt in.
 #[test]
-#[ignore]
+#[ignore = "opt-in same-machine timing benchmark; run with --ignored --nocapture"]
 fn benchmark_query_reference_and_legacy() {
     use std::time::Instant;
     let f = Fixture::new();
