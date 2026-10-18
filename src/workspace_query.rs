@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub const SKIP_DIRS: &[&str] =
     &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
 pub const OUTPUT_BYTES: usize = 28_000;
+pub const RENDER_BYTES: usize = 30_000;
 const DIAGNOSTIC_BYTES: usize = 2_000;
 const MATCHES_PER_FILE: usize = 30;
 const MAX_COLUMNS: usize = 300;
@@ -39,6 +40,10 @@ impl BoundedPipe {
     }
 
     fn read_available(&mut self, input: &mut impl Read) -> std::io::Result<()> {
+        self.read_observed(input, &mut |_| {})
+    }
+
+    fn read_observed(&mut self, input: &mut impl Read, observe: &mut impl FnMut(&[u8])) -> std::io::Result<()> {
         if self.eof {
             return Ok(());
         }
@@ -51,6 +56,7 @@ impl BoundedPipe {
                     break;
                 }
                 Ok(n) => {
+                    observe(&buffer[..n]);
                     let keep = n.min(self.limit.saturating_sub(self.bytes.len()));
                     self.bytes.extend_from_slice(&buffer[..keep]);
                     self.truncated |= keep < n;
@@ -167,6 +173,7 @@ fn collect_query_cancellable(
     child: Child,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
+    mut audit: Option<&mut RgAudit>,
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     use std::os::fd::AsRawFd;
     let mut child = QueryChild { child, group_cleaned: false, reaped: false };
@@ -185,7 +192,11 @@ fn collect_query_cancellable(
     let mut exited_at = None;
     let mut termination = "exited";
     loop {
-        output.read_available(&mut stdout)?;
+        output.read_observed(&mut stdout, &mut |bytes| {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.feed(bytes);
+            }
+        })?;
         diagnostics.read_available(&mut stderr)?;
         if status.is_none() {
             status = child.child.try_wait()?;
@@ -224,6 +235,7 @@ fn collect_query_cancellable(
     child: Child,
     _: Duration,
     _: &dyn Fn() -> bool,
+    _: Option<&mut RgAudit>,
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     drop(QueryChild { child, group_cleaned: false, reaped: false });
     anyhow::bail!("bounded workspace search requires Unix pipes")
@@ -231,13 +243,14 @@ fn collect_query_cancellable(
 
 #[cfg(test)]
 fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
-    collect_query_cancellable(child, timeout, &|| false)
+    collect_query_cancellable(child, timeout, &|| false, None)
 }
 
 #[derive(Debug)]
 pub struct SearchResult {
     pub engine: &'static str,
     pub scan_complete: bool,
+    pub audit_complete: bool,
     pub match_limit_possible: bool,
     pub column_limit_possible: bool,
     pub output: Capture,
@@ -248,28 +261,56 @@ pub struct SearchResult {
 
 impl SearchResult {
     pub fn render(&self) -> String {
-        let mut out = format!(
+        let header = format!(
             "[query engine={} scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true exit={:?} termination={}]\n",
             self.engine, self.scan_complete, self.output.truncated, self.exit_code, self.termination
         );
-        if self.engine == "rg" {
-            let _ = writeln!(out, "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]", self.match_limit_possible, self.column_limit_possible);
+        let scope = if self.engine == "rg" {
+            format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible)
         } else {
-            out.push_str("[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n");
-        }
-        if self.output.text.trim().is_empty() {
-            out.push_str(if self.scan_complete { "no matches" } else { "no matches observed; search incomplete" });
+            "[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n".into()
+        };
+        let body = if self.output.text.trim().is_empty() {
+            if self.scan_complete {
+                "no matches"
+            } else {
+                "no matches observed; search incomplete"
+            }
         } else {
-            out.push_str(&self.output.text);
-        }
+            &self.output.text
+        };
+        let mut diagnostics = String::new();
         if !self.diagnostics.text.is_empty() {
-            let _ = write!(out, "\n[diagnostics; skipped paths/errors]\n{}", self.diagnostics.text);
+            let _ = write!(diagnostics, "\n[diagnostics; skipped paths/errors]\n{}", self.diagnostics.text);
         }
         if self.diagnostics.truncated {
-            out.push_str("\n[additional diagnostics omitted]");
+            diagnostics.push_str("\n[additional diagnostics omitted]");
         }
-        out
+        render_bounded(header, &scope, body, &diagnostics)
     }
+}
+
+fn prefix(text: &str, limit: usize) -> &str {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Cap the entire response while retaining completeness flags and diagnostics.
+fn render_bounded(mut header: String, scope: &str, body: &str, diagnostics: &str) -> String {
+    let clipped_diagnostics = diagnostics.len() > DIAGNOSTIC_BYTES;
+    let diagnostics = if clipped_diagnostics {
+        format!("{}\n[additional diagnostics omitted]", prefix(diagnostics, DIAGNOSTIC_BYTES))
+    } else {
+        diagnostics.to_owned()
+    };
+    if header.len() + scope.len() + body.len() + diagnostics.len() > RENDER_BYTES || clipped_diagnostics {
+        header = header.replacen("output_truncated=false", "output_truncated=true", 1);
+    }
+    let budget = RENDER_BYTES.saturating_sub(header.len() + scope.len() + diagnostics.len());
+    format!("{header}{scope}{}{diagnostics}", prefix(body, budget))
 }
 
 /// Spawn rg directly each time: cached executable availability could outlive a PATH change.
@@ -301,6 +342,7 @@ fn search_with(
         return Ok(SearchResult {
             engine: "rg",
             scan_complete: false,
+            audit_complete: false,
             match_limit_possible: false,
             column_limit_possible: false,
             output: BoundedPipe::new(0).finish(),
@@ -349,17 +391,29 @@ fn search_with(
         }
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
-    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(child, QUERY_TIMEOUT, cancelled)?;
-    let (output, match_limit_possible, column_limit_possible) =
-        if engine == "rg" { present_rg(output) } else { (output, false, false) };
+    let mut audit = RgAudit::new();
+    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(
+        child,
+        QUERY_TIMEOUT,
+        cancelled,
+        if engine == "rg" { Some(&mut audit) } else { None },
+    )?;
+    audit.complete &= audit.pending.is_empty();
+    let audit_complete = engine == "rg" && audit.complete;
+    let match_limit_possible = audit.match_limit_possible;
+    let column_limit_possible = audit.column_limit_possible;
+    let mut output = if engine == "rg" { present_rg(output) } else { output };
+    output.truncated |= match_limit_possible || column_limit_possible;
     let scan_complete = engine == "rg"
         && termination == "exited"
         && matches!(exit_code, Some(0 | 1))
         && diagnostics.text.is_empty()
+        && audit_complete
         && !match_limit_possible;
     Ok(SearchResult {
         engine,
         scan_complete,
+        audit_complete,
         match_limit_possible,
         column_limit_possible,
         output,
@@ -369,50 +423,113 @@ fn search_with(
     })
 }
 
-/// Sort only the captured prefix. NUL-delimited paths keep colons/newlines in
-/// filenames from corrupting per-file counts. The engine remains free to scan
-/// in parallel, so an overflowing prefix is deliberately not a stable subset.
-fn present_rg(raw: Capture) -> (Capture, bool, bool) {
+/// Audit every drained frame independently of the retained display prefix.
+/// Both an unfinished frame and retained per-file keys have a fixed byte budget.
+struct RgAudit {
+    pending: Vec<u8>,
+    path_end: Option<usize>,
+    dropping: bool,
+    counts: std::collections::BTreeMap<Vec<u8>, usize>,
+    key_bytes: usize,
+    complete: bool,
+    match_limit_possible: bool,
+    column_limit_possible: bool,
+}
+impl RgAudit {
+    fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(OUTPUT_BYTES),
+            path_end: None,
+            dropping: false,
+            counts: std::collections::BTreeMap::new(),
+            key_bytes: 0,
+            complete: true,
+            match_limit_possible: false,
+            column_limit_possible: false,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.pending.len() < OUTPUT_BYTES && !self.dropping {
+                self.pending.push(byte);
+            } else {
+                self.dropping = true;
+                self.complete = false;
+            }
+            if self.path_end.is_none() && byte == 0 {
+                self.path_end = Some(self.pending.len());
+            } else if self.path_end.is_some() && byte == b'\n' {
+                if !self.dropping {
+                    if let Some((path, _, matching, content)) = rg_frame(&self.pending[..self.pending.len() - 1]) {
+                        self.column_limit_possible |= content.starts_with(b"[Omitted ");
+                        if matching {
+                            if let Some(count) = self.counts.get_mut(path) {
+                                *count = (*count + 1).min(MATCHES_PER_FILE);
+                                self.match_limit_possible |= *count >= MATCHES_PER_FILE;
+                            } else if self.counts.len() < ENTRY_LIMIT && self.key_bytes + path.len() <= OUTPUT_BYTES {
+                                self.key_bytes += path.len();
+                                self.counts.insert(path.to_vec(), 1);
+                            } else {
+                                self.complete = false;
+                            }
+                        }
+                    } else {
+                        self.complete = false;
+                    }
+                }
+                self.pending.clear();
+                self.path_end = None;
+                self.dropping = false;
+            }
+        }
+    }
+}
+
+fn rg_frame(frame: &[u8]) -> Option<(&[u8], u64, bool, &[u8])> {
+    let nul = frame.iter().position(|&byte| byte == 0)?;
+    if nul == 0 {
+        return None;
+    }
+    let line = &frame[nul + 1..];
+    let sep = line.iter().position(|&byte| byte == b':' || byte == b'-')?;
+    let number = std::str::from_utf8(&line[..sep]).ok()?.parse().ok()?;
+    if number == 0 {
+        return None;
+    }
+    Some((&frame[..nul], number, line[sep] == b':', &line[sep + 1..]))
+}
+
+/// Sort only complete retained records, recovering after malformed line numbers.
+/// Full-stream audit, rather than display truncation, decides scan completeness.
+fn present_rg(raw: Capture) -> Capture {
     let mut records = Vec::new();
-    let mut counts = std::collections::BTreeMap::new();
-    let mut match_limit_possible = raw.truncated;
-    let mut column_limit_possible = false;
+    let mut truncated = raw.truncated;
     let mut rest = raw.text.as_str();
     while !rest.is_empty() {
         let Some((path, body)) = rest.split_once('\0') else {
-            match_limit_possible = true;
+            truncated = true;
             break;
         };
         let Some((line, tail)) = body.split_once('\n') else {
-            match_limit_possible = true;
+            truncated = true;
             break;
         };
-        let Some(separator) = line.find([':', '-']) else {
-            match_limit_possible = true;
-            break;
-        };
-        let Ok(number) = line[..separator].parse::<u64>() else {
-            match_limit_possible = true;
-            break;
-        };
-        let matching = line.as_bytes()[separator] == b':';
-        if matching {
-            let count = counts.entry(path).or_insert(0usize);
-            *count += 1;
-            match_limit_possible |= *count >= MATCHES_PER_FILE;
-        }
-        // A literal marker in source can conservatively trigger this too.
-        column_limit_possible |= line[separator + 1..].starts_with("[Omitted ");
-        records.push((path, number, matching, line));
+        let frame_len = path.len() + 1 + line.len();
+        let parsed = rg_frame(&rest.as_bytes()[..frame_len]);
         rest = tail;
+        if let Some((_, number, matching, _)) = parsed {
+            records.push((path, number, matching, line));
+        } else {
+            truncated = true;
+        }
     }
     records.sort_unstable_by_key(|&(path, number, matching, line)| (path, number, matching, line));
     let mut text = String::with_capacity(raw.text.len());
     for (path, _, matching, line) in records {
         let _ = writeln!(text, "{path}{}{line}", if matching { ':' } else { '-' });
     }
-    let truncated = raw.truncated || match_limit_possible || column_limit_possible;
-    (Capture { text, truncated }, match_limit_possible, column_limit_possible)
+    Capture { text, truncated }
 }
 
 #[derive(Default, Debug)]
@@ -434,19 +551,31 @@ impl Enumeration {
     }
 
     pub fn render(&self, body: &str, output_truncated: bool) -> String {
-        let mut out = format!(
-            "[query scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true skipped={}]\n\
-             [scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n{}",
-            !self.incomplete, output_truncated, self.skipped, body
+        if !self.incomplete
+            && self.diagnostics.is_empty()
+            && self.skipped == 0
+            && !output_truncated
+            && body.len() <= RENDER_BYTES
+        {
+            return body.to_owned();
+        }
+        let header = format!(
+            "[query scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true skipped={}]\n",
+            !self.incomplete, output_truncated, self.skipped
         );
+        let scope = "[scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n";
+        let mut diagnostics = String::new();
         for diagnostic in &self.diagnostics {
-            let _ = write!(out, "\n[skipped] {diagnostic}");
+            let _ = write!(diagnostics, "\n[skipped] {diagnostic}");
         }
         if self.skipped > self.diagnostics.len() {
-            let _ =
-                write!(out, "\n[{} additional skipped paths/subtrees omitted]", self.skipped - self.diagnostics.len());
+            let _ = write!(
+                diagnostics,
+                "\n[{} additional skipped paths/subtrees omitted]",
+                self.skipped - self.diagnostics.len()
+            );
         }
-        out
+        render_bounded(header, scope, body, &diagnostics)
     }
 }
 
@@ -529,6 +658,7 @@ mod tests {
         let result = SearchResult {
             engine: "rg",
             scan_complete: true,
+            audit_complete: true,
             match_limit_possible: false,
             column_limit_possible: false,
             output,
@@ -546,11 +676,85 @@ mod tests {
             text: "z:part\nname\0".to_owned() + "10:needle\n" + "a.rs\0" + "11-context\n" + "a.rs\0" + "2:needle\n",
             truncated: false,
         };
-        let (shown, matches, columns) = present_rg(raw);
+        let mut audit = RgAudit::new();
+        audit.feed(raw.text.as_bytes());
+        let shown = present_rg(raw);
         assert_eq!(shown.text, "a.rs:2:needle\na.rs-11-context\nz:part\nname:10:needle\n");
-        assert!(!shown.truncated && !matches && !columns);
-        let (partial, limited, _) = present_rg(Capture { text: "partial-path".into(), truncated: false });
-        assert!(partial.truncated && limited && partial.text.is_empty());
+        assert!(!shown.truncated && audit.complete && !audit.match_limit_possible && !audit.column_limit_possible);
+        let partial = present_rg(Capture { text: "partial-path".into(), truncated: false });
+        assert!(partial.truncated && partial.text.is_empty());
+    }
+
+    #[test]
+    fn full_stream_audit_is_independent_of_display_truncation() {
+        let mut bytes = Vec::new();
+        for file in 0..100 {
+            for line in 1..=20 {
+                bytes.extend_from_slice(format!("file{file}\0{line}:needle\n").as_bytes());
+            }
+        }
+        let mut audit = RgAudit::new();
+        let mut retained = BoundedPipe::new(40);
+        let mut input = Cursor::new(&bytes);
+        while !retained.eof {
+            retained.read_observed(&mut input, &mut |bytes| audit.feed(bytes)).unwrap();
+        }
+        let shown = present_rg(retained.finish());
+        assert!(shown.truncated && audit.complete && audit.pending.is_empty());
+        assert!(!audit.match_limit_possible && !audit.column_limit_possible);
+        // A file cap after the display prefix must still be observed.
+        for line in 1..=MATCHES_PER_FILE {
+            audit.feed(format!("later\0{line}:needle\n").as_bytes());
+        }
+        assert!(audit.match_limit_possible);
+        assert!(audit.pending.capacity() <= OUTPUT_BYTES && audit.key_bytes <= OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn malformed_frames_preserve_later_records_and_make_audit_incomplete() {
+        let raw = "bad.rs\0not-a-number:bad\ngood.rs\0".to_owned() + "2:needle\n";
+        let mut audit = RgAudit::new();
+        for bytes in raw.as_bytes().chunks(3) {
+            audit.feed(bytes);
+        }
+        let shown = present_rg(Capture { text: raw, truncated: false });
+        assert_eq!(shown.text, "good.rs:2:needle\n");
+        assert!(shown.truncated && !audit.complete && !audit.match_limit_possible);
+        // Oversized frames/too many path bytes are an audit limit, never a match cap.
+        let mut bounded = RgAudit::new();
+        bounded.feed(format!("{}\0x:bad\nnext\0", "p".repeat(OUTPUT_BYTES + 1)).as_bytes());
+        bounded.feed(b"1:needle\n");
+        assert!(!bounded.complete && !bounded.match_limit_possible && bounded.pending.is_empty());
+        assert!(bounded.pending.capacity() <= OUTPUT_BYTES);
+        for file in 0..1000 {
+            bounded.feed(format!("{file:04}{}\0", "p".repeat(100)).as_bytes());
+            bounded.feed(b"1:needle\n");
+        }
+        assert!(bounded.key_bytes <= OUTPUT_BYTES && !bounded.complete && !bounded.match_limit_possible);
+    }
+
+    #[test]
+    fn rendered_bound_retains_completeness_flags_and_diagnostics() {
+        let result = SearchResult {
+            engine: "rg",
+            scan_complete: false,
+            audit_complete: true,
+            match_limit_possible: false,
+            column_limit_possible: false,
+            output: Capture { text: "é".repeat(OUTPUT_BYTES / 2), truncated: false },
+            diagnostics: Capture { text: "error".repeat(DIAGNOSTIC_BYTES), truncated: false },
+            exit_code: Some(2),
+            termination: "exited",
+        };
+        let shown = result.render();
+        assert!(shown.len() <= RENDER_BYTES && shown.is_char_boundary(shown.len()));
+        assert!(shown.starts_with("[query engine=rg scan_complete=false output_truncated=true"));
+        assert!(shown.contains("[diagnostics;") && shown.contains("[additional diagnostics omitted]"));
+        assert_eq!(Enumeration::default().render("small result", false), "small result");
+        let mut scan = Enumeration::default();
+        scan.skip(Path::new(&"p".repeat(OUTPUT_BYTES)), "unreadable");
+        let shown = scan.render(&"x".repeat(OUTPUT_BYTES), false);
+        assert!(shown.len() <= RENDER_BYTES && shown.contains("scan_complete=false output_truncated=true"));
     }
 
     #[test]
@@ -604,6 +808,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         let result = SearchResult {
             engine: "rg",
             scan_complete: false,
+            audit_complete: false,
             match_limit_possible: false,
             column_limit_possible: false,
             output: Capture { text: "good.rs:1:needle".into(), truncated: false },
@@ -619,7 +824,8 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
 
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
-        let result = search_with("/rusty/nonexistent-rg", "pub fn search", file!(), None, 0, &|| false).unwrap();
+        let result =
+            search_with("/rusty/nonexistent-rg", "pub fn search", file!(), None, 0, &|| false).unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
         assert!(!result.output.text.is_empty());
@@ -646,6 +852,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         let result = SearchResult {
             engine: "rg",
             scan_complete: false,
+            audit_complete: false,
             match_limit_possible: false,
             column_limit_possible: false,
             output: out,
@@ -668,9 +875,12 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         let child = spawn_query(&mut cmd).unwrap();
         let pid = child.id();
         let started = Instant::now();
-        let (_, _, _, reason) = collect_query_cancellable(child, Duration::from_secs(5), &|| {
-            started.elapsed() >= Duration::from_millis(50)
-        })
+        let (_, _, _, reason) = collect_query_cancellable(
+            child,
+            Duration::from_secs(5),
+            &|| started.elapsed() >= Duration::from_millis(50),
+            None,
+        )
         .unwrap();
         assert_eq!(reason, "cancelled");
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -720,7 +930,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
                 std::thread::sleep(Duration::from_millis(1));
             }
             let timeout = if cancel { Duration::from_secs(5) } else { Duration::ZERO };
-            let (out, _, status, reason) = collect_query_cancellable(child, timeout, &|| cancel).unwrap();
+            let (out, _, status, reason) = collect_query_cancellable(child, timeout, &|| cancel, None).unwrap();
             assert_eq!(status, Some(0));
             assert_eq!(out.text, "done");
             assert_eq!(reason, if cancel { "cancelled" } else { "deadline" });

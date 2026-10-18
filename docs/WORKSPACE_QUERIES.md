@@ -6,7 +6,8 @@ content cache, or result cache. Local tools use it directly; the existing tool
 bridge executes the same tools beside the remote files. Client files never
 answer a remote query.
 
-Every search, glob, listing, and outline reports two independent facts:
+Searches and partial or truncated enumerations report two independent facts.
+Small, complete listings, globs and outlines retain their plain result body:
 
 - `scan_complete`: whether the requested scope was examined without known
   errors or enumeration/read limits. This does not certify an atomic snapshot.
@@ -39,8 +40,13 @@ matching lines in any observed file conservatively sets `match_limit_possible`,
 contain exactly thirty matches. Column omission markers set
 `column_limit_possible` and `output_truncated=true`; column clipping alone does
 not make the scan incomplete. A literal omission marker can conservatively
-trigger this flag too. If the bounded capture overflows or ends mid-record,
-cap accounting is incomplete, so scan completeness is not claimed. Empty
+trigger this flag too. An independent streaming audit examines every drained
+record, including records beyond the retained display prefix. Its pending frame
+and retained per-file path keys each have a 28,000-byte budget, with at most
+20,000 path entries. Malformed frames or exhausted audit budgets set
+`audit_complete=false` and prevent a complete-scan claim, without inventing an
+observed match cap. Display clipping alone leaves scan completeness unchanged.
+Later well-framed records survive a malformed numeric line. Empty
 complete results still require an error-free, uncapped no-match observation.
 
 The first 28,000 raw output bytes are retained while both pipes are drained;
@@ -50,7 +56,10 @@ conversion can temporarily expand invalid raw bytes up to threefold. The retaine
 rendered prefixes are capped again at the same byte limits on a UTF-8 boundary,
 excess String capacity is released, and any additional omission sets
 `output_truncated` or the diagnostic marker. This bounds retained query output,
-not process RSS or the allocator's freed-page retention.
+not process RSS or the allocator's freed-page retention. The entire rendered
+response also has a 30,000-byte cap, preserving its completeness header and
+bounded diagnostics and setting `output_truncated=true` when clipped. Outlines
+retain at most 160 bytes from each definition signature.
 
 Only failure to find the ripgrep executable selects grep. The legacy grep
 fallback uses case-insensitive extended regex and build-directory exclusions;

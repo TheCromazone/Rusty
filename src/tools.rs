@@ -14,7 +14,7 @@ use crate::ui::{self, truncate};
 
 use rusty::workspace_query::{self, SKIP_DIRS};
 
-const MAX_OUTPUT: usize = 30_000;
+const MAX_OUTPUT: usize = workspace_query::RENDER_BYTES;
 
 /// The built-in tool schemas. They never change, so they are built once.
 pub fn definitions() -> &'static Value {

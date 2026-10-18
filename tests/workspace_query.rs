@@ -51,7 +51,10 @@ impl Fixture {
         }
         assert_eq!(
             result.scan_complete,
-            matches!(raw.status.code(), Some(0 | 1)) && raw.stderr.is_empty() && !result.match_limit_possible
+            matches!(raw.status.code(), Some(0 | 1))
+                && raw.stderr.is_empty()
+                && result.audit_complete
+                && !result.match_limit_possible
         );
         result
     }
@@ -203,7 +206,7 @@ fn bounded_parallel_output_is_sorted_without_claiming_a_stable_subset() {
         f.put(&format!("src/{i:03}.txt"), &"needle\n".repeat(20));
     }
     let result = f.query("needle", None, 0);
-    assert!(result.output.truncated && result.match_limit_possible && !result.scan_complete);
+    assert!(result.output.truncated && !result.match_limit_possible && result.audit_complete && result.scan_complete);
     assert!(result.output.text.len() <= rusty::workspace_query::OUTPUT_BYTES);
     let mut previous = None;
     for line in result.output.text.lines() {
