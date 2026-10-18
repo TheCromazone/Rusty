@@ -351,6 +351,13 @@ outcome, elapsed check time, and bounded redacted output with a digest of that
 captured output. The enclosing goal supplies the objective. Missing manifests
 or failed reads do not create passing records.
 
+Shell output readers are owned and joined. After process-group cleanup they have
+a bounded drain interval; an escaped descendant holding a pipe cannot keep the
+check alive indefinitely. If capture does not reach EOF, the receipt retains an
+`output capture incomplete` diagnostic and has no successful exit observation,
+even when the launcher exited zero. Escaped process groups are outside process
+containment; closing their inherited readers is not a claim that they were killed.
+
 The input digest covers the canonical workspace identity, inherited environment,
 file contents, paths, and Unix permission modes. Environment values and file
 contents are hashed rather than exported. It includes untracked files and

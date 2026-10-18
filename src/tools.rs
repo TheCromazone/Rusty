@@ -448,8 +448,8 @@ fn run_owned(
     // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
     let so = child.0.stdout.take().unwrap();
     let se = child.0.stderr.take().unwrap();
-    let t_out = std::thread::spawn(move || drain(so));
-    let t_err = std::thread::spawn(move || drain(se));
+    let t_out = ShellReader::new(so)?;
+    let t_err = ShellReader::new(se)?;
 
     let start = Instant::now();
     let status = loop {
@@ -469,9 +469,90 @@ fn run_owned(
     // Kill descendants even when the shell exited first, before joining pipe
     // readers. A background child must not keep verification alive forever.
     drop(child);
-    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
-    Ok((status, stdout, stderr))
+    let (out, out_complete) = t_out.finish();
+    let (err, err_complete) = t_err.finish();
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    let mut stderr = String::from_utf8_lossy(&err).to_string();
+    let complete = out_complete && err_complete;
+    if !complete {
+        stderr.push_str("\n[output capture incomplete: inherited pipe remained open; readers stopped]\n");
+    }
+    // An exited launcher alone cannot establish successful verification.
+    Ok((if complete { status } else { None }, stdout, stderr))
+}
+
+// Reader ownership is independent of descendant process-group containment.
+// A setsid descendant can retain a pipe; it must not retain our thread or FD.
+struct ShellReader {
+    eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+impl ShellReader {
+    fn new<T: Read + std::os::fd::AsRawFd + Send + 'static>(pipe: T) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        struct Cancellable<T> {
+            eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            pipe: T,
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl<T: Read + AsRawFd> Read for Cancellable<T> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                loop {
+                    if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "shell reader stopped"));
+                    }
+                    match self.pipe.read(bytes) {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            let mut fd = libc::pollfd { fd: self.pipe.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                            let rc = unsafe { libc::poll(&mut fd, 1, 25) };
+                            if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        Ok(0) => {
+                            self.eof.store(true, std::sync::atomic::Ordering::Release);
+                            return Ok(0);
+                        }
+                        result => return result,
+                    }
+                }
+            }
+        }
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("setting shell output nonblocking");
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input = Cancellable { pipe, stop: stop.clone(), eof: eof.clone() };
+        let thread = Some(std::thread::spawn(move || drain(input)));
+        Ok(Self { stop, thread, eof })
+    }
+
+    fn finish(mut self) -> (Vec<u8>, bool) {
+        let until = Instant::now() + Duration::from_millis(100);
+        let thread = self.thread.as_ref().unwrap();
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let complete = thread.is_finished() && self.eof.load(std::sync::atomic::Ordering::Acquire);
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        match self.thread.take().unwrap().join() {
+            Ok(output) => (output, complete),
+            Err(_) => (Vec::new(), false),
+        }
+    }
+}
+impl Drop for ShellReader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct OwnedShell(std::process::Child);
@@ -743,6 +824,75 @@ mod tests {
             let (status, _, _) = run(command, Duration::from_millis(100)).unwrap();
             assert_eq!(status, expected);
             assert!(started.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[test]
+    fn completion_contract_shell_releases_readers_held_by_escaped_processes() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(pid) = fs::read_to_string(self.0.join("pid")).unwrap_or_default().parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        for mode in ["exit", "timeout", "cancel"] {
+            let fixture =
+                Fixture(std::env::temp_dir().join(format!("rusty-shell-escaped-{}-{mode}", std::process::id())));
+            fs::create_dir_all(&fixture.0).unwrap();
+            let pidfile = fixture.0.join("pid");
+            let script = fixture.0.join("holder.py");
+            fs::write(
+                &script,
+                r#"import os,sys,time
+r,w=os.pipe()
+if os.fork()==0:
+    os.close(r)
+    os.setsid()
+    with open(sys.argv[1],'w') as f: f.write(str(os.getpid()))
+    os.write(w,b'x')
+    os.close(w)
+    time.sleep(30)
+    os._exit(0)
+os.close(w)
+os.read(r,1)
+print('ready',flush=True)
+if sys.argv[2]!='exit': time.sleep(30)
+os._exit(0)
+"#,
+            )
+            .unwrap();
+            let command = format!("python3 '{}' '{}' {mode}", script.display(), pidfile.display());
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            let ready = pidfile.clone();
+            let notifier = std::thread::spawn(move || {
+                if mode == "cancel" {
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while !ready.exists() && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            let started = Instant::now();
+            let timeout = if mode == "timeout" { Duration::from_secs(2) } else { Duration::from_secs(10) };
+            let (status, _, stderr) = run_cancellable(&command, timeout, &cancel).unwrap();
+            notifier.join().unwrap();
+            assert!(started.elapsed() < Duration::from_secs(8), "{mode} retained a reader");
+            assert_eq!(status, None, "incomplete capture cannot establish success");
+            assert!(stderr.contains("output capture incomplete"), "{mode}: {stderr}");
+            let pid = fs::read_to_string(&pidfile).unwrap().parse::<i32>().unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "escaped process should still hold pipes during the assertion"
+            );
         }
     }
 
