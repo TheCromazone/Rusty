@@ -263,7 +263,7 @@ impl Server {
     fn spawn(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
         let mut child = Command::new(command)
             .args(&cfg.args)
-            .envs(&cfg.env)
+            .envs(expand_env(&cfg.env)?)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -503,6 +503,27 @@ fn verb_class(tool: &str) -> Class {
     Class::Risky(format!("MCP tool {tool} may change something"))
 }
 
+/// `"NAME": "${VAR}"` takes VAR from rusty's own environment, so a shared
+/// `.mcp.json` can name a credential without containing it. Other values are
+/// passed as written.
+fn expand_env(env: &BTreeMap<String, String>) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(env.len());
+    for (key, value) in env {
+        let reference = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')).filter(|v| env_name(v));
+        let value = match reference {
+            Some(var) => std::env::var(var).map_err(|_| anyhow!("environment variable {var} for {key} is not set"))?,
+            None => value.clone(),
+        };
+        out.push((key.clone(), value));
+    }
+    Ok(out)
+}
+
+fn env_name(s: &str) -> bool {
+    s.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 /// Manage the existing MCP manifest without starting anything on add/list.
 /// Preserve unknown fields and existing env values; never echo credentials.
 pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) -> Result<String> {
@@ -512,7 +533,7 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
     let path = if path.is_absolute() { path } else { cwd.join(path) };
     let action = args.first().map(String::as_str).unwrap_or("list");
     if action == "help" {
-        return Ok("MCP: /integrations mcp list | add NAME COMMAND [ARGS...] | remove NAME | check. Add saves a required stdio server; it starts only on check or the next session. Use the CLI form for arguments containing spaces. Existing .mcp.json / RUSTY_MCP_CONFIG remains the source of truth. Configure authentication in the server's own native flow or environment; do not put tokens in command arguments. Direct HTTP transport is not supported; an explicitly configured stdio bridge can supply it.".into());
+        return Ok("MCP: /integrations mcp list | add NAME [--env VAR]... [--] COMMAND [ARGS...] | remove NAME | check. Add saves an optional stdio server; it starts only on check or the next session. --env VAR saves a reference to VAR, read from the environment when the server starts, never its value. Arguments that look like secrets are refused. Use the CLI form, rusty --integrations mcp add NAME -- [--env VAR]... COMMAND [ARGS...], for arguments containing spaces. Existing .mcp.json / RUSTY_MCP_CONFIG remains the source of truth. Direct HTTP transport is not supported; an explicitly configured stdio bridge can supply it.".into());
     }
     if action == "check" {
         anyhow::ensure!(args.len() == 1, "usage: /integrations mcp check");
@@ -575,27 +596,51 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
     );
     match action {
         "add" => {
-            anyhow::ensure!(args.len() >= 3, "usage: /integrations mcp add NAME COMMAND [ARGS...]");
+            let usage = "usage: /integrations mcp add NAME [--env VAR]... [--] COMMAND [ARGS...]";
             anyhow::ensure!(
                 !servers.contains_key(name),
                 "MCP server already exists; remove it explicitly before replacing it"
             );
-            let start = if args.get(2).is_some_and(|a| a == "--") { 3 } else { 2 };
-            let command = args.get(start).context("MCP server command required")?;
+            let mut at = if args.get(2).is_some_and(|a| a == "--") { 3 } else { 2 };
+            let mut env = serde_json::Map::new();
+            while args.get(at).is_some_and(|a| a == "--env") {
+                let var = args.get(at + 1).context(usage)?;
+                anyhow::ensure!(env_name(var), "--env takes an environment variable name such as GITHUB_TOKEN");
+                env.insert(var.clone(), Value::String(format!("${{{var}}}")));
+                at += 2;
+            }
+            if args.get(at).is_some_and(|a| a == "--") {
+                at += 1;
+            }
+            let command = args.get(at).context(usage)?;
             anyhow::ensure!(!command.trim().is_empty(), "MCP server command required");
-            servers.insert(name.clone(), serde_json::json!({"command":command,"args":args[start+1..],"required":true}));
+            // .mcp.json is often committed, and arguments also land in shell
+            // history and process listings.
+            anyhow::ensure!(
+                rusty::privacy::redact(&args[at..].join(" ")).1 == 0,
+                "an argument looks like a secret; MCP configuration is often committed, so pass it with --env VAR instead"
+            );
+            // Optional until it has been seen to start: a required server that
+            // can't start stops every later session, including teammates'.
+            let mut entry = serde_json::json!({"command": command, "args": &args[at + 1..], "required": false});
+            if !env.is_empty() {
+                entry["env"] = Value::Object(env);
+            }
+            servers.insert(name.clone(), entry);
         }
         _ => {
             anyhow::ensure!(args.len() == 2, "usage: /integrations mcp remove NAME");
             anyhow::ensure!(servers.remove(name).is_some(), "MCP server not configured");
         }
     }
-    if path.exists() {
-        anyhow::ensure!(
-            std::fs::symlink_metadata(&path)?.file_type().is_file(),
-            "MCP config must be a regular file, not a symlink"
-        );
-    }
+    // A shared project file keeps the mode it already has.
+    let existing = if path.exists() {
+        let meta = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(meta.file_type().is_file(), "MCP config must be a regular file, not a symlink");
+        Some(meta.permissions())
+    } else {
+        None
+    };
     let parent = path.parent().context("MCP config directory missing")?;
     std::fs::create_dir_all(parent)?;
     let pending = path.with_extension("json.pending");
@@ -604,9 +649,20 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
     // server's secret value into a nonfunctional placeholder.
     serde_json::to_writer_pretty(&mut file, &value)?;
     file.write_all(b"\n")?;
+    if let Some(permissions) = existing {
+        file.set_permissions(permissions)?;
+    }
     file.sync_all()?;
     std::fs::rename(&pending, &path)?;
-    Ok(format!("MCP server {name} {action} saved; existing sessions keep their current connections"))
+    let note = if action == "add" {
+        format!(
+            ". It is optional; once `/integrations mcp check` passes, set \"required\": true on it in {} to stop sessions starting without it",
+            path.display()
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!("MCP server {name} {action} saved; existing sessions keep their current connections{note}"))
 }
 
 #[cfg(test)]
@@ -693,5 +749,52 @@ mod tests {
         assert!(matches!(tool_class("deploy", &json!({"readOnlyHint": true})), Class::Risky(_)));
         assert!(matches!(tool_class("drop", &json!({"destructiveHint": false})), Class::Destructive(_)));
         assert_eq!(tool_class("get", &json!({})), Class::ReadOnly);
+    }
+
+    #[test]
+    fn env_references_come_from_the_environment_and_literals_pass_through() {
+        let env = BTreeMap::from([("A".to_string(), "${PATH}".to_string()), ("B".to_string(), "plain".to_string())]);
+        let expanded = expand_env(&env).unwrap();
+        assert_eq!(
+            expanded,
+            vec![("A".to_string(), std::env::var("PATH").unwrap()), ("B".to_string(), "plain".to_string())]
+        );
+        let missing = BTreeMap::from([("T".to_string(), "${RUSTY_TEST_UNSET_VARIABLE}".to_string())]);
+        let err = expand_env(&missing).unwrap_err().to_string();
+        assert!(err.contains("RUSTY_TEST_UNSET_VARIABLE"), "{err}");
+    }
+
+    #[test]
+    fn mcp_add_saves_optional_servers_with_env_references_and_refuses_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rusty-mcp-manage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+        std::fs::write(&path, "{\"mcpServers\":{}}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let policy = crate::permissions::Policy::new(crate::permissions::Mode::Yolo);
+        let run = |args: &[&str]| manage(&dir, &policy, &args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        let out = run(&["add", "gh", "--env", "GITHUB_TOKEN", "--", "github-mcp", "stdio"]).unwrap();
+        assert!(out.contains("\"required\": true"), "{out}");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["mcpServers"]["gh"],
+            json!({"command": "github-mcp", "args": ["stdio"], "required": false, "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}})
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        for args in [
+            vec!["add", "leak", "server", "--token=abcdefghijklmnop"],
+            vec!["add", "leak", "server", "--password", "hunter2hunter2"],
+            vec!["add", "leak", "server", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"],
+            vec!["add", "leak", "--env", "NOT-A-NAME", "server"],
+            vec!["add", "leak", "--env"],
+        ] {
+            assert!(run(&args[..]).is_err(), "{args:?}");
+        }
+        let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, saved);
+        assert!(!dir.join(".mcp.json.pending").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

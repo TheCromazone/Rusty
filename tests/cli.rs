@@ -5583,7 +5583,8 @@ fn unified_mcp_setup_preserves_other_servers_and_never_launches_on_add_or_list()
     assert_eq!(cfg["mcpServers"]["existing"]["env"]["TOKEN"], "keep-this-secret");
     assert_eq!(cfg["custom"]["preserve"], true);
     assert_eq!(cfg["mcpServers"]["new"]["args"][0], "path with spaces");
-    assert_eq!(cfg["mcpServers"]["new"]["required"], true);
+    assert_eq!(cfg["mcpServers"]["new"]["required"], false);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"required\": true"));
     let out = s.cmd().args(["--integrations", "mcp", "list"]).output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
@@ -5599,6 +5600,24 @@ fn unified_mcp_setup_preserves_other_servers_and_never_launches_on_add_or_list()
     assert_eq!(std::fs::read(&path).unwrap(), unchanged);
     let out = s.cmd().args(["--integrations", "mcp", "remove", "new"]).output().unwrap();
     assert!(out.status.success());
+    let out = s
+        .cmd()
+        .args(["--integrations", "mcp", "add", "gh", "--", "--env", "GH_TOKEN", "gh-server", "--verbose"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["gh"],
+        serde_json::json!({"command":"gh-server","args":["--verbose"],"required":false,"env":{"GH_TOKEN":"${GH_TOKEN}"}})
+    );
+    let out = s
+        .cmd()
+        .args(["--integrations", "mcp", "add", "leak", "--", "gh-server", "--token=abcdefghijklmnop"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("abcdefghijklmnop"));
 }
 
 #[test]

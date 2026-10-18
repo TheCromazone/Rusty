@@ -77,15 +77,23 @@ References: [GitHub auth](https://cli.github.com/manual/gh_auth_login),
 rusty --integrations setup mcp
 rusty --integrations mcp list
 rusty --integrations mcp add my-server -- /path/to/server 'argument with spaces'
+rusty --integrations mcp add github -- --env GITHUB_TOKEN github-mcp-server stdio
 rusty --integrations mcp check
 rusty --integrations mcp remove my-server
 ```
 
 The same commands work under `/integrations`. The existing `.mcp.json` (or
 `RUSTY_MCP_CONFIG`) remains the only MCP manifest. Add/list never execute a
-server; add marks it required and check explicitly starts it. Configuration
-changes serialize concurrent writers across profiles without leaving a repository lock file, obey write permissions, preserve other server entries and environment
-values, and refuse accidental replacement or malformed files. List shows no
+server; check explicitly starts it. Add saves the server as optional, so a
+typo can't stop later sessions (or a teammate's, through a committed
+`.mcp.json`); once check passes, set `"required": true` on it by hand if a
+session should refuse to start without it. `.mcp.json` is often committed, so
+add refuses arguments that look like secrets: `--env VAR` instead saves
+`"env": {"VAR": "${VAR}"}`, and the server gets VAR from Rusty's environment
+when it starts (a missing variable fails that server's start). Configuration
+changes keep the file's existing permissions and serialize concurrent writers across profiles without leaving a repository lock file, obey write permissions, preserve other server entries and environment
+values, and refuse accidental replacement or malformed files. The file is
+rewritten pretty-printed with keys in sorted order. List shows no
 environment values. Changes take effect in the next session. Health checks
 fail on any disconnected configured server, including optional ones; the
 existing `--mcp-check` required-server contract stays unchanged.
