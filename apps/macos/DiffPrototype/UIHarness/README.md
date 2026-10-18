@@ -23,8 +23,20 @@ xcodebuild test \
   -test-timeouts-enabled YES \
   -default-test-execution-time-allowance 90 \
   -maximum-test-execution-time-allowance 120 \
-  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-
 ```
+
+The harness uses local ad hoc signatures. Disabling code signing leaves the copied
+XCTest runner signature invalid after its bundle is assembled; macOS can reject
+the runner before any test method starts. No developer account is required. Both the app and runner must pass
+`codesign --verify --deep --strict` before a measurement attempt.
+
+A later enumerate-only preflight reproduced the bootstrap failure: the runner
+was killed by macOS security policy while its copied signature was invalid.
+After enabling ad hoc signing, strict signature verification passed and
+enumeration returned all three methods with an empty `errors` array. This
+proves test discovery, not scrolling performance. Check the enumeration JSON:
+`xcodebuild` can exit zero while that JSON contains a runner error.
 
 Use `test-without-building` in place of `test` to use the already-compiled
 harness. A fresh result path is required each time. Do not delete or overwrite
@@ -52,3 +64,13 @@ No valid trace or hitch metric exists from that run. A future attempt should use
 a much shorter capture and a small recording window, monitor both the output
 trace and its raw temp, and reserve ample disk before starting. Do not retry
 until the coordinator explicitly opens the quiet window.
+
+Functional launch checks run separately from scrolling metrics. They verify
+initial viewport bounds and compare the actual draw-loop projection with AX
+children before and after global and individual folding. The latter keeps
+window screenshots and JSON diagnostic attachments in its result bundle.
+`--projection-diagnostics <path>` enables bounded last-draw/AX snapshots for
+this test only; leave it off during performance measurements. Draw-loop
+agreement does not alone prove what WindowServer presented: inspect the saved
+screenshots as well. An intermittent initial-frame discrepancy remains
+unexplained unless a controlled same-process reproduction establishes it.

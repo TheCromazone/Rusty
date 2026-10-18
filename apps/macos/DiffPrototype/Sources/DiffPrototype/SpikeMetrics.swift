@@ -45,6 +45,11 @@ func physicalFootprint() -> UInt64? {
             "rows": rowCount, "synthetic_fixture_ms": fixtureMS,
             "document_receipt_to_first_appkit_draw_end_ms": firstPaintMS,
             "first_paint_cached_lines": view.cachedLineCount,
+            "first_paint_view_frame": NSStringFromRect(view.frame),
+            "first_paint_view_bounds": NSStringFromRect(view.bounds),
+            "first_paint_visible_rect": NSStringFromRect(view.visibleRect),
+            "first_paint_clip_bounds": view.enclosingScrollView.map { NSStringFromRect($0.contentView.bounds) } ?? "no scroll view",
+            "first_paint_window_frame": view.window.map { NSStringFromRect($0.frame) } ?? "no window",
             "load_average": ProcessInfo.processInfo.environment["RUSTY_SPIKE_LOAD_NOTE"] ?? "see captured uptime",
             "span_definition": "OpenMeasurement.init after Fixtures.rows returns through DiffRowView.draw first completion; excludes fixture generation, process launch and compositor presentation"
         ]
@@ -84,5 +89,30 @@ func physicalFootprint() -> UInt64? {
         } catch {
             fputs("measurement receipt write failed: \(error)\n", stderr)
         }
+    }
+}
+
+/// Opt-in diagnostic snapshots, deliberately disabled during performance runs.
+/// Records branches actually painted and AX children actually requested. It is
+/// not proof that WindowServer presented the same frame.
+@MainActor final class ProjectionDiagnostics {
+    let output: URL
+    private var report: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier]
+    init(path: String) { output = URL(fileURLWithPath: path) }
+    func record(_ kind: String, view: DiffRowView, first: Int, end: Int) {
+        let rows: [[String: Any]] = (first..<min(end, first + 128)).map { index in
+            let visible = view.document.visible[index]
+            return ["visual_index": index, "source_start": visible.source.lowerBound,
+                    "source_end": visible.source.upperBound, "collapsed": visible.collapsed]
+        }
+        report[kind] = ["at": Date().timeIntervalSince1970,
+                        "collapsed": view.document.isCollapsed,
+                        "projection_count": view.document.visible.count,
+                        "visible_rect": NSStringFromRect(view.visibleRect),
+                        "rows": rows]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys, .prettyPrinted])
+            try data.write(to: output, options: .atomic)
+        } catch { fputs("projection diagnostic write failed: \(error)\n", stderr) }
     }
 }

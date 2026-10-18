@@ -51,6 +51,9 @@ if CommandLine.arguments.contains("--benchmark") {
         let document = DiffDocument(rows: rows, collapsed: !CommandLine.arguments.contains("--expanded"))
         let view = DiffRowView(document: document)
         view.openMeasurement = measurement
+        if let flag = CommandLine.arguments.firstIndex(of: "--projection-diagnostics"), CommandLine.arguments.indices.contains(flag + 1) {
+            view.projectionDiagnostics = ProjectionDiagnostics(path: CommandLine.arguments[flag + 1])
+        }
         let window = NSWindow(contentRect: NSRect(x: 120, y: 140, width: 1180, height: 760),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "rusty · native diff prototype · \(count) rows"

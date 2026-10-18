@@ -42,6 +42,7 @@ import DiffPrototypeCore
     private(set) var drawnRows = 0
     var selectionChanged: ((String) -> Void)?
     var openMeasurement: OpenMeasurement?
+    var projectionDiagnostics: ProjectionDiagnostics?
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override var isOpaque: Bool { true }
@@ -81,12 +82,14 @@ import DiffPrototypeCore
             element.setAccessibilityFrame(frame)
             return element
         }
+        projectionDiagnostics?.record("accessibility", view: self, first: first, end: end)
         return accessibleRows
     }
     func resizeDocument() {
         setFrameSize(NSSize(width: max(1600, enclosingScrollView?.contentSize.width ?? 0),
                             height: max(1, CGFloat(document.visible.count) * rowHeight)))
         needsDisplay = true
+        NSAccessibility.post(element: self, notification: .layoutChanged)
     }
     func toggleCollapse() {
         let source = document.visible.indices.contains(Int(visibleRect.minY / rowHeight))
@@ -188,6 +191,7 @@ import DiffPrototypeCore
             CTLineDraw(ctLine, ctx)
             ctx.restoreGState()
         }
+        projectionDiagnostics?.record("draw", view: self, first: first, end: end)
     }
     private func position(_ event: NSEvent) -> TextPosition? {
         let point = convert(event.locationInWindow, from: nil)
