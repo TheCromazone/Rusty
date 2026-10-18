@@ -84,7 +84,7 @@ rusty --integrations mcp remove my-server
 The same commands work under `/integrations`. The existing `.mcp.json` (or
 `RUSTY_MCP_CONFIG`) remains the only MCP manifest. Add/list never execute a
 server; add marks it required and check explicitly starts it. Configuration
-changes obey write permissions, preserve other server entries and environment
+changes serialize concurrent writers across profiles without leaving a repository lock file, obey write permissions, preserve other server entries and environment
 values, and refuse accidental replacement or malformed files. List shows no
 environment values. Changes take effect in the next session. Health checks
 fail on any disconnected configured server, including optional ones; the
@@ -96,3 +96,5 @@ resources and prompts are not advertised. A user-selected stdio bridge may
 supply remote HTTP/OAuth functionality without another client stack in Rusty.
 Configure bridges explicitly; Rusty does not install packages or initiate
 authentication merely by listing integrations.
+
+The bounded stdio transport, request deadlines and reader/process cleanup are described in [verification and qualification](VERIFICATION.md).

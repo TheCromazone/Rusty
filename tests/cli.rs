@@ -5598,3 +5598,33 @@ fn unified_mcp_health_check_cannot_mark_an_unavailable_optional_server_healthy()
     assert!(!out.status.success());
     assert_eq!(std::fs::read_to_string(s.project.join(".mcp.json")).unwrap(), "not json");
 }
+
+#[test]
+fn concurrent_mcp_configuration_adds_preserve_every_server_across_profiles() {
+    let s = Sandbox::new("native-mcp-concurrent");
+    let mut children = Vec::new();
+    for n in 0..8 {
+        children.push(
+            s.cmd()
+                .env("RUSTY_HOME", s.home.join(format!("profile-{n}")))
+                .env_remove("NVIDIA_API_KEY")
+                .args(["--integrations", "mcp", "add", &format!("server{n}"), "/bin/true"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let out = wait(child, Duration::from_secs(30));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.project.join(".mcp.json")).unwrap()).unwrap();
+    let servers = config["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 8);
+    for n in 0..8 {
+        assert_eq!(servers[&format!("server{n}")]["command"], "/bin/true");
+    }
+    assert!(!s.project.join(".mcp.json.pending").exists());
+}

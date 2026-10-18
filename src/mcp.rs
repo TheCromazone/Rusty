@@ -5,6 +5,7 @@
 //! stdio transport. Only tools are supported; resources and prompts are not.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -508,6 +509,7 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
     use std::io::Write;
     let path =
         std::env::var_os("RUSTY_MCP_CONFIG").map(std::path::PathBuf::from).unwrap_or_else(|| cwd.join(".mcp.json"));
+    let path = if path.is_absolute() { path } else { cwd.join(path) };
     let action = args.first().map(String::as_str).unwrap_or("list");
     if action == "help" {
         return Ok("MCP: /integrations mcp list | add NAME COMMAND [ARGS...] | remove NAME | check. Add saves a required stdio server; it starts only on check or the next session. Use the CLI form for arguments containing spaces. Existing .mcp.json / RUSTY_MCP_CONFIG remains the source of truth. Configure authentication in the server's own native flow or environment; do not put tokens in command arguments. Direct HTTP transport is not supported; an explicitly configured stdio bridge can supply it.".into());
@@ -521,6 +523,26 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
         anyhow::ensure!(all_connected, "MCP health check failed: {output}");
         return Ok(output);
     }
+    // Lock the containing directory: stable across profiles and path aliases,
+    // with no persistent lock artifact in a user's repository. Rename remains
+    // atomic for readers; cooperating writers serialize read/modify/write.
+    let _lock = if matches!(action, "add" | "remove") {
+        let verdict = policy.decide("write_file", &serde_json::json!({"path":path}), cwd);
+        anyhow::ensure!(
+            matches!(verdict, crate::permissions::Verdict::Allow),
+            "MCP config change refused by permissions: {verdict:?}"
+        );
+        let parent = path.parent().context("MCP config directory missing")?;
+        std::fs::create_dir_all(parent)?;
+        let lock = std::fs::File::open(parent)?;
+        anyhow::ensure!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0,
+            "cannot lock MCP configuration directory"
+        );
+        Some(lock)
+    } else {
+        None
+    };
     let mut value: Value = if path.exists() {
         serde_json::from_slice(&std::fs::read(&path)?).context("invalid MCP configuration; left unchanged")?
     } else {
@@ -568,11 +590,6 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
             anyhow::ensure!(servers.remove(name).is_some(), "MCP server not configured");
         }
     }
-    let verdict = policy.decide("write_file", &serde_json::json!({"path":path}), cwd);
-    anyhow::ensure!(
-        matches!(verdict, crate::permissions::Verdict::Allow),
-        "MCP config change refused by permissions: {verdict:?}"
-    );
     if path.exists() {
         anyhow::ensure!(
             std::fs::symlink_metadata(&path)?.file_type().is_file(),
