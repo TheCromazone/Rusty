@@ -793,10 +793,31 @@ fn oversized_legacy_receipt_ledger_opens_read_only_without_replay() {
     resumed.send("stop", "shutdown", json!({}));
     assert_eq!(resumed.response("stop")["ok"], true);
     drop(resumed);
+    // The decoded cap also applies to tiny compressed streams; the original
+    // bytes remain untouched and no receipt can be guessed or replayed.
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&bytes).unwrap();
+    let compressed = gzip.finish().unwrap();
+    assert!(compressed.len() < 64 * 1024);
+    std::fs::write(&ledger, &compressed).unwrap();
+    let mut inflated = Worker::start(&root, &home, url, &["--continue", &id]);
+    let snapshot = inflated.until("session.snapshot")["payload"].clone();
+    assert_eq!(snapshot["read_only"], true);
+    assert_eq!(snapshot["read_only_reason"], "receipt_ledger_over_limit");
+    inflated.send("submit", "message.submit", json!({"text":"must never run"}));
+    assert_eq!(inflated.response("submit")["ok"], false);
+    assert_eq!(std::fs::read(&ledger).unwrap(), compressed);
+    inflated.send("stop", "shutdown", json!({}));
+    assert_eq!(inflated.response("stop")["ok"], true);
+    drop(inflated);
     // Corruption has a typed startup failure, rather than an empty channel.
     std::fs::write(&ledger, b"not json").unwrap();
     let invalid = Worker::start(&root, &home, url, &["--continue", &id]);
     assert_eq!(invalid.until("startup.failed")["payload"]["code"], "receipt_invalid");
+    drop(invalid);
+    std::fs::write(&ledger, [0x1f, 0x8b, 0, 0]).unwrap();
+    let invalid_gzip = Worker::start(&root, &home, url, &["--continue", &id]);
+    assert_eq!(invalid_gzip.until("startup.failed")["payload"]["code"], "receipt_invalid");
 }
 
 #[test]

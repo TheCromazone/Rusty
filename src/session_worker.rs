@@ -533,7 +533,7 @@ fn receipt_value(receipts: &BTreeMap<String, Receipt>, reserve_states: bool) -> 
         }
     }
     if serde_json::to_vec(&value)?.len() > RECEIPT_BYTES - if reserve_states { 64 * 1024 } else { 0 } {
-        return Err(anyhow!("worker receipt file exceeds 8 MiB"));
+        return Err(ReceiptOverLimit.into());
     }
     Ok(value)
 }
@@ -546,18 +546,44 @@ fn save_receipts(path: &Path, receipts: &BTreeMap<String, Receipt>) -> Result<()
     Ok(())
 }
 
-fn load_receipts(path: &Path) -> Result<BTreeMap<String, Receipt>> {
-    let mut receipts: BTreeMap<String, Receipt> = match File::open(path) {
-        Ok(file) => {
-            let mut bytes = Vec::new();
-            file.take(RECEIPT_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-            if bytes.len() > RECEIPT_BYTES {
-                return Err(anyhow!("worker receipt file exceeds 8 MiB"));
-            }
-            serde_json::from_slice(&bytes)?
+#[derive(Debug)]
+struct ReceiptOverLimit;
+impl std::fmt::Display for ReceiptOverLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("worker receipt file exceeds 8 MiB decoded limit")
+    }
+}
+impl std::error::Error for ReceiptOverLimit {}
+
+fn read_receipt_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(RECEIPT_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > RECEIPT_BYTES {
+        return Err(ReceiptOverLimit.into());
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice()).take(RECEIPT_BYTES as u64 + 1).read_to_end(&mut decoded)?;
+        if decoded.len() > RECEIPT_BYTES {
+            return Err(ReceiptOverLimit.into());
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => return Err(e.into()),
+        Ok(decoded)
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn load_receipts(path: &Path) -> Result<BTreeMap<String, Receipt>> {
+    let mut receipts: BTreeMap<String, Receipt> = match read_receipt_bytes(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            BTreeMap::new()
+        }
+        Err(error) => return Err(error),
     };
     if receipts.len() > 10000
         || receipts.iter().any(|(id, r)| {
@@ -642,6 +668,9 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
     }
     let receipts = match load_receipts(&path) {
         Ok(receipts) => receipts,
+        Err(error) if error.is::<ReceiptOverLimit>() => {
+            return serve_read_only(transport, agent, "receipt_ledger_over_limit")
+        }
         Err(error) => {
             transport.startup_failed("receipt_invalid", &error.to_string())?;
             return Err(error);
@@ -1235,9 +1264,54 @@ mod tests {
         save_receipts(&path, &ledger).unwrap();
         let persisted = std::fs::read(&path).unwrap();
         assert!(persisted.len() <= RECEIPT_BYTES);
-        let reopened: BTreeMap<String, Receipt> = serde_json::from_slice(&persisted).unwrap();
+        assert!(persisted.starts_with(&[0x1f, 0x8b]), "large ledgers use existing session compression");
+        let decoded = read_receipt_bytes(&path).unwrap();
+        assert!(decoded.len() <= RECEIPT_BYTES);
+        let reopened: BTreeMap<String, Receipt> = serde_json::from_slice(&decoded).unwrap();
         assert_eq!(reopened.values().filter(|r| r.state == "completed").count(), 1);
         assert_eq!(reopened.len(), n as usize + accepted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plain_and_compressed_receipts_recover_with_the_same_decoded_bound() {
+        let dir = std::env::temp_dir().join(format!("rusty-ledger-codec-{}", identity().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("receipts.json");
+        let ledger: BTreeMap<_, _> = (0..500)
+            .map(|n| {
+                (
+                    format!("request-{n}"),
+                    Receipt {
+                        ordinal: n + 1,
+                        fingerprint: "a".repeat(64),
+                        state: "running".into(),
+                        run_id: format!("{n:032}"),
+                        tools: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let plain = serde_json::to_vec(&ledger).unwrap();
+        assert!(plain.len() > 64 * 1024);
+        std::fs::write(&path, &plain).unwrap();
+        let recovered = load_receipts(&path).unwrap();
+        assert_eq!(recovered.len(), 500);
+        assert!(recovered.values().all(|r| r.state == "uncertain"));
+        assert!(std::fs::read(&path).unwrap().starts_with(&[0x1f, 0x8b]));
+        let reopened = load_receipts(&path).unwrap();
+        assert_eq!(reopened.len(), 500);
+        assert!(reopened.values().all(|r| r.state == "uncertain"));
+        // A tiny physical stream cannot bypass the decoded allocation cap.
+        use std::io::Write;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&vec![b' '; RECEIPT_BYTES + 1]).unwrap();
+        let oversized = gzip.finish().unwrap();
+        assert!(oversized.len() < 64 * 1024);
+        std::fs::write(&path, oversized).unwrap();
+        assert!(read_receipt_bytes(&path).unwrap_err().is::<ReceiptOverLimit>());
+        std::fs::write(&path, [0x1f, 0x8b, 0, 0]).unwrap();
+        assert!(!read_receipt_bytes(&path).unwrap_err().is::<ReceiptOverLimit>());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

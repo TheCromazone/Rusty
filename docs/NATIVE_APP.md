@@ -52,7 +52,8 @@ are rejected as message submissions until their typed controls are implemented.
 A message submission records a private durable receipt before queueing work.
 Repeating an ID with identical text returns its receipt; different text under
 that ID is rejected. Receipts are capped at 10,000 per session, with an 8 MiB
-serialized-file cap enforced before admission, reserving space for state changes.
+decoded JSON cap enforced before admission, reserving space for state changes.
+Receipt ledgers use the existing session compression above its threshold; recovery accepts legacy plain JSON and gzip, with separate bounded physical and decoded reads.
 An oversized legacy ledger opens the transcript read-only and marks recovery
 unknown; it never guesses which operations ran. Snapshots return at most 100 receipts and label truncation;
 a client can query a known submission by repeating the same ID and text.
