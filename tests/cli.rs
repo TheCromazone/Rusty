@@ -3969,6 +3969,154 @@ fn mcp_tools_are_offered_and_called() {
 }
 
 #[test]
+fn mcp_dispatch_outcomes_reach_trajectory_and_session_but_not_provider_requests() {
+    for case in ["settled", "unknown", "not_started", "interrupted"] {
+        let s = Sandbox::new(&format!("mcp-outcome-{case}"));
+        s.fake(
+            "outcome-mcp",
+            r#"
+while IFS= read -r line; do
+  echo "mcp> $line" >> "$RUSTY_TEST_CALLS"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*) echo '{"jsonrpc":"2.0","id":'$id',"result":{"capabilities":{}}}' ;;
+    *'"tools/list"'*)
+      if test "$RUSTY_TEST_MCP_CASE" = not_started; then exec 0<&-; fi
+      echo '{"jsonrpc":"2.0","id":'$id',"result":{"tools":[{"name":"get_flag","inputSchema":{"type":"object"}}]}}'
+      if test "$RUSTY_TEST_MCP_CASE" = not_started; then exec sleep 60; fi ;;
+    *'"tools/call"'*)
+      if test "$RUSTY_TEST_MCP_CASE" = unknown; then exec sleep 60; fi
+      if test "$RUSTY_TEST_MCP_CASE" = interrupted; then printf ready > "$RUSTY_TEST_MCP_READY"; exec sleep 60; fi
+      echo '{"jsonrpc":"2.0","id":'$id',"error":{"code":-32000,"message":"fixture refusal"}}' ;;
+  esac
+done
+"#,
+        );
+        std::fs::write(s.project.join(".mcp.json"), r#"{"mcpServers":{"outcome":{"command":"outcome-mcp"}}}"#).unwrap();
+        let mut call = tool_reply("mcp__outcome__get_flag", serde_json::json!({}));
+        let replies = if case == "interrupted" {
+            let mut skipped = call["choices"][0]["delta"]["tool_calls"][0].clone();
+            skipped["index"] = serde_json::json!(1);
+            skipped["id"] = serde_json::json!("skipped");
+            call["choices"][0]["delta"]["tool_calls"].as_array_mut().unwrap().push(skipped);
+            vec![call]
+        } else {
+            vec![call, text_reply("The call's effect is not assumed successful.")]
+        };
+        let (url, server) = scripted_endpoint(replies);
+        let ready = s.home.join("call-ready");
+        let trace_path = s.home.join("outcome.json");
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_TEST_MCP_CASE", case)
+            .env("RUSTY_TEST_MCP_READY", &ready)
+            .env("RUSTY_MCP_TIMEOUT", if case == "interrupted" { "30" } else { "1" })
+            .args(["--yolo", "--mode", "standard", "--agents", "off", "--memory", "off", "--trajectory"])
+            .arg(&trace_path)
+            .arg("inspect the flag")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if case == "interrupted" {
+            let started = Instant::now();
+            while !ready.exists() {
+                if started.elapsed() > Duration::from_secs(15) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("MCP call did not reach the effect barrier");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+        }
+        let out = wait(child, Duration::from_secs(30));
+        let requests = server.join().unwrap();
+        if case == "interrupted" {
+            assert_eq!(out.status.code(), Some(130));
+        } else {
+            assert!(out.status.success(), "{case}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        assert_eq!(requests.len(), if case == "interrupted" { 1 } else { 2 });
+        let expected = if case == "interrupted" { "unknown" } else { case };
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(&trace_path).unwrap()).unwrap();
+        let result = trace["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(result["_mcp_outcome"], expected, "{case}: {trace}");
+        assert_eq!(trace["mcp_outcomes"][expected], 1);
+        assert!(requests.iter().all(|r| !r["messages"].to_string().contains("_mcp_outcome")));
+        if case == "interrupted" {
+            let results: Vec<_> =
+                trace["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").collect();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[1]["_mcp_outcome"], "not_started");
+            assert_eq!(trace["mcp_outcomes"]["not_started"], 1);
+            assert_eq!(s.calls().matches("tools/call").count(), 1, "skipped call must not reach MCP");
+        }
+        let session_path = std::fs::read_dir(sessions_dir(&s))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let session: serde_json::Value = serde_json::from_slice(&std::fs::read(session_path).unwrap()).unwrap();
+        let saved = session["history"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(saved["_mcp_outcome"], expected);
+        if case == "not_started" {
+            assert!(!s.calls().contains("tools/call"), "{}", s.calls());
+        }
+        if case == "unknown" {
+            assert!(result["content"].as_str().unwrap().starts_with("MCP outcome unknown:"));
+        }
+    }
+}
+
+#[test]
+fn ctrl_c_during_mcp_startup_is_interrupted_and_reaps_the_server() {
+    let s = Sandbox::new("mcp-startup-interrupted");
+    let ready = s.home.join("mcp-ready");
+    s.fake(
+        "waiting-mcp",
+        r#"IFS= read -r line
+printf '%s' "$$" > "$RUSTY_TEST_MCP_READY.next"
+mv "$RUSTY_TEST_MCP_READY.next" "$RUSTY_TEST_MCP_READY"
+exec sleep 60"#,
+    );
+    std::fs::write(
+        s.project.join(".mcp.json"),
+        r#"{"mcpServers":{"required":{"command":"waiting-mcp","required":true}}}"#,
+    )
+    .unwrap();
+    let mut child = s
+        .cmd()
+        .env("RUSTY_TEST_MCP_READY", &ready)
+        .arg("--mcp-check")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !ready.exists() {
+        if started.elapsed() > Duration::from_secs(15) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("MCP server did not reach initialize");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let server_pid: i32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let out = wait(child, Duration::from_secs(15));
+    assert_eq!(out.status.code(), Some(130), "{}", String::from_utf8_lossy(&out.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["servers"][0]["reason"], "interrupted");
+    assert_eq!(report["servers"][0]["status"], "interrupted");
+    assert_eq!(unsafe { libc::kill(server_pid, 0) }, -1, "startup server was not reaped");
+}
+
+#[test]
 fn unattended_mcp_deletes_are_refused_before_reaching_the_server() {
     // `reset_flags` is a delete only by its annotation.
     for tool in ["delete_flag", "reset_flags"] {

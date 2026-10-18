@@ -1134,6 +1134,19 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   and requires `--verify`. Capabilities expose `verify.files_flag`.
 - **`--verify`** is optional. Without it, the goal closes on the model's word,
   and exit status 2 means the goal remains open or blocked, including a stall or exhausted turn allowance.
+- **MCP resource bounds.** Frames are limited to 4 MiB and four frames can queue.
+  Notifications cannot extend request deadlines. Closing a connection stops and
+  joins its reader, kills its owned process group, and reaps its child. Escaped
+  process groups are outside containment; these limits do not establish that
+  arbitrary external servers are leak-free. Outbound JSON is capped during
+  serialization, including escape expansion.
+
+  MCP tool-result records retain private `_mcp_outcome` metadata: `not_started`,
+  `settled` (a matching reply, including an invalid body), or `unknown` (sent but
+  no matching reply). Trajectories count these records in `mcp_outcomes`;
+  provider requests omit the private metadata. Unknown effects must not be
+  replayed. These observations do not implement native durable recovery.
+
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
   key and exits 1 if a server marked `required`, or one of its

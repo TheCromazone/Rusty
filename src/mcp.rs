@@ -4,12 +4,14 @@
 //! Newline-delimited JSON-RPC 2.0 over the server's stdin/stdout, per the MCP
 //! stdio transport. Only tools are supported; resources and prompts are not.
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Error, Result};
@@ -24,7 +26,62 @@ const PREFIX: &str = "mcp__";
 const MAX_NAME: usize = 64;
 const MAX_PAGES: usize = 100;
 const MAX_TOOLS: usize = 1000;
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+const QUEUED_FRAMES: usize = 4;
 const HANDSHAKE: Duration = Duration::from_secs(30);
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+/// What is known about this request, not whether the remote effect succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    NotStarted,
+    Settled,
+    Unknown,
+}
+
+impl DispatchOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Settled => "settled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Retained through anyhow contexts for callers that own durable effect markers.
+#[derive(Debug)]
+pub struct CallFailure {
+    pub outcome: DispatchOutcome,
+    source: Error,
+}
+
+impl CallFailure {
+    fn error(outcome: DispatchOutcome, source: impl Into<Error>) -> Error {
+        Error::new(Self { outcome, source: source.into() })
+    }
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)?;
+        if self.outcome == DispatchOutcome::Unknown {
+            write!(f, " (MCP outcome unknown; do not replay this call)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CallFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Relative to the tool request, even if connection setup failed first.
+pub fn failure_outcome(error: &Error) -> Option<DispatchOutcome> {
+    error.downcast_ref::<CallFailure>().map(|failure| failure.outcome)
+}
 
 #[derive(Deserialize)]
 struct Config {
@@ -32,7 +89,7 @@ struct Config {
     servers: BTreeMap<String, Value>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct ServerConfig {
     command: Option<String>,
@@ -64,12 +121,18 @@ pub struct Tool {
 struct Server {
     name: String,
     child: Child,
-    stdin: ChildStdin,
-    lines: Receiver<String>,
+    stdin: Option<ChildStdin>,
+    lines: Receiver<Result<String, String>>,
+    reader_stop: Arc<AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
     next_id: u64,
     tools: Vec<Tool>,
     /// Features the server offers that rusty doesn't use.
     ignored: Vec<String>,
+    command: String,
+    config: ServerConfig,
+    cwd: PathBuf,
+    stopped: bool,
 }
 
 /// What became of one configured server, for `--mcp-check` and errors.
@@ -77,7 +140,7 @@ struct Server {
 pub struct Report {
     server: String,
     required: bool,
-    /// `ok`, `skipped` or `failed`.
+    /// `ok`, `skipped`, `interrupted` or `failed`.
     status: &'static str,
     /// Why it isn't fully usable, so a harness can tell a capability rusty
     /// declares unsupported (`unsupported_transport`) from a server that
@@ -114,6 +177,9 @@ impl Mcp {
     /// marked `required` or names `requiredTools`.
     pub fn load(cwd: &Path) -> Result<Self> {
         let (mcp, reports) = Self::connect(cwd)?;
+        if reports.iter().any(|report| report.reason == Some("interrupted")) {
+            bail!("MCP startup interrupted");
+        }
         for r in &reports {
             if r.blocks() {
                 let why = r.error.clone().unwrap_or_else(|| format!("missing tools: {}", r.missing.join(", ")));
@@ -177,6 +243,9 @@ impl Mcp {
                     servers.push(server);
                 }
                 Err((reason, e)) => {
+                    if reason == "interrupted" {
+                        report.status = "interrupted";
+                    }
                     report.reason = Some(reason);
                     report.error = Some(format!("{e:#}"));
                 }
@@ -231,14 +300,39 @@ impl Mcp {
     /// Calls a tool by its exposed name and returns its text content. A tool
     /// error comes back as text starting with `error:`, like other tools.
     pub fn call(&mut self, exposed: &str, args: &Value) -> Result<String> {
-        let server = self
-            .servers
-            .iter_mut()
-            .find(|s| s.tools.iter().any(|t| t.exposed == exposed))
-            .ok_or_else(|| anyhow!("unknown MCP tool `{exposed}`"))?;
-        let name = server.tools.iter().find(|t| t.exposed == exposed).map(|t| t.name.clone()).unwrap_or_default();
+        self.call_cancellable(exposed, args, &|| {
+            crate::signal::poll_keys();
+            crate::signal::interrupted()
+        })
+    }
+
+    /// The callback is checked between bounded transport waits. A failure's
+    /// CallFailure outcome must be consulted before clearing an effect marker.
+    /// Reconnecting on a later call never replays this call.
+    pub fn call_cancellable(&mut self, exposed: &str, args: &Value, cancelled: &dyn Fn() -> bool) -> Result<String> {
+        self.call_with_timeout(exposed, args, call_timeout(), cancelled)
+    }
+
+    fn call_with_timeout(
+        &mut self,
+        exposed: &str,
+        args: &Value,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<String> {
+        if cancelled() {
+            return Err(CallFailure::error(DispatchOutcome::NotStarted, anyhow!("MCP call interrupted")));
+        }
+        let server =
+            self.servers.iter_mut().find(|s| s.tools.iter().any(|t| t.exposed == exposed)).ok_or_else(|| {
+                CallFailure::error(DispatchOutcome::NotStarted, anyhow!("unknown MCP tool `{exposed}`"))
+            })?;
+        server.reconnect(cancelled).map_err(|e| CallFailure::error(DispatchOutcome::NotStarted, e))?;
+        let name = server.tools.iter().find(|t| t.exposed == exposed).map(|t| t.name.clone()).ok_or_else(|| {
+            CallFailure::error(DispatchOutcome::NotStarted, anyhow!("MCP tool disappeared after reconnect"))
+        })?;
         let args = if args.is_object() { args.clone() } else { json!({}) };
-        let result = server.request("tools/call", json!({"name": name, "arguments": args}), call_timeout())?;
+        let result = server.tool_call(&name, args, timeout, cancelled)?;
         let text: Vec<&str> = result["content"]
             .as_array()
             .into_iter()
@@ -252,12 +346,83 @@ impl Mcp {
 }
 
 impl Server {
+    fn tool_call(&mut self, name: &str, args: Value, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<Value> {
+        let result =
+            self.request_cancellable("tools/call", json!({"name": name, "arguments": args}), timeout, cancelled);
+        let result = result.and_then(|value| {
+            if !value.is_object()
+                || !value.get("content").is_some_and(Value::is_array)
+                || value.get("isError").is_some_and(|v| !v.is_boolean())
+                || value.get("structuredContent").is_some_and(|v| !v.is_object())
+                || value.get("_meta").is_some_and(|v| !v.is_object())
+            {
+                return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP tools/call result")));
+            }
+            Ok(value)
+        });
+        if result.as_ref().err().and_then(failure_outcome) == Some(DispatchOutcome::Unknown) {
+            self.stop();
+        }
+        result
+    }
+
     /// Starts, initializes and lists one server; an error says which stage failed.
     fn start(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self, (&'static str, Error)> {
+        Self::start_cancellable(name, command, cfg, cwd, &crate::signal::interrupted)
+    }
+
+    fn start_cancellable(
+        name: &str,
+        command: &str,
+        cfg: &ServerConfig,
+        cwd: &Path,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, (&'static str, Error)> {
+        if cancelled() {
+            return Err(("interrupted", anyhow!("MCP startup interrupted before launch")));
+        }
         let mut server = Self::spawn(name, command, cfg, cwd).map_err(|e| ("start_failed", e))?;
-        server.initialize().map_err(|e| ("handshake_failed", e))?;
-        server.discover().map_err(|e| ("discovery_failed", e))?;
+        server.initialize(cancelled).map_err(|e| (if cancelled() { "interrupted" } else { "handshake_failed" }, e))?;
+        server.discover(cancelled).map_err(|e| (if cancelled() { "interrupted" } else { "discovery_failed" }, e))?;
         Ok(server)
+    }
+
+    fn reconnect(&mut self, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        if !self.stopped {
+            return Ok(());
+        }
+        if cancelled() {
+            bail!("MCP call interrupted before reconnect");
+        }
+        let mut replacement = Self::start_cancellable(&self.name, &self.command, &self.config, &self.cwd, cancelled)
+            .map_err(|(_, e)| e)?;
+        // The caller authorized the original definitions and permission class.
+        // A restarted server must not silently change either of them.
+        if replacement.tools.len() != self.tools.len() {
+            bail!("MCP server changed its tools after reconnect; reload the session");
+        }
+        let mut remaining: HashSet<&str> = self.tools.iter().map(|tool| tool.name.as_str()).collect();
+        if remaining.len() != self.tools.len() {
+            bail!("MCP server has duplicate tool names; reload the session");
+        }
+        for tool in &mut replacement.tools {
+            if !remaining.remove(tool.name.as_str()) {
+                bail!("MCP server changed or duplicated a tool after reconnect; reload the session");
+            }
+            let mut matches = self.tools.iter().filter(|old| old.name == tool.name);
+            let old = matches.next().context("MCP server changed a tool after reconnect; reload the session")?;
+            if matches.next().is_some()
+                || old.schema != tool.schema
+                || old.class != tool.class
+                || old.description != tool.description
+            {
+                bail!("MCP server changed a tool after reconnect; reload the session");
+            }
+            tool.exposed.clone_from(&old.exposed);
+        }
+        drop(remaining);
+        *self = replacement;
+        Ok(())
     }
 
     fn spawn(name: &str, command: &str, cfg: &ServerConfig, cwd: &Path) -> Result<Self> {
@@ -265,6 +430,7 @@ impl Server {
             .args(&cfg.args)
             .envs(expand_env(&cfg.env)?)
             .current_dir(cwd)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -273,24 +439,70 @@ impl Server {
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         // A reader thread, so a silent server can never block past a deadline.
-        let (tx, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if tx.send(line).is_err() {
+        let (tx, lines) = mpsc::sync_channel(QUEUED_FRAMES);
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let mut server = Self {
+            name: name.to_string(),
+            child,
+            stdin: Some(stdin),
+            lines,
+            reader_stop: reader_stop.clone(),
+            reader: None,
+            next_id: 1,
+            tools: Vec::new(),
+            ignored: Vec::new(),
+            command: command.to_string(),
+            config: cfg.clone(),
+            cwd: cwd.to_path_buf(),
+            stopped: false,
+        };
+        for fd in [server.stdin.as_ref().context("no stdin")?.as_raw_fd(), stdout.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("setting MCP pipes nonblocking");
+            }
+        }
+        server.reader = Some(std::thread::spawn(move || {
+            let mut reader = BufReader::new(Reader { stdout, stop: reader_stop.clone() });
+            'frames: loop {
+                let line = read_frame(&mut reader);
+                if reader_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let done = !matches!(&line, Ok(Some(_)));
+                let mut message = match line {
+                    Ok(Some(line)) => Ok(line),
+                    Ok(None) => break,
+                    Err(e) => Err(e.to_string()),
+                };
+                loop {
+                    if reader_stop.load(Ordering::Acquire) {
+                        break 'frames;
+                    }
+                    match tx.try_send(message) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Disconnected(_)) => break 'frames,
+                        Err(mpsc::TrySendError::Full(value)) => {
+                            message = value;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                if done {
                     break;
                 }
             }
-        });
-        Ok(Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new(), ignored: Vec::new() })
+        }));
+        Ok(server)
     }
 
-    fn initialize(&mut self) -> Result<()> {
-        let init = self.request(
+    fn initialize(&mut self, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        let init = self.request_cancellable(
             "initialize",
             json!({"protocolVersion": PROTOCOL, "capabilities": {},
                    "clientInfo": {"name": "rusty", "version": env!("CARGO_PKG_VERSION")}}),
             HANDSHAKE,
+            cancelled,
         )?;
         // Only tools are used; logging and completions need nothing of us.
         let used = ["tools", "logging", "completions", "experimental"];
@@ -301,22 +513,31 @@ impl Server {
             .filter(|k| !used.contains(&k.as_str()))
             .cloned()
             .collect();
-        self.notify("notifications/initialized")
+        let mut written = false;
+        self.send_cancellable(
+            &json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+            Instant::now() + HANDSHAKE,
+            cancelled,
+            &mut written,
+        )
     }
 
-    fn discover(&mut self) -> Result<()> {
+    fn discover(&mut self, cancelled: &dyn Fn() -> bool) -> Result<()> {
         let name = self.name.clone();
         // `tools/list` is paginated: follow `nextCursor` until it stops,
         // within bounds a looping or endless server can't get past.
         let (mut cursor, mut seen) = (None::<String>, HashSet::new());
         for page in 1.. {
             let params = cursor.as_ref().map_or(json!({}), |c| json!({ "cursor": c }));
-            let listed = self.request("tools/list", params, HANDSHAKE)?;
+            let listed = self.request_cancellable("tools/list", params, HANDSHAKE, cancelled)?;
             for t in listed["tools"].as_array().into_iter().flatten() {
                 let Some(tool) = t["name"].as_str().filter(|n| !n.is_empty()) else { continue };
                 let mut schema = t["inputSchema"].clone();
                 if !schema.is_object() {
                     schema = json!({"type": "object", "properties": {}});
+                }
+                if self.tools.len() >= MAX_TOOLS {
+                    bail!("tools/list exceeded {MAX_TOOLS} tools");
                 }
                 self.tools.push(Tool {
                     exposed: String::new(),
@@ -338,43 +559,212 @@ impl Server {
         Ok(())
     }
 
-    fn send(&mut self, message: &Value) -> Result<()> {
-        writeln!(self.stdin, "{message}").and_then(|()| self.stdin.flush()).context("the MCP server closed its input")
+    fn send_cancellable(
+        &mut self,
+        message: &Value,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+        written: &mut bool,
+    ) -> Result<()> {
+        if cancelled() {
+            bail!("MCP call interrupted");
+        }
+        let bytes = encode_frame(message)?;
+        let mut rest = bytes.as_slice();
+        let stdin = self.stdin.as_mut().context("MCP input is closed")?;
+        while !rest.is_empty() {
+            if cancelled() {
+                bail!("MCP call interrupted");
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("MCP input timed out");
+            }
+            match stdin.write(rest) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                        .context("the MCP server closed its input")
+                }
+                Ok(n) => {
+                    *written = true;
+                    rest = &rest[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd { fd: stdin.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+                    let status = unsafe { libc::poll(&mut fd, 1, left.min(CANCEL_POLL).as_millis().max(1) as i32) };
+                    if status < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        return Err(std::io::Error::last_os_error()).context("waiting for MCP input");
+                    }
+                }
+                Err(e) => return Err(e).context("the MCP server closed its input"),
+            }
+        }
+        Ok(())
     }
 
-    fn notify(&mut self, method: &str) -> Result<()> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method}))
-    }
-
+    #[cfg(test)]
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.request_cancellable(method, params, timeout, &crate::signal::interrupted)
+    }
+
+    fn request_cancellable(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
         let deadline = Instant::now() + timeout;
+        let mut written = false;
+        self.send_cancellable(
+            &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+            deadline,
+            cancelled,
+            &mut written,
+        )
+        .map_err(|e| {
+            if e.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WriteZero)
+            }) {
+                self.stop();
+            }
+            CallFailure::error(if written { DispatchOutcome::Unknown } else { DispatchOutcome::NotStarted }, e)
+        })?;
         loop {
+            if cancelled() {
+                return Err(CallFailure::error(DispatchOutcome::Unknown, anyhow!("MCP call interrupted")));
+            }
             let left = deadline.saturating_duration_since(Instant::now());
-            let line = match self.lines.recv_timeout(left) {
-                Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => bail!("{method} timed out after {}s", timeout.as_secs()),
-                Err(RecvTimeoutError::Disconnected) => bail!("the MCP server `{}` exited", self.name),
+            if left.is_zero() {
+                return Err(CallFailure::error(
+                    DispatchOutcome::Unknown,
+                    anyhow!("{method} timed out after {}s", timeout.as_secs_f64()),
+                ));
+            }
+            let line = match self.lines.recv_timeout(left.min(CANCEL_POLL)) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
+                    return Err(CallFailure::error(DispatchOutcome::Unknown, anyhow!("MCP output rejected: {error}")))
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(CallFailure::error(
+                        DispatchOutcome::Unknown,
+                        anyhow!("the MCP server `{}` exited", self.name),
+                    ))
+                }
             };
             // Skip notifications, server requests and stray output.
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg["id"].as_u64() != Some(id) || msg.get("method").is_some() {
                 continue;
             }
+            if msg["jsonrpc"] != "2.0" || msg.get("result").is_some() == msg.get("error").is_some() {
+                return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP reply envelope")));
+            }
             if let Some(err) = msg.get("error") {
-                bail!("{method}: {}", err["message"].as_str().unwrap_or("error"));
+                if !err["code"].is_i64() || !err["message"].is_string() {
+                    return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP error reply")));
+                }
+                return Err(CallFailure::error(
+                    DispatchOutcome::Settled,
+                    anyhow!("{method}: {}", err["message"].as_str().unwrap_or("error")),
+                ));
             }
             return Ok(msg["result"].clone());
         }
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
+/// Polling permits shutdown even if an escaped descendant retains stdout.
+struct Reader {
+    stdout: std::process::ChildStdout,
+    stop: Arc<AtomicBool>,
+}
+impl Read for Reader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "MCP reader stopped"));
+            }
+            match self.stdout.read(bytes) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd { fd: self.stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    let status = unsafe { libc::poll(&mut fd, 1, 50) };
+                    if status < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// Cap serialization while writing, including JSON escape expansion.
+fn encode_frame(message: &Value) -> Result<Vec<u8>> {
+    struct Frame(Vec<u8>);
+    impl Write for Frame {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_FRAME - 1).saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("MCP request exceeds 4 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut frame = Frame(Vec::new());
+    serde_json::to_writer(&mut frame, message)?;
+    frame.0.push(b'\n');
+    Ok(frame.0)
+}
+
+/// Limit before allocating or parsing, including output without a newline.
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    reader.take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_FRAME {
+        bail!("MCP frame exceeds 4 MiB");
+    }
+    Ok(Some(String::from_utf8(bytes).context("MCP output is not UTF-8")?))
+}
+
+impl Server {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.reader_stop.store(true, Ordering::Release);
+        // A launcher may exit before its server. Reap the child and stop its
+        // owned process group so descendants cannot retain stdout/readers.
+        // Keep the unreaped Child as the PID/group anchor until after signalling.
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
+        self.stdin.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        self.lines = mpsc::channel().1;
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -669,6 +1059,293 @@ pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) 
 mod tests {
     use super::*;
 
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rusty-mcp-outcome-{}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn outcome_fixture(path: &Path) -> Mcp {
+        let script = r#"
+import json, os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+with (root / 'starts').open('a') as f: f.write(str(os.getpid()) + '\n')
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if 'id' not in message: continue
+    reply = {'jsonrpc': '2.0', 'id': message['id']}
+    if method == 'initialize':
+        reply['result'] = {'capabilities': {}}
+    elif method == 'tools/list':
+        tool = {'name': 'apply', 'inputSchema': {'type': 'object'}}
+        if (root / 'changed').exists(): tool['annotations'] = {'destructiveHint': True}
+        other = tool if (root / 'duplicate').exists() else {'name': 'read', 'inputSchema': {'type': 'object'}}
+        reply['result'] = {'tools': [tool, other]}
+    else:
+        label = message['params']['arguments'].get('label', 'ok')
+        with (root / 'effects').open('a') as f: f.write(label + '\n')
+        if label == 'wait':
+            (root / 'ready').write_text('effect completed; reply withheld')
+            time.sleep(60)
+            continue
+        if label == 'rpc-error':
+            reply['error'] = {'code': -32000, 'message': 'fixture refusal'}
+        else:
+            reply['result'] = {'content': [{'type': 'text', 'text': 'ok'}]}
+            if label == 'malformed': reply['jsonrpc'] = 'wrong'
+            if label == 'bad-error': reply = {'jsonrpc':'2.0','id':message['id'],'error':{'code':'odd','message':None}}
+            if label == 'both': reply['error'] = {'code':-1,'message':'odd'}
+            if label == 'neither': reply.pop('result')
+            if label == 'result-null': reply['result'] = None
+            if label == 'result-string': reply['result'] = 'invalid'
+            if label == 'content-bad': reply['result']['content'] = 'invalid'
+            if label == 'block-bad': reply['result']['content'] = [None]
+            if label == 'is-error-bad': reply['result']['isError'] = 'invalid'
+            if label == 'structured-bad': reply['result']['structuredContent'] = 'invalid'
+            if label == 'meta-bad': reply['result']['_meta'] = 'invalid'
+            if label == 'non-text':
+                reply['result'] = {'content': [{'type':'audio', 'data':'AA==', 'mimeType':'audio/wav'}], 'structuredContent': {'ok': True}}
+    print(json.dumps(reply), flush=True)
+"#;
+        let cfg = ServerConfig {
+            args: vec!["-c".into(), script.into(), path.display().to_string()],
+            ..ServerConfig::default()
+        };
+        let server = Server::start("outcome", "python3", &cfg, path).unwrap_or_else(|(_, e)| panic!("{e:#}"));
+        let mut servers = vec![server];
+        name_tools(&mut servers);
+        Mcp { servers }
+    }
+
+    fn assert_stopped(server: &Server, pid: u32, reader: &Arc<AtomicBool>) {
+        assert!(server.stopped && server.stdin.is_none() && server.reader.is_none());
+        assert_eq!(Arc::strong_count(reader), 2, "reader thread still owns its cancellation state");
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "owned MCP child was not reaped");
+    }
+
+    #[test]
+    fn a_cancelled_effect_is_unknown_reaped_and_never_replayed_on_reconnect() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let pid = mcp.servers[0].child.id();
+        let reader = mcp.servers[0].reader_stop.clone();
+        let error = mcp
+            .call_with_timeout(&name, &json!({"label":"wait"}), Duration::from_secs(5), &|| {
+                scratch.0.join("ready").exists()
+            })
+            .unwrap_err();
+        assert!(scratch.0.join("ready").exists(), "cancellation must follow the actual effect");
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
+        assert_stopped(&mcp.servers[0], pid, &reader);
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\n");
+        assert_eq!(mcp.call_cancellable(&name, &json!({"label":"next"}), &|| false).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\nnext\n");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn cancellation_before_writing_is_not_started_and_replies_settle() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let error = mcp.call_cancellable(&name, &json!({}), &|| true).unwrap_err().context("outer context");
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert!(!scratch.0.join("effects").exists());
+        assert_eq!(mcp.call_cancellable(&name, &json!({}), &|| false).unwrap(), "ok");
+        assert_eq!(mcp.call_cancellable(&name, &json!({"label":"non-text"}), &|| false).unwrap(), r#"{"ok":true}"#);
+        let error = mcp.call_cancellable(&name, &json!({"label":"rpc-error"}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Settled));
+        assert!(!mcp.servers[0].stopped);
+        assert_eq!(mcp.call_cancellable(&name, &json!({}), &|| false).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn a_timeout_is_unknown_and_poisons_the_connection() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let pid = mcp.servers[0].child.id();
+        let reader = mcp.servers[0].reader_stop.clone();
+        let error = mcp.servers[0]
+            .tool_call("apply", json!({"label":"wait"}), Duration::from_millis(100), &|| false)
+            .unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        assert!(error.to_string().contains("after 0.1s"), "{error}");
+        assert_stopped(&mcp.servers[0], pid, &reader);
+    }
+
+    #[test]
+    fn a_reconnected_server_cannot_change_the_authorized_tool_definition() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let error =
+            mcp.call_cancellable(&name, &json!({"label":"wait"}), &|| scratch.0.join("ready").exists()).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        std::fs::write(scratch.0.join("changed"), "change annotation").unwrap();
+        let error = mcp.call_cancellable(&name, &json!({"label":"should-not-run"}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\n");
+        assert!(mcp.servers[0].stopped);
+    }
+
+    #[test]
+    fn id_matched_odd_replies_settle_without_stopping_the_server() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let pid = mcp.servers[0].child.id();
+        for label in [
+            "malformed",
+            "bad-error",
+            "both",
+            "neither",
+            "result-null",
+            "result-string",
+            "content-bad",
+            "is-error-bad",
+            "structured-bad",
+            "meta-bad",
+        ] {
+            let error = mcp.call_cancellable(&name, &json!({"label":label}), &|| false).unwrap_err();
+            assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Settled), "{label}");
+            assert!(!mcp.servers[0].stopped, "{label}");
+            assert_eq!(mcp.servers[0].child.id(), pid);
+            assert_eq!(mcp.call_cancellable(&name, &json!({}), &|| false).unwrap(), "ok");
+        }
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 1);
+        // Content extensions are outside transport validation.
+        assert!(mcp.call_cancellable(&name, &json!({"label":"block-bad"}), &|| false).is_ok());
+    }
+
+    #[test]
+    fn a_closed_input_before_any_write_is_not_started_and_reconnects_later() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let pid = mcp.servers[0].child.id();
+        let reader = mcp.servers[0].reader_stop.clone();
+        // Reserve the direct child until stop() sends its last signal.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) },
+                0
+            );
+            if unsafe { info.si_pid() } == pid as i32 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let error = mcp.call_cancellable(&name, &json!({"label":"must-not-run"}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert_stopped(&mcp.servers[0], pid, &reader);
+        assert!(!scratch.0.join("effects").exists());
+        assert_eq!(mcp.call_cancellable(&name, &json!({"label":"next"}), &|| false).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "next\n");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn startup_cancellation_is_interrupted_before_launch_handshake_or_discovery() {
+        let cfg = ServerConfig::default();
+        let error = Server::start_cancellable("cancel", "/nonexistent-must-not-launch", &cfg, Path::new("."), &|| true)
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "interrupted");
+        for stage in ["initialize", "tools/list"] {
+            let scratch = Scratch::new();
+            let script = r#"
+import json, os, pathlib, sys, time
+root, stage = pathlib.Path(sys.argv[1]), sys.argv[2]
+(root / 'pid').write_text(str(os.getpid()))
+for line in sys.stdin:
+    msg = json.loads(line)
+    if 'id' not in msg: continue
+    if msg['method'] == stage:
+        (root / 'ready').write_text(stage)
+        time.sleep(60)
+    print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'capabilities':{}}}), flush=True)
+"#;
+            let cfg = ServerConfig {
+                args: vec!["-c".into(), script.into(), scratch.0.display().to_string(), stage.into()],
+                ..ServerConfig::default()
+            };
+            let error =
+                Server::start_cancellable("cancel", "python3", &cfg, &scratch.0, &|| scratch.0.join("ready").exists())
+                    .err()
+                    .unwrap();
+            assert_eq!(error.0, "interrupted", "{stage}: {}", error.1);
+            let pid: i32 = std::fs::read_to_string(scratch.0.join("pid")).unwrap().parse().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "startup child not reaped");
+        }
+    }
+
+    #[test]
+    fn reconnect_requires_a_bijection_and_never_sends_an_empty_tool_name() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let original = names(&mcp.servers);
+        let error = mcp
+            .call_cancellable(&original[0], &json!({"label":"wait"}), &|| scratch.0.join("ready").exists())
+            .unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        std::fs::write(scratch.0.join("duplicate"), "A,B became A,A").unwrap();
+        let error = mcp.call_cancellable(&original[1], &json!({"label":"should-not-run"}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\n");
+    }
+
+    #[test]
+    fn failed_reconnect_does_not_start_the_tool() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        mcp.servers[0].stop();
+        mcp.servers[0].command = "/nonexistent-rusty-mcp-fixture".into();
+        let error = mcp.call_cancellable(&name, &json!({}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert!(!scratch.0.join("effects").exists());
+    }
+
+    #[test]
+    fn cancellation_while_input_is_full_preserves_partial_write_uncertainty() {
+        let cfg = ServerConfig { args: vec!["-c".into(), "sleep 60".into()], ..ServerConfig::default() };
+        let mut server = Server::spawn("blocked-cancel", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let pid = server.child.id();
+        let reader = server.reader_stop.clone();
+        let fd = server.stdin.as_ref().unwrap().as_raw_fd();
+        let error = server
+            .tool_call("apply", json!({"data":"x".repeat(1024*1024)}), Duration::from_secs(5), &|| {
+                let mut writable = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                unsafe { libc::poll(&mut writable, 1, 0) == 0 }
+            })
+            .unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        assert!(error.to_string().contains("interrupted"), "{error:#}");
+        assert_stopped(&server, pid, &reader);
+    }
+
     fn server(name: &str, tools: &[&str]) -> Server {
         let mut child = Command::new("true").stdin(Stdio::piped()).spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
@@ -682,7 +1359,21 @@ mod tests {
                 class: verb_class(t),
             })
             .collect();
-        Server { name: name.into(), child, stdin, lines: mpsc::channel().1, next_id: 1, tools, ignored: Vec::new() }
+        Server {
+            name: name.into(),
+            child,
+            stdin: Some(stdin),
+            lines: mpsc::channel().1,
+            reader_stop: Arc::new(AtomicBool::new(false)),
+            reader: None,
+            next_id: 1,
+            tools,
+            ignored: Vec::new(),
+            command: "true".into(),
+            config: ServerConfig::default(),
+            cwd: PathBuf::from("."),
+            stopped: false,
+        }
     }
 
     fn names(servers: &[Server]) -> Vec<String> {
@@ -750,7 +1441,6 @@ mod tests {
         assert!(matches!(tool_class("drop", &json!({"destructiveHint": false})), Class::Destructive(_)));
         assert_eq!(tool_class("get", &json!({})), Class::ReadOnly);
     }
-
     #[test]
     fn env_references_come_from_the_environment_and_literals_pass_through() {
         let env = BTreeMap::from([("A".to_string(), "${PATH}".to_string()), ("B".to_string(), "plain".to_string())]);
@@ -796,5 +1486,158 @@ mod tests {
         assert_eq!(after, saved);
         assert!(!dir.join(".mcp.json.pending").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_and_unterminated_mcp_frames_are_bounded_before_parsing() {
+        for terminated in [false, true] {
+            let mut bytes = vec![b'x'; MAX_FRAME + 1];
+            if terminated {
+                bytes.push(b'\n');
+            }
+            let mut reader = std::io::Cursor::new(bytes);
+            assert!(read_frame(&mut reader).unwrap_err().to_string().contains("4 MiB"));
+            assert_eq!(reader.position(), (MAX_FRAME + 1) as u64);
+        }
+        let mut reader = std::io::Cursor::new(b"one\ntwo\n");
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("one\n"));
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("two\n"));
+        assert!(read_frame(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn queued_notifications_cannot_extend_an_expired_request_deadline() {
+        let cfg = ServerConfig { args: vec!["-c".into(), "sleep 60".into()], ..ServerConfig::default() };
+        let mut server = Server::spawn("deadline", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(json!({"method":"notifications/progress"}).to_string())).unwrap();
+        tx.send(Ok(json!({"id":1,"result":{"late":true}}).to_string())).unwrap();
+        server.lines = rx;
+        let error = server.request("probe", json!({}), Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        let pid = server.child.id();
+        drop(server);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "MCP child was not reaped");
+    }
+    #[test]
+    fn closing_a_launcher_stops_its_owned_descendants() {
+        let path = std::env::temp_dir().join(format!("rusty-mcp-child-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = ServerConfig {
+            args: vec![
+                "-c".into(),
+                "sleep 60 & echo $! > \"$1\"; wait".into(),
+                "fixture".into(),
+                path.display().to_string(),
+            ],
+            ..ServerConfig::default()
+        };
+        let server = Server::spawn("launcher", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        let child = loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < end, "launcher did not publish child PID");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop(server);
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = Command::new("ps").args(["-o", "stat=", "-p", &child.to_string()]).output().unwrap();
+            let state = String::from_utf8_lossy(&out.stdout);
+            // An orphan zombie awaits init's reap but retains no live process.
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < end, "MCP descendant still running: {state}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn an_unread_mcp_input_cannot_hold_a_request_past_its_deadline() {
+        let cfg = ServerConfig { args: vec!["-c".into(), "sleep 3".into()], ..ServerConfig::default() };
+        let mut server = Server::spawn("blocked-input", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let error =
+            server.request("probe", json!({"data":"x".repeat(1024 * 1024)}), Duration::from_millis(20)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+    }
+    #[test]
+    fn a_real_notification_flood_respects_the_request_deadline_and_drops_cleanly() {
+        let cfg = ServerConfig {
+            args: vec![
+                "-c".into(),
+                r#"while :; do printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress"}'; done"#.into(),
+            ],
+            ..ServerConfig::default()
+        };
+        let mut server = Server::spawn("flood", "/bin/sh", &cfg, Path::new(".")).unwrap();
+        let first = server.lines.recv_timeout(Duration::from_secs(30)).unwrap().unwrap();
+        assert!(first.contains("notifications/progress"));
+        let pid = server.child.id();
+        let (done, stop) = mpsc::channel();
+        // A regression must fail rather than leave an infinite fixture behind.
+        let guard = std::thread::spawn(move || {
+            if matches!(stop.recv_timeout(Duration::from_secs(60)), Err(mpsc::RecvTimeoutError::Timeout)) {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+        });
+        let result = server.request("probe", json!({}), Duration::from_millis(50));
+        let _ = done.send(());
+        guard.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        drop(server);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+    #[test]
+    fn outbound_json_is_capped_during_escape_expansion() {
+        assert!(encode_frame(&json!({"data":"\u{0001}".repeat(MAX_FRAME / 4)}))
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB"));
+        let frame = encode_frame(&json!({"ok":true})).unwrap();
+        assert!(frame.ends_with(b"\n"));
+        assert_eq!(serde_json::from_slice::<Value>(&frame).unwrap(), json!({"ok":true}));
+    }
+
+    #[test]
+    fn drop_joins_reader_when_an_escaped_descendant_holds_stdout_open() {
+        struct Escaped(u32);
+        impl Drop for Escaped {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0 as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("rusty-mcp-escaped-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let script = "import os,sys,time\nif os.fork()==0:\n os.setsid()\n with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))\n time.sleep(60)\n os._exit(0)\nos._exit(0)";
+        let cfg = ServerConfig {
+            args: vec!["-c".into(), script.into(), path.display().to_string()],
+            ..ServerConfig::default()
+        };
+        let server = Server::spawn("escaped", "python3", &cfg, Path::new(".")).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        let escaped = loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break Escaped(pid);
+                }
+            }
+            assert!(Instant::now() < end, "escaped fixture did not publish PID");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stopped = server.reader_stop.clone();
+        drop(server);
+        assert_eq!(Arc::strong_count(&stopped), 1, "reader thread retained its cancellation state");
+        assert_eq!(unsafe { libc::kill(escaped.0 as i32, 0) }, 0, "fixture must still hold stdout");
+        drop(escaped);
+        let _ = std::fs::remove_file(path);
     }
 }

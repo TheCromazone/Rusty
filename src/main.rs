@@ -217,10 +217,18 @@ fn run() -> Result<i32> {
         return Ok(0);
     }
     if cli.mcp_check {
+        signal::install();
         let (_, reports) = mcp::Mcp::connect(&cwd)?;
-        let ok = !reports.iter().any(mcp::Report::blocks);
+        let interrupted = signal::interrupted();
+        let ok = !interrupted && !reports.iter().any(mcp::Report::blocks);
         println!("{}", serde_json::json!({ "ok": ok, "servers": reports }));
-        return Ok(if ok { 0 } else { 1 });
+        return Ok(if interrupted {
+            130
+        } else if ok {
+            0
+        } else {
+            1
+        });
     }
 
     let mut settings = Settings::load();

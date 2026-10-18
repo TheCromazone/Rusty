@@ -87,15 +87,16 @@ fn refusal_error(kind: RefusalKind, message: String) -> anyhow::Error {
 struct DispatchResult {
     text: String,
     refusal: Option<RefusalKind>,
+    mcp_outcome: Option<crate::mcp::DispatchOutcome>,
 }
 
 impl DispatchResult {
     fn refused(kind: RefusalKind, text: impl Into<String>) -> Self {
-        Self { text: text.into(), refusal: Some(kind) }
+        Self { text: text.into(), refusal: Some(kind), mcp_outcome: None }
     }
 
     fn failed(text: impl Into<String>) -> Self {
-        Self { text: text.into(), refusal: None }
+        Self { text: text.into(), refusal: None, mcp_outcome: None }
     }
 }
 
@@ -1278,6 +1279,8 @@ impl Agent {
             let mut early: Vec<Option<Result<String>>> = Vec::new();
             let mut read_to = 0;
             for (i, call) in reply.tool_calls.iter().enumerate() {
+                let mut mcp_outcome =
+                    crate::mcp::Mcp::is_tool(&call.name).then_some(crate::mcp::DispatchOutcome::NotStarted);
                 let output = if signal::interrupted() {
                     "skipped: the user interrupted".to_string()
                 } else if outcome.is_err() {
@@ -1302,6 +1305,7 @@ impl Agent {
                         read_to = self.read_ahead(&reply.tool_calls, i, &mut early);
                     }
                     let mut result = self.dispatch(call, &mut d, early.get_mut(i).and_then(Option::take));
+                    mcp_outcome = result.mcp_outcome.or(mcp_outcome);
                     self.safety.record(&class, result.refusal);
                     if class != crate::permissions::Class::ReadOnly && result.refusal.is_none() {
                         changed = true;
@@ -1369,7 +1373,13 @@ impl Agent {
                     }
                     result.text
                 };
-                self.history.push(json!({"role": "tool", "tool_call_id": call.id, "content": output}));
+                let mut message = json!({"role": "tool", "tool_call_id": call.id, "content": output});
+                if let Some(outcome) = mcp_outcome {
+                    // Private history metadata is retained in sessions and trajectories,
+                    // but provider serializers omit underscore-prefixed fields.
+                    message["_mcp_outcome"] = json!(outcome.label());
+                }
+                self.history.push(message);
             }
             self.checkpoint_trajectory();
             if outcome.is_err() {
@@ -1727,11 +1737,19 @@ impl Agent {
             },
             name => self.run_guarded(name, &args, d, early),
         };
-        let (text, ok, refusal) = match result {
-            Ok(t) => (t, true, None),
+        let is_mcp = crate::mcp::Mcp::is_tool(&call.name);
+        let (text, ok, refusal, mcp_outcome) = match result {
+            Ok(t) => (t, true, None, is_mcp.then_some(crate::mcp::DispatchOutcome::Settled)),
             Err(e) => {
                 let refusal = e.downcast_ref::<AuthorizationRefusal>().map(|r| r.kind);
-                (format!("error: {e:#}"), false, refusal)
+                let mcp_outcome =
+                    is_mcp.then(|| crate::mcp::failure_outcome(&e).unwrap_or(crate::mcp::DispatchOutcome::NotStarted));
+                let text = match mcp_outcome {
+                    Some(crate::mcp::DispatchOutcome::Unknown) => format!("MCP outcome unknown: {e:#}"),
+                    Some(crate::mcp::DispatchOutcome::NotStarted) => format!("MCP call not started: {e:#}"),
+                    _ => format!("error: {e:#}"),
+                };
+                (text, false, refusal, mcp_outcome)
             }
         };
         if ok && self.is_worker && self.board.is_some() {
@@ -1759,7 +1777,7 @@ impl Agent {
                 ui::dim(&format!("⊘ {redacted} secret{} redacted", if redacted == 1 { "" } else { "s" }))
             ));
         }
-        DispatchResult { text, refusal }
+        DispatchResult { text, refusal, mcp_outcome }
     }
 
     /// Runs a filesystem/shell tool through the permission policy.
@@ -2933,6 +2951,12 @@ impl Agent {
         let t = &self.totals;
         let mut messages = self.archived.clone();
         messages.extend(self.history.iter().cloned());
+        let mut mcp_outcomes = BTreeMap::<&str, usize>::new();
+        for message in &messages {
+            if let Some(outcome @ ("not_started" | "settled" | "unknown")) = message["_mcp_outcome"].as_str() {
+                *mcp_outcomes.entry(outcome).or_default() += 1;
+            }
+        }
         json!({
             "agent": "rusty",
             "version": env!("CARGO_PKG_VERSION"),
@@ -2954,6 +2978,7 @@ impl Agent {
             "claims": self.completion,
             "safety": self.safety,
             "activities": self.activities.records(),
+            "mcp_outcomes": mcp_outcomes,
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
         })
@@ -3261,6 +3286,25 @@ mod stable_prompt_tests {
         );
         let client = Arc::new(Client::new(vec![endpoint]).unwrap());
         Agent::new(client, "test-model".into(), std::env::temp_dir(), Policy::new(Mode::Yolo))
+    }
+
+    #[test]
+    fn mcp_result_metadata_is_private_for_every_provider_serializer() {
+        let mut agent = agent();
+        agent.history = vec![
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":"mcp-1","type":"function","function":{"name":"mcp__fixture__apply","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"mcp-1","content":"effect outcome unknown","_mcp_outcome":"unknown"}),
+        ];
+        let trace = agent.trajectory();
+        assert_eq!(trace["messages"][1]["_mcp_outcome"], "unknown");
+        assert_eq!(trace["mcp_outcomes"]["unknown"], 1);
+        let public = serde_json::to_value(crate::anthropic::Public(&agent.history)).unwrap();
+        let (_, anthropic) = crate::anthropic::convert(&agent.history);
+        let (_, codex) = crate::codex::convert(&agent.history);
+        for request in [public, json!(anthropic), json!(codex)] {
+            assert!(!request.to_string().contains("_mcp_outcome"));
+            assert!(request.to_string().contains("effect outcome unknown"));
+        }
     }
 
     #[test]
