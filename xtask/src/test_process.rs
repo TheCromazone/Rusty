@@ -393,7 +393,7 @@ mod tests {
     }
     #[test]
     fn exit_observation_preserves_ownership_until_consuming_finish() {
-        let mut owned = Owned::new(Command::new("/bin/true").process_group(0).spawn().unwrap());
+        let mut owned = Owned::new(Command::new("/bin/sh").args(["-c", "exit 0"]).process_group(0).spawn().unwrap());
         let pid = owned.child.id();
         let end = Instant::now() + Duration::from_secs(60);
         while !owned.exited().unwrap() {
@@ -415,7 +415,7 @@ mod tests {
     }
     #[test]
     fn already_expired_deadline_cannot_accept_a_successful_command() {
-        let result = capture(&mut Command::new("/bin/true"), 4096, Duration::ZERO).unwrap();
+        let result = capture(Command::new("/bin/sh").args(["-c", "exit 0"]), 4096, Duration::ZERO).unwrap();
         assert!(!result.success());
         assert_eq!(result.problem.as_deref(), Some("child exceeded capture deadline"));
         assert!(result.cleanup_error.is_none());
