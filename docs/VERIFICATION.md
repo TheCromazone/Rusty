@@ -1141,6 +1141,12 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   arbitrary external servers are leak-free. Outbound JSON is capped during
   serialization, including escape expansion.
 
+  MCP tool-result records retain private `_mcp_outcome` metadata: `not_started`,
+  `settled` (a matching reply, including an invalid body), or `unknown` (sent but
+  no matching reply). Trajectories count these records in `mcp_outcomes`;
+  provider requests omit the private metadata. Unknown effects must not be
+  replayed. These observations do not implement native durable recovery.
+
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
   key and exits 1 if a server marked `required`, or one of its

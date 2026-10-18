@@ -39,6 +39,16 @@ pub enum DispatchOutcome {
     Unknown,
 }
 
+impl DispatchOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Settled => "settled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Retained through anyhow contexts for callers that own durable effect markers.
 #[derive(Debug)]
 pub struct CallFailure {
@@ -130,7 +140,7 @@ struct Server {
 pub struct Report {
     server: String,
     required: bool,
-    /// `ok`, `skipped` or `failed`.
+    /// `ok`, `skipped`, `interrupted` or `failed`.
     status: &'static str,
     /// Why it isn't fully usable, so a harness can tell a capability rusty
     /// declares unsupported (`unsupported_transport`) from a server that
@@ -167,6 +177,9 @@ impl Mcp {
     /// marked `required` or names `requiredTools`.
     pub fn load(cwd: &Path) -> Result<Self> {
         let (mcp, reports) = Self::connect(cwd)?;
+        if reports.iter().any(|report| report.reason == Some("interrupted")) {
+            bail!("MCP startup interrupted");
+        }
         for r in &reports {
             if r.blocks() {
                 let why = r.error.clone().unwrap_or_else(|| format!("missing tools: {}", r.missing.join(", ")));
@@ -230,6 +243,9 @@ impl Mcp {
                     servers.push(server);
                 }
                 Err((reason, e)) => {
+                    if reason == "interrupted" {
+                        report.status = "interrupted";
+                    }
                     report.reason = Some(reason);
                     report.error = Some(format!("{e:#}"));
                 }
@@ -329,21 +345,6 @@ impl Mcp {
     }
 }
 
-fn valid_content(value: &Value) -> bool {
-    match value["type"].as_str() {
-        Some("text") => value["text"].is_string(),
-        Some("image" | "audio") => value["data"].is_string() && value["mimeType"].is_string(),
-        Some("resource_link") => value["uri"].is_string() && value["name"].is_string(),
-        Some("resource") => {
-            let resource = &value["resource"];
-            resource["uri"].is_string()
-                && (resource["text"].is_string() || resource["blob"].is_string())
-                && resource.get("mimeType").is_none_or(Value::is_string)
-        }
-        _ => false,
-    }
-}
-
 impl Server {
     fn tool_call(&mut self, name: &str, args: Value, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Result<Value> {
         let result =
@@ -354,9 +355,8 @@ impl Server {
                 || value.get("isError").is_some_and(|v| !v.is_boolean())
                 || value.get("structuredContent").is_some_and(|v| !v.is_object())
                 || value.get("_meta").is_some_and(|v| !v.is_object())
-                || value["content"].as_array().is_some_and(|items| items.iter().any(|item| !valid_content(item)))
             {
-                return Err(CallFailure::error(DispatchOutcome::Unknown, anyhow!("invalid MCP tools/call result")));
+                return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP tools/call result")));
             }
             Ok(value)
         });
@@ -378,9 +378,12 @@ impl Server {
         cwd: &Path,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, (&'static str, Error)> {
+        if cancelled() {
+            return Err(("interrupted", anyhow!("MCP startup interrupted before launch")));
+        }
         let mut server = Self::spawn(name, command, cfg, cwd).map_err(|e| ("start_failed", e))?;
-        server.initialize(cancelled).map_err(|e| ("handshake_failed", e))?;
-        server.discover(cancelled).map_err(|e| ("discovery_failed", e))?;
+        server.initialize(cancelled).map_err(|e| (if cancelled() { "interrupted" } else { "handshake_failed" }, e))?;
+        server.discover(cancelled).map_err(|e| (if cancelled() { "interrupted" } else { "discovery_failed" }, e))?;
         Ok(server)
     }
 
@@ -578,7 +581,10 @@ impl Server {
                 bail!("MCP input timed out");
             }
             match stdin.write(rest) {
-                Ok(0) => bail!("the MCP server closed its input"),
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero))
+                        .context("the MCP server closed its input")
+                }
                 Ok(n) => {
                     *written = true;
                     rest = &rest[n..];
@@ -620,6 +626,11 @@ impl Server {
             &mut written,
         )
         .map_err(|e| {
+            if e.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::WriteZero)
+            }) {
+                self.stop();
+            }
             CallFailure::error(if written { DispatchOutcome::Unknown } else { DispatchOutcome::NotStarted }, e)
         })?;
         loop {
@@ -630,7 +641,7 @@ impl Server {
             if left.is_zero() {
                 return Err(CallFailure::error(
                     DispatchOutcome::Unknown,
-                    anyhow!("{method} timed out after {}s", timeout.as_secs()),
+                    anyhow!("{method} timed out after {}s", timeout.as_secs_f64()),
                 ));
             }
             let line = match self.lines.recv_timeout(left.min(CANCEL_POLL)) {
@@ -652,11 +663,11 @@ impl Server {
                 continue;
             }
             if msg["jsonrpc"] != "2.0" || msg.get("result").is_some() == msg.get("error").is_some() {
-                return Err(CallFailure::error(DispatchOutcome::Unknown, anyhow!("invalid MCP reply envelope")));
+                return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP reply envelope")));
             }
             if let Some(err) = msg.get("error") {
                 if !err["code"].is_i64() || !err["message"].is_string() {
-                    return Err(CallFailure::error(DispatchOutcome::Unknown, anyhow!("invalid MCP error reply")));
+                    return Err(CallFailure::error(DispatchOutcome::Settled, anyhow!("invalid MCP error reply")));
                 }
                 return Err(CallFailure::error(
                     DispatchOutcome::Settled,
@@ -1097,6 +1108,9 @@ for line in sys.stdin:
         else:
             reply['result'] = {'content': [{'type': 'text', 'text': 'ok'}]}
             if label == 'malformed': reply['jsonrpc'] = 'wrong'
+            if label == 'bad-error': reply = {'jsonrpc':'2.0','id':message['id'],'error':{'code':'odd','message':None}}
+            if label == 'both': reply['error'] = {'code':-1,'message':'odd'}
+            if label == 'neither': reply.pop('result')
             if label == 'result-null': reply['result'] = None
             if label == 'result-string': reply['result'] = 'invalid'
             if label == 'content-bad': reply['result']['content'] = 'invalid'
@@ -1164,18 +1178,17 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn timeout_and_malformed_replies_are_unknown_and_poison_the_connection() {
-        for label in ["wait", "malformed"] {
-            let scratch = Scratch::new();
-            let mut mcp = outcome_fixture(&scratch.0);
-            let pid = mcp.servers[0].child.id();
-            let reader = mcp.servers[0].reader_stop.clone();
-            let error = mcp.servers[0]
-                .tool_call("apply", json!({"label":label}), Duration::from_secs(1), &|| false)
-                .unwrap_err();
-            assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
-            assert_stopped(&mcp.servers[0], pid, &reader);
-        }
+    fn a_timeout_is_unknown_and_poisons_the_connection() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let pid = mcp.servers[0].child.id();
+        let reader = mcp.servers[0].reader_stop.clone();
+        let error = mcp.servers[0]
+            .tool_call("apply", json!({"label":"wait"}), Duration::from_millis(100), &|| false)
+            .unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
+        assert!(error.to_string().contains("after 0.1s"), "{error}");
+        assert_stopped(&mcp.servers[0], pid, &reader);
     }
 
     #[test]
@@ -1183,28 +1196,108 @@ for line in sys.stdin:
         let scratch = Scratch::new();
         let mut mcp = outcome_fixture(&scratch.0);
         let name = names(&mcp.servers)[0].clone();
-        let error = mcp.call_cancellable(&name, &json!({"label":"malformed"}), &|| false).unwrap_err();
+        let error =
+            mcp.call_cancellable(&name, &json!({"label":"wait"}), &|| scratch.0.join("ready").exists()).unwrap_err();
         assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
         std::fs::write(scratch.0.join("changed"), "change annotation").unwrap();
         let error = mcp.call_cancellable(&name, &json!({"label":"should-not-run"}), &|| false).unwrap_err();
         assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
-        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "malformed\n");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\n");
         assert!(mcp.servers[0].stopped);
     }
 
     #[test]
-    fn malformed_tool_results_cannot_settle_an_effect() {
-        for label in
-            ["result-null", "result-string", "content-bad", "block-bad", "is-error-bad", "structured-bad", "meta-bad"]
-        {
-            let scratch = Scratch::new();
-            let mut mcp = outcome_fixture(&scratch.0);
-            let name = names(&mcp.servers)[0].clone();
-            let pid = mcp.servers[0].child.id();
-            let reader = mcp.servers[0].reader_stop.clone();
+    fn id_matched_odd_replies_settle_without_stopping_the_server() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let pid = mcp.servers[0].child.id();
+        for label in [
+            "malformed",
+            "bad-error",
+            "both",
+            "neither",
+            "result-null",
+            "result-string",
+            "content-bad",
+            "is-error-bad",
+            "structured-bad",
+            "meta-bad",
+        ] {
             let error = mcp.call_cancellable(&name, &json!({"label":label}), &|| false).unwrap_err();
-            assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown), "{label}");
-            assert_stopped(&mcp.servers[0], pid, &reader);
+            assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Settled), "{label}");
+            assert!(!mcp.servers[0].stopped, "{label}");
+            assert_eq!(mcp.servers[0].child.id(), pid);
+            assert_eq!(mcp.call_cancellable(&name, &json!({}), &|| false).unwrap(), "ok");
+        }
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 1);
+        // Content extensions are outside transport validation.
+        assert!(mcp.call_cancellable(&name, &json!({"label":"block-bad"}), &|| false).is_ok());
+    }
+
+    #[test]
+    fn a_closed_input_before_any_write_is_not_started_and_reconnects_later() {
+        let scratch = Scratch::new();
+        let mut mcp = outcome_fixture(&scratch.0);
+        let name = names(&mcp.servers)[0].clone();
+        let pid = mcp.servers[0].child.id();
+        let reader = mcp.servers[0].reader_stop.clone();
+        // Reserve the direct child until stop() sends its last signal.
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) },
+                0
+            );
+            if unsafe { info.si_pid() } == pid as i32 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "server did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let error = mcp.call_cancellable(&name, &json!({"label":"must-not-run"}), &|| false).unwrap_err();
+        assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
+        assert_stopped(&mcp.servers[0], pid, &reader);
+        assert!(!scratch.0.join("effects").exists());
+        assert_eq!(mcp.call_cancellable(&name, &json!({"label":"next"}), &|| false).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "next\n");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("starts")).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn startup_cancellation_is_interrupted_before_launch_handshake_or_discovery() {
+        let cfg = ServerConfig::default();
+        let error = Server::start_cancellable("cancel", "/nonexistent-must-not-launch", &cfg, Path::new("."), &|| true)
+            .err()
+            .unwrap();
+        assert_eq!(error.0, "interrupted");
+        for stage in ["initialize", "tools/list"] {
+            let scratch = Scratch::new();
+            let script = r#"
+import json, os, pathlib, sys, time
+root, stage = pathlib.Path(sys.argv[1]), sys.argv[2]
+(root / 'pid').write_text(str(os.getpid()))
+for line in sys.stdin:
+    msg = json.loads(line)
+    if 'id' not in msg: continue
+    if msg['method'] == stage:
+        (root / 'ready').write_text(stage)
+        time.sleep(60)
+    print(json.dumps({'jsonrpc':'2.0','id':msg['id'],'result':{'capabilities':{}}}), flush=True)
+"#;
+            let cfg = ServerConfig {
+                args: vec!["-c".into(), script.into(), scratch.0.display().to_string(), stage.into()],
+                ..ServerConfig::default()
+            };
+            let error =
+                Server::start_cancellable("cancel", "python3", &cfg, &scratch.0, &|| scratch.0.join("ready").exists())
+                    .err()
+                    .unwrap();
+            assert_eq!(error.0, "interrupted", "{stage}: {}", error.1);
+            let pid: i32 = std::fs::read_to_string(scratch.0.join("pid")).unwrap().parse().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "startup child not reaped");
         }
     }
 
@@ -1213,12 +1306,14 @@ for line in sys.stdin:
         let scratch = Scratch::new();
         let mut mcp = outcome_fixture(&scratch.0);
         let original = names(&mcp.servers);
-        let error = mcp.call_cancellable(&original[0], &json!({"label":"malformed"}), &|| false).unwrap_err();
+        let error = mcp
+            .call_cancellable(&original[0], &json!({"label":"wait"}), &|| scratch.0.join("ready").exists())
+            .unwrap_err();
         assert_eq!(failure_outcome(&error), Some(DispatchOutcome::Unknown));
         std::fs::write(scratch.0.join("duplicate"), "A,B became A,A").unwrap();
         let error = mcp.call_cancellable(&original[1], &json!({"label":"should-not-run"}), &|| false).unwrap_err();
         assert_eq!(failure_outcome(&error), Some(DispatchOutcome::NotStarted));
-        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "malformed\n");
+        assert_eq!(std::fs::read_to_string(scratch.0.join("effects")).unwrap(), "wait\n");
     }
 
     #[test]
