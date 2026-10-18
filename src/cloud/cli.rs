@@ -363,17 +363,7 @@ fn prepare_source(env: &Env, cpu: u8, memory: u8) -> Result<i32> {
     let tmp = std::env::temp_dir().join(format!("rusty-source-{}", super::digest::random_hex(8)));
     crate::privacy::private_dir(&tmp)?;
     let result = (|| -> Result<()> {
-        let mut tar = std::process::Command::new("tar")
-            .args(["xf", "-", "-C"])
-            .arg(&tmp)
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("running tar")?;
-        std::io::Write::write_all(tar.stdin.as_mut().context("tar stdin")?, &archive)?;
-        drop(tar.stdin.take());
-        if !tar.wait()?.success() {
-            bail!("extracting the source archive failed");
-        }
+        extract_source_archive(&archive, &tmp)?;
         let build = image::source_build(&tmp)?;
         eprintln!("☾ building {revision} as {name} in Daytona ({cpu} CPU, {memory} GiB)…");
         let hashes = image::upload_contexts(&d.push_access()?, &build.contexts)?;
@@ -384,6 +374,33 @@ fn prepare_source(env: &Env, cpu: u8, memory: u8) -> Result<i32> {
     result?;
     println!("{name}");
     Ok(0)
+}
+
+fn extract_source_archive(archive: &[u8], dir: &Path) -> Result<()> {
+    let path = dir.join(".rusty-source.tar");
+    let result = (|| -> Result<()> {
+        let mut file = crate::privacy::private_file(&path, false)?;
+        std::io::Write::write_all(&mut file, archive)?;
+        drop(file);
+        // tar can exit after its end markers without reading all valid zero
+        // padding. A regular file avoids racing that exit with a pipe writer.
+        let status = std::process::Command::new("tar")
+            .arg("xf")
+            .arg(&path)
+            .arg("-C")
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .context("running tar")?;
+        if !status.success() {
+            bail!("extracting the source archive failed");
+        }
+        Ok(())
+    })();
+    let removed = std::fs::remove_file(&path);
+    result?;
+    removed.context("removing the source archive")?;
+    Ok(())
 }
 
 fn prune(env: &Env, yes: bool, keep: Option<String>) -> Result<i32> {
@@ -490,4 +507,46 @@ fn run(env: &Env, runs: &Runs, args: RunArgs) -> Result<i32> {
         return Ok(130);
     }
     launcher::finish(&d, &remote, runs, &mut state, args.keep)
+}
+
+#[cfg(test)]
+mod source_archive_tests {
+    use super::*;
+
+    #[test]
+    fn source_archive_accepts_trailing_padding_and_cleans_up_after_failure() {
+        let root = std::env::temp_dir().join(format!("rusty-source-test-{}", super::super::digest::random_hex(8)));
+        crate::privacy::private_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let input = root.join("input");
+        let output = root.join("output");
+        crate::privacy::private_dir(&input).unwrap();
+        crate::privacy::private_dir(&output).unwrap();
+        std::fs::write(input.join("tracked.txt"), b"complete source\n").unwrap();
+        let tar = std::process::Command::new("tar")
+            .arg("cf")
+            .arg("-")
+            .arg("-C")
+            .arg(&input)
+            .arg("tracked.txt")
+            .output()
+            .unwrap();
+        assert!(tar.status.success());
+        let mut archive = tar.stdout;
+        // More trailing padding than a pipe can buffer makes the original
+        // write-all-before-wait path fail when tar exits at the end markers.
+        archive.resize(archive.len() + 2 * 1024 * 1024, 0);
+        extract_source_archive(&archive, &output).unwrap();
+        assert_eq!(std::fs::read(output.join("tracked.txt")).unwrap(), b"complete source\n");
+        assert!(!output.join(".rusty-source.tar").exists());
+
+        assert!(extract_source_archive(b"not a tar archive", &output).is_err());
+        assert!(!output.join(".rusty-source.tar").exists());
+    }
 }
