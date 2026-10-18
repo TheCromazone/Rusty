@@ -2455,7 +2455,10 @@ fn a_refused_key_stops_after_two_attempts() {
     assert_eq!(server.join().unwrap().len(), 2);
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("refused.json")).unwrap()).unwrap();
-    assert_eq!(trace["model_budget"]["attempts"], 2, "authentication failures must stop after the fallback attempt");
+    // One round-one backoff (2 to 2.5s) separates the two attempts; anything
+    // longer means auth failures are waiting out the retry budget.
+    let waited = trace["model_budget"]["retry_wait_seconds"].as_f64().unwrap();
+    assert!(waited < 10.0, "auth failures don't wait out the budget: waited {waited}s");
 }
 
 #[test]
@@ -3062,11 +3065,15 @@ fn ctrl_c_cancels_and_reaps_an_owned_command_before_export() {
         std::fs::read_to_string(s.project.join("owner.pid")).ok().and_then(|s| s.trim().parse::<i32>().ok()).is_some()
     });
     let pid: i32 = std::fs::read_to_string(s.project.join("owner.pid")).unwrap().trim().parse().unwrap();
+    let before = Instant::now();
     unsafe {
         libc::kill(child.id() as i32, libc::SIGINT);
     }
     let out = wait(child, Duration::from_secs(60));
     assert_eq!(out.status.code(), Some(130), "{}", String::from_utf8_lossy(&out.stderr));
+    // Generous for a loaded machine, yet well short of the 30s sleep: only
+    // a working cancel can exit this soon.
+    assert!(before.elapsed() < Duration::from_secs(15), "Ctrl-C waited for the command to finish");
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("interrupted.json")).unwrap()).unwrap();
     assert_eq!(trace["activities"][0]["status"], "Interrupted");
@@ -3357,8 +3364,10 @@ fn root_budget_deadline_stops_a_silent_response() {
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
         stream.flush().unwrap();
         // Startup consumes no provider time. Expire only after the real POST.
+        // The fake clock drives the deadline; the request's real timer is a
+        // full minute, so a slow scheduler cannot fire it and force a retry.
         let next = server_clock.with_extension("next");
-        std::fs::write(&next, "1000").unwrap();
+        std::fs::write(&next, "60000").unwrap();
         std::fs::rename(next, server_clock).unwrap();
         let mut byte = [0];
         assert!(matches!(stream.read(&mut byte), Ok(0)), "deadline must close the silent response");
@@ -3368,7 +3377,7 @@ fn root_budget_deadline_stops_a_silent_response() {
         .cmd()
         .env("RUSTY_BASE_URL", url)
         .env("RUSTY_TEST_BUDGET_CLOCK", &clock)
-        .args(["--budget-secs", "1", "--mode", "standard", "--memory", "off", "--trajectory"])
+        .args(["--budget-secs", "60", "--mode", "standard", "--memory", "off", "--trajectory"])
         .arg(&trajectory)
         .arg("inspect")
         .stdout(Stdio::piped())
