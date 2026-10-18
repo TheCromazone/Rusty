@@ -565,14 +565,12 @@ fn run_owned(
         cmd.process_group(0);
     }
     let mut child = OwnedShell(cmd.spawn().context("failed to spawn bash")?);
-    if let (Some((_, input)), Some(mut stdin)) = (hook, child.0.stdin.take()) {
-        // On its own thread: a hook that never reads its input must not stall
-        // rusty on a full pipe. The write fails once the hook has exited.
-        let input = input.to_string();
-        std::thread::spawn(move || {
-            let _ = std::io::Write::write_all(&mut stdin, input.as_bytes());
-        });
-    }
+    // On its own thread: a hook that never reads its input must not stall
+    // rusty on a full pipe.
+    let writer = match (hook, child.0.stdin.take()) {
+        (Some((_, input)), Some(stdin)) => Some(ShellWriter::new(stdin, input.as_bytes().to_vec())?),
+        _ => None,
+    };
 
     // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
     let so = child.0.stdout.take().unwrap();
@@ -598,6 +596,7 @@ fn run_owned(
     // Kill descendants even when the shell exited first, before joining pipe
     // readers. A background child must not keep verification alive forever.
     drop(child);
+    drop(writer);
     // One shared grace budget tolerates delayed scheduling without allowing an
     // escaped pipe holder to retain either reader indefinitely. This is capture
     // policy, not proof of process containment or a change to the exit status.
@@ -613,6 +612,51 @@ fn run_owned(
         );
     }
     Ok(ShellCapture { status, stdout, stderr, capture_complete })
+}
+
+// The same holds for a hook's stdin: a setsid descendant can hold it open
+// without reading, so the writer gives up when the call is done with it.
+struct ShellWriter {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl ShellWriter {
+    fn new(mut pipe: std::process::ChildStdin, input: Vec<u8>) -> Result<Self> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("setting hook input nonblocking");
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut rest = &input[..];
+            while !rest.is_empty() && !stopped.load(std::sync::atomic::Ordering::Acquire) {
+                match pipe.write(rest) {
+                    Ok(0) => break,
+                    Ok(n) => rest = &rest[n..],
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        let mut fd = libc::pollfd { fd: pipe.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+                        unsafe { libc::poll(&mut fd, 1, 25) };
+                    }
+                    // The hook exited or closed its stdin.
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self { stop, thread: Some(thread) })
+    }
+}
+impl Drop for ShellWriter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 // Reader ownership is independent of descendant process-group containment.
@@ -1188,6 +1232,37 @@ os._exit(0)
         assert!(ahead[0].is_some());
         assert!(ahead[1..].iter().all(Option::is_none));
         assert!(read_ahead(&[("read_file", &read); 3], 3, &|| true).iter().all(Option::is_none));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_hook_input_nobody_reads_cannot_outlive_the_call() {
+        // The holder leaves the process group with the hook's stdin and never
+        // reads it, so four megabytes can't all be written.
+        let dir = std::env::temp_dir().join(format!("rusty-hook-stdin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("holder.py");
+        fs::write(
+            &script,
+            "import os,sys,time\nif os.fork()==0:\n    os.setsid()\n    os.close(1); os.close(2)\n    \
+             open('holder.pid','w').write(str(os.getpid()))\n    time.sleep(20)\n    os._exit(0)\n",
+        )
+        .unwrap();
+        let command = format!("python3 '{}'; while [ ! -s holder.pid ]; do sleep 0.05; done", script.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cwd = dir.clone();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let input = "x".repeat(4 << 20);
+            let _ = tx.send(run_hook(&command, &cwd, &input, Duration::from_secs(10)).map(|c| c.status));
+        });
+        let status = rx.recv_timeout(Duration::from_secs(8)).expect("the hook's stdin writer outlived the call");
+        assert_eq!(status.unwrap(), Some(Some(0)));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        if let Ok(pid) = fs::read_to_string(dir.join("holder.pid")).unwrap_or_default().trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
