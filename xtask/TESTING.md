@@ -21,9 +21,17 @@ OpenSSH and container gates. Opened, reopened and synchronized PRs
 and main pushes run `check` and the full offline gate. Superseded code runs
 cancel; title/body edits run conventions only in a separate concurrency group,
 without cancelling code QA or selecting the expensive jobs. The cache includes compiler
-identity and the lockfile. Main publishes caches; PRs restore them. Conventions
-run in `check`. A lightweight `messages` job mirrors that result to preserve
-existing branch-protection check names, with no duplicate compilation.
+identity and the lockfile. QA and conventions share an archive namespace, while
+each runner keeps its own target directory. Main QA alone publishes caches;
+PR jobs only restore them. Cache hits and time savings require hosted evidence. Conventions
+run independently in `messages`, with its own PR concurrency group, so invalid
+metadata does not prevent code QA and an older code run cannot replay a stale
+metadata failure after a title fix. It reads the current title/body through
+the read-only repository API, while commit checks use the event's immutable
+base/head revisions. The small checker builds in parallel with
+QA; this duplicates that package's build to keep the two results independent.
+Edited events run only `messages`; the unrequested QA job uses a different
+check name so it does not replace the preceding code `check` result.
 The scoped `benchmark` job retains the fixed-input cloud/read comparison:
 separate baseline/candidate targets, exact read/tar/context equivalence, and
 CPU/RSS tables. Scoped jobs select the PR merge-base diff so a behind branch
