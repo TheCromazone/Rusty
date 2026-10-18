@@ -681,14 +681,48 @@ fn ssh_connection_failure_is_terminal_and_does_not_expose_stderr() {
     let initial = h.api.requests().len();
     let bin = h.tmp.path().join("ssh-bin");
     std::fs::create_dir(&bin).unwrap();
-    write_exec(&bin.join("ssh"), "#!/bin/sh\necho credential-canary >&2\nsleep 30 &\nexit 255\n");
+    // Natural completion is observable, so startup scheduling cannot be
+    // mistaken for pipe retention or successful descendant cleanup.
+    let held = bin.join("held");
+    let expired = bin.join("holder-expired");
+    write_exec(
+        &bin.join("ssh"),
+        &format!(
+            r#"#!/bin/sh
+echo credential-canary >&2
+python3 - <<'PYTHON' &
+import os, time
+held, expired = {}, {}
+with open(held + '.tmp', 'w') as output:
+    output.write(str(os.getpid()))
+os.replace(held + '.tmp', held)
+time.sleep(30)
+with open(expired, 'w') as output:
+    output.write('natural completion')
+PYTHON
+holder=$!
+attempts=0
+while [ ! -s '{}' ]; do
+    attempts=$((attempts + 1))
+    if ! kill -0 "$holder" 2>/dev/null || ! kill -0 {} 2>/dev/null || [ "$attempts" -ge 3000 ]; then
+        exit 254
+    fi
+    sleep 0.02
+done
+exit 255
+"#,
+            serde_json::to_string(&held).unwrap(),
+            serde_json::to_string(&expired).unwrap(),
+            held.display(),
+            std::process::id()
+        ),
+    );
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = calls.clone();
     let server = serve(Arc::new(move |_| {
         count.fetch_add(1, Ordering::SeqCst);
         Response::json(500, json!({}))
     }));
-    let started = Instant::now();
     let out = Command::new(CLOUD)
         .current_dir(&h.host)
         .env_clear()
@@ -713,7 +747,18 @@ fn ssh_connection_failure_is_terminal_and_does_not_expose_stderr() {
         ])
         .output()
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5), "an SSH descendant retained the output pipe");
+    let holder = std::fs::read_to_string(&held).expect("the SSH descendant never held the output pipes");
+    let holder: i32 = holder.parse().unwrap();
+    assert!(holder > 0);
+    support::sync::until("SSH holder terminal state", || {
+        if unsafe { libc::kill(holder, 0) } < 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        }
+        // A dead orphan may await the runner's reaper; it holds no pipes.
+        let state = Command::new("ps").args(["-p", &holder.to_string(), "-o", "stat="]).output().unwrap();
+        state.status.success() && String::from_utf8_lossy(&state.stdout).trim_start().starts_with('Z')
+    });
+    assert!(!expired.exists(), "the SSH descendant survived until natural completion");
     assert!(!out.status.success());
     assert!(!text(&out).contains("credential-canary"));
     assert!(text(&out).contains("no local fallback"));

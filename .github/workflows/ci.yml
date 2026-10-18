@@ -3,31 +3,78 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-    # edited: a fixed title or description is checked again without a push.
     types: [opened, synchronize, reopened, edited]
-
-concurrency:
-  # An edit must not cancel the code checks of the same push.
-  group: ci-${{ github.ref }}-${{ github.event.action == 'edited' && 'edited' || 'code' }}
-  cancel-in-progress: true
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Offline is free; live/cloud consume provider credits'
+        type: choice
+        options: [offline, perf, live, cloud, demo]
+        default: offline
+      runner:
+        description: 'Use macOS only when qualifying that platform'
+        type: choice
+        options: [ubuntu-latest, macos-latest]
+        default: ubuntu-latest
+      tasks:
+        description: 'Live evals: comma-separated names, multi, or empty for all'
+        default: verified-repair,py-pagination,rename-refactor
+      models:
+        description: 'Live eval model IDs (space-separated)'
+        default: nvidia/nemotron-3-super-120b-a12b
+      memory:
+        description: 'Live eval memory levels (space-separated)'
+        default: 'off'
+      repeats:
+        description: 'Live eval repeats per configuration (1–5)'
+        default: '1'
+      jobs:
+        description: 'Live eval tasks at once (1–8)'
+        type: number
+        default: 4
+      demo:
+        description: 'Demo suite: scene to record and commit as a README GIF (branch only)'
+        default: models
+      cloud_snapshot:
+        description: 'Cloud suite only: existing qualified Daytona snapshot'
+      cloud_ref:
+        description: 'Cloud suite only: immutable source commit in that snapshot'
 
 permissions:
   contents: read
+concurrency:
+  # Explicit paid runs are never cancelled by a later push; cancelling a
+  # cloud controller can strand compute. Metadata edits cannot cancel code QA.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.action == 'edited' && 'edited' || 'code' }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # Standard 2-vCPU hosted runners: the smallest GitHub offers.
   check:
-    if: github.event.action != 'edited'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    if: github.event.action != 'edited' && inputs.suite != 'demo'
+    name: ${{ github.event.action == 'edited' && 'qa-unrequested' || 'check' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    # Hosted run 39110575738 completed check in 309s; 15m leaves 591s headroom.
+    # Revisit against scale-1 timings and cache/toolchain changes.
+    timeout-minutes: ${{ inputs.suite == 'live' && 45 || inputs.suite == 'cloud' && 30 || 15 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PRs restore caches; main alone publishes them.
+          save-if: ${{ github.event_name == 'push' }}
+          shared-key: qa
+          key: qa-${{ hashFiles('Cargo.lock') }}
+      - name: Reset quality receipts
+        if: always()
+        shell: bash
+        run: rm -rf target/qa target/test-suite.json target/flaky.json
       - name: Query test prerequisite
+        if: github.event.action != 'edited'
         shell: bash
         run: |
           if ! command -v rg >/dev/null 2>&1; then
@@ -38,35 +85,346 @@ jobs:
             esac
           fi
           rg --version
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - name: memory hooks, real CLI and offline provider
+      - name: Offline quality
+        if: github.event.action != 'edited' && (inputs.suite == '' || inputs.suite == 'offline')
+        run: cargo xtask qa --full
+      - name: Performance qualification
+        if: github.event.action != 'edited' && inputs.suite == 'perf'
+        run: cargo xtask qa --perf
+      - name: Live model qualification
+        if: github.event.action != 'edited' && inputs.suite == 'live'
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_MODELS: ${{ inputs.models }}
+          EVAL_TASKS: ${{ inputs.tasks }}
+          EVAL_MEMORY: ${{ inputs.memory }}
+          EVAL_REPEATS: ${{ inputs.repeats }}
+          EVAL_JOBS: ${{ inputs.jobs }}
+          EVAL_TIMEOUT: '300'
+          RUSTY_MAX_REQUESTS: '50'
+          RUSTY_MAX_BUDGET_TOKENS: '2000000'
+          RUSTY_BUDGET_SECS: '300'
+        shell: bash
         run: |
-          cargo build --bins --locked
-          cargo xtask memory-smoke --report memory-offline.json
+          case "$EVAL_REPEATS" in [1-5]) ;; *) echo 'repeats must be 1–5' >&2; exit 1 ;; esac
+          case "$EVAL_JOBS" in [1-8]) ;; *) echo 'jobs must be 1–8' >&2; exit 1 ;; esac
+          cargo xtask qa --live
+      - name: Hosted cloud qualification
+        if: github.event.action != 'edited' && inputs.suite == 'cloud'
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          RUSTY_CLOUD_SNAPSHOT: ${{ inputs.cloud_snapshot }}
+          RUSTY_CLOUD_REF: ${{ inputs.cloud_ref }}
+        run: cargo xtask qa --cloud
+      - name: Summary
+        if: always() && github.event.action != 'edited'
+        shell: bash
+        run: |
+          if [[ -f target/qa/summary.md ]]; then
+            cat target/qa/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Quality gate did not finish; inspect the failed step.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Evidence
+        if: always() && github.event.action != 'edited'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-${{ runner.os }}-${{ github.run_attempt }}
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            target/test-suite.json
+            target/flaky.json
+            target/qa/summary.json
+            target/qa/summary.md
+            target/qa/memory*.json
+            target/qa/bench.json
+            target/qa/terminal/**/alignment.json
+            target/evals/*.jsonl
+            target/evals/*.md
 
+  # Validate metadata independently so a title fix cannot replay an older
+  # conventions failure when a long-running code QA job finishes later.
   messages:
+    name: messages
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: ci-messages-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --package xtask --locked
-      - name: PR title follows Conventional Commits
+        with:
+          save-if: false
+          shared-key: qa
+          key: qa-${{ hashFiles('Cargo.lock') }}
+      - name: Pull request conventions
         env:
-          TITLE: ${{ github.event.pull_request.title }}
-        run: printf '%s' "$TITLE" | cargo xtask check-message -
-      - name: PR description has no tool attribution
-        env:
-          BODY: ${{ github.event.pull_request.body }}
-        run: printf '%s' "$BODY" | cargo xtask check-body
-      - name: every commit follows Conventional Commits
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
         run: |
-          for sha in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
-            git log -1 --format=%B "$sha" | cargo xtask check-message - || { echo "in commit $sha"; exit 1; }
+          cargo build --package xtask --locked
+          metadata=$(mktemp "$RUNNER_TEMP/conventions.XXXXXX")
+          trap 'rm -f "$metadata"' EXIT
+          gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" > "$metadata"
+          jq -er '.title' "$metadata" | target/debug/xtask check-message -
+          jq -r '.body // ""' "$metadata" | target/debug/xtask check-body
+          git rev-list "$BASE..$HEAD" | while IFS= read -r sha; do
+            git log -1 --format=%B "$sha" | target/debug/xtask check-message -
           done
+
+  benchmark:
+    name: benchmark
+    if: github.event_name == 'pull_request' && github.event.action != 'edited'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: after
+          fetch-depth: 0
+      - name: Select fixed-input memory comparison
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if git -C after diff --quiet "$BASE...$HEAD" -- \
+            src/tools.rs src/cloud/image.rs src/cloud/digest.rs src/cloud/api.rs \
+            examples/cloud_perf.rs scripts/cloud-memory-bench.py \
+            .github/workflows/ci.yml; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No relevant changes; fixed-input memory comparison was not selected.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            diff_status=$?
+            test "$diff_status" -eq 1
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.scope.outputs.run == 'true'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: before
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.run == 'true'
+      - name: Build baseline and candidate in separate target directories
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          cp after/examples/cloud_perf.rs before/examples/cloud_perf.rs
+          (cd before && cargo build --release --locked --bin rusty --example cloud_perf)
+          (cd after && cargo build --release --locked --bin rusty --example cloud_perf)
+      - name: Measure fixed inputs and assert output equivalence
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          python3 after/scripts/cloud-memory-bench.py before before/target/release/rusty before/target/release/examples/cloud_perf
+          python3 after/scripts/cloud-memory-bench.py after after/target/release/rusty after/target/release/examples/cloud_perf
+          python3 - <<'PY'
+          import json, os
+          before=json.load(open('focused-before.json'))
+          after=json.load(open('focused-after.json'))
+          assert before['read_output_sha256']==after['read_output_sha256']
+          for key in ['context_hash', 'tar_bytes', 'tar_sha256']:
+              assert before['cloud_receipt'][key]==after['cloud_receipt'][key], key
+          rows=['| Workload | CPU ms before → after | Delta | Peak RSS MB before → after | Delta |', '|---|---:|---:|---:|---:|']
+          for name in ['read_64MiB', 'cloud_64MiB']:
+              a,b=before[name],after[name]
+              rows.append(f"| {name} | {a['cpu_ms']:.2f} → {b['cpu_ms']:.2f} | {(b['cpu_ms']/a['cpu_ms']-1)*100:+.1f}% | {a['rss_bytes']/1e6:.2f} → {b['rss_bytes']/1e6:.2f} | {(b['rss_bytes']/a['rss_bytes']-1)*100:+.1f}% |")
+          table='\n'.join(rows)+'\n'
+          open('comparison.md','w').write(table)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f: f.write(table)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.run == 'true'
+        with:
+          name: cloud-memory-comparison
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            focused-before.json
+            focused-after.json
+            comparison.md
+
+  openssh:
+    name: openssh
+    if: github.event_name == 'pull_request' && github.event.action != 'edited' && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select scoped transport/package gate
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if git diff --quiet "$BASE...$HEAD" -- 'src/cloud/' 'src/backend.rs' 'tests/cloud_hybrid.rs' '.github/workflows/ci.yml'; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            diff_status=$?
+            test "$diff_status" -eq 1
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.run == 'true'
+      - run: cargo build --bins --locked
+        if: steps.scope.outputs.run == 'true'
+      - name: Disposable SSH server with a strict four-connection startup limit
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+          sudo install target/debug/rusty /usr/local/bin/rusty
+          fixture="$RUNNER_TEMP/rusty-ssh"
+          mkdir -m 700 "$fixture" "$fixture/workspace"
+          ssh-keygen -q -t ed25519 -N '' -f "$fixture/identity"
+          ssh-keygen -q -t ed25519 -N '' -f "$fixture/host"
+          cp "$fixture/identity.pub" "$fixture/authorized_keys"
+          printf '[127.0.0.1]:2222 ' > "$fixture/known_hosts"
+          cat "$fixture/host.pub" >> "$fixture/known_hosts"
+          cat > "$fixture/server" <<CONFIG
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $fixture/host
+          PidFile $fixture/sshd.pid
+          AuthorizedKeysFile $fixture/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM yes
+          StrictModes no
+          MaxStartups 4:100:4
+          AllowUsers $(id -un)
+          CONFIG
+          cat > "$fixture/client" <<CONFIG
+          Host rusty-ci
+            HostName 127.0.0.1
+            Port 2222
+            User $(id -un)
+            IdentityFile $fixture/identity
+            IdentitiesOnly yes
+            UserKnownHostsFile $fixture/known_hosts
+            ControlMaster no
+          CONFIG
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -f "$fixture/server" -E "$fixture/server.log"
+          echo "RUSTY_TEST_SSH_CONFIG=$fixture/client" >> "$GITHUB_ENV"
+          echo "RUSTY_TEST_SSH_WORKSPACE=$fixture/workspace" >> "$GITHUB_ENV"
+          echo "RUSTY_TEST_SSH_AUTHORIZED_KEYS=$fixture/authorized_keys" >> "$GITHUB_ENV"
+      - name: Verify fixture authentication before testing the transport
+        if: steps.scope.outputs.run == 'true'
+        run: ssh -F "$RUSTY_TEST_SSH_CONFIG" -oBatchMode=yes -oStrictHostKeyChecking=yes rusty-ci true
+      - name: Real network concurrency, tools, timeout and revoked authentication
+        if: steps.scope.outputs.run == 'true'
+        run: cargo test --lib --locked cloud::ssh::tests::real_openssh_network -- --ignored --exact --nocapture
+      - name: Stop disposable server
+        if: always() && steps.scope.outputs.run == 'true'
+        run: |
+          fixture="$RUNNER_TEMP/rusty-ssh"
+          if test -f "$fixture/server.log"; then sudo cat "$fixture/server.log"; fi
+          if test -f "$fixture/sshd.pid"; then sudo kill "$(cat "$fixture/sshd.pid")"; fi
+          rm -f "$fixture/identity" "$fixture/host"
+
+  build:
+    name: build
+    if: github.event_name == 'pull_request' && github.event.action != 'edited' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'feat/ssh-execution-transport')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select scoped transport/package gate
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if git diff --quiet "$BASE...$HEAD" -- 'Dockerfile' 'Cargo.toml' 'Cargo.lock' 'src/' '.github/workflows/ci.yml'; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            diff_status=$?
+            test "$diff_status" -eq 1
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.scope.outputs.run == 'true'
+      - name: Build runtime and export binaries
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          docker buildx build --load -t rusty-ci .
+          docker buildx build --target bin --output type=local,dest=out .
+          for binary in rusty rusty-memoryd rusty-cloud; do test -x "out/$binary"; done
+          docker run --rm rusty-ci --version
+          docker run --rm --entrypoint rusty-cloud rusty-ci ssh --help
+          docker run --rm --entrypoint ssh rusty-ci -V
+      - name: Rebuild after a source change using compiler cache
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          printf '\n// Container cache verification.\n' >> src/lib.rs
+          docker buildx build --load -t rusty-ci .
+          docker run --rm rusty-ci --version
+
+  # A real session for the README, recorded with the repository's keys. The GIF
+  # is committed to the branch the run was started on (never main) for review.
+  demo:
+    if: github.event_name == 'workflow_dispatch' && inputs.suite == 'demo' && inputs.demo != '' && github.ref_name != 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: cargo build --release --workspace && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
+      - name: record
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SCENE: ${{ inputs.demo }}
+        run: |
+          mkdir -p out
+          work=$(mktemp -d) && cp -R demo/shop/. "$work"
+          # The recorder runs from the copy, outside the workspace, so call it by path.
+          (cd "$work" && RUSTY_BIN="$GITHUB_WORKSPACE/target/release/rusty" RUSTY_HOME="$(mktemp -d)" \
+            "$GITHUB_WORKSPACE/target/release/xtask" record "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
+          agg --theme monokai --speed 2 --idle-time-limit 2 "out/$SCENE.cast" "out/$SCENE.gif"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo
+          path: out/
+      - name: commit the GIF to the branch
+        env:
+          SCENE: ${{ inputs.demo }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          cp "out/$SCENE.gif" "docs/demo/$SCENE.gif"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "docs/demo/$SCENE.gif"
+          git commit -m "docs(demo): record the $SCENE scene"
+          git push origin "HEAD:$BRANCH"

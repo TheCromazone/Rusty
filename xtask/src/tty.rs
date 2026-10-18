@@ -329,9 +329,13 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
     let log = File::create(dest.join(format!("terminal-{cols}.ansi")))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
     if matches!(prompt, "aside-capture" | "side-capture" | "summary-capture") {
-        let end = Instant::now() + Duration::from_secs(5);
+        // Startup includes durable session creation. Wait for the actual tool
+        // witness within the same bounded deadline as other PTY readiness.
+        let end = Instant::now() + s.timeout;
         while !dest.join("main-started.txt").exists() && Instant::now() < end {
-            s.pump(Duration::from_millis(20))?;
+            if !s.pump(Duration::from_millis(20))? {
+                bail!("terminal closed before the main command started");
+            }
         }
         if !dest.join("main-started.txt").exists() {
             bail!("main command did not start");
@@ -529,6 +533,9 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd).arg("--yolo");
     if let Some((endpoint, home)) = endpoint {
+        // Memory lifecycle has its own tests; this terminal fixture must not
+        // autostart a service that intentionally outlives the CLI process.
+        cmd.args(["--memory", "off"]);
         offline(&mut cmd, endpoint, home);
     }
     let mut s = Session::spawn(cmd, 80, log, Duration::from_secs(90))?;
@@ -825,6 +832,13 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     )? {
         bail!("the ctrl-c capture was inconclusive");
     }
+    if args.iter().any(|a| a == "--all") {
+        for (name, check) in
+            [("owned", Check::Owned), ("aside", Check::Aside), ("side", Check::Side), ("summary", Check::Summary)]
+        {
+            run(&binary, &output.join(name), &[check], false)?;
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -921,6 +935,11 @@ fn lines_json(lines: &[String]) -> String {
 /// `last-screen.txt`.
 pub fn inspect(args: &[String]) -> Result<ExitCode> {
     let Some(root) = args.first().map(PathBuf::from) else { bail!("usage: cargo xtask tty-inspect DIR") };
+    if args.iter().any(|a| a == "--all") {
+        for name in ["owned", "aside", "side", "summary"] {
+            inspect(&[root.join(name).display().to_string()])?;
+        }
+    }
     let mut reports = Vec::new();
     let mut replays = Vec::new();
     for cols in WIDTHS {
