@@ -1,0 +1,3 @@
+{"future_optional_metadata":{"revision":2},"instance_id":"fixture-host-1","kind":"future.optional.notice","payload":{"diagnostic":true},"protocol":1,"seq":4}
+{"future_optional_metadata":null,"method":"approval.decide","params":{"allowed":false,"approval_id":"a","operation_digest":"d"},"protocol":1,"request_id":"optional-omitted"}
+{"method":"approval.decide","params":{"allowed":false,"approval_id":"a","operation_digest":"d","typed":null},"protocol":1,"request_id":"optional-null"}
