@@ -30,7 +30,8 @@
 //!
 //! A single-turn task may include verify.txt with a fixed acceptance command.
 //! It then runs with --goal and --verify; the independent check.sh still
-//! grades the actual result and stays outside the working copy.
+//! grades the actual result and stays outside the working copy. verify-files.txt
+//! optionally pins one workspace-relative acceptance file per line at startup.
 //! Each run gets a budget ledger (RUSTY_BUDGET_LEDGER) in its home. A
 //! timeout that spent at least half its wall time waiting on provider
 //! retries is scored infra, since it measures the provider, not the agent.
@@ -399,6 +400,16 @@ fn single_args<'a>(prompt: &'a str, check: Option<&'a str>) -> Vec<&'a str> {
     }
 }
 
+fn append_verify_files<'a>(args: &mut Vec<&'a str>, pins: &'a str, has_check: bool) -> Result<()> {
+    for path in pins.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        if !has_check {
+            bail!("verify-files.txt requires verify.txt");
+        }
+        args.extend(["--verify-file", path]);
+    }
+    Ok(())
+}
+
 /// Runs one rusty process with a hard time limit, appending to the home's
 /// stdout and stderr. Extra args pass through. Session `n` (from 1) writes its
 /// own trajectory, so a later session can't overwrite what an earlier one did.
@@ -672,7 +683,10 @@ fn score(cfg: &Config, task: &Task, run: &Run, work: &Path, home: &Path, jsonl: 
         if check.as_ref().is_some_and(|s| s.trim().is_empty()) {
             bail!("{}: verify.txt must contain a nonempty acceptance command", task.name);
         }
-        let args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
+        let pins_path = task.dir.join("verify-files.txt");
+        let pins = if pins_path.is_file() { std::fs::read_to_string(pins_path)? } else { String::new() };
+        let mut args = single_args(prompt.trim_end_matches('\n'), check.as_deref().map(str::trim));
+        append_verify_files(&mut args, &pins, check.is_some())?;
         if !holds_any(work, &secrets) {
             checked.push(1);
         }
@@ -1147,6 +1161,14 @@ mod tests {
     }
 
     #[test]
+    fn completion_contract_eval_pins_are_explicit_and_require_a_check() {
+        let mut args = single_args("repair", Some("python3 check.py"));
+        append_verify_files(&mut args, "check.py\ntests/helpers.py\n", true).unwrap();
+        assert_eq!(&args[4..], &["--verify-file", "check.py", "--verify-file", "tests/helpers.py"]);
+        assert!(append_verify_files(&mut vec![], "check.py", false).is_err());
+    }
+
+    #[test]
     fn task_selection() {
         assert!(selected("", "rust-slugify", false));
         assert!(selected("", "undo-one-step", true));
@@ -1179,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_pass_with_fatal_endpoint_error_is_preserved_as_infra() {
+    fn completion_contract_independent_pass_with_fatal_endpoint_error_is_preserved_as_infra() {
         use std::os::unix::fs::PermissionsExt;
         let root = temp_dir().unwrap();
         let taskdir = root.join("task");
@@ -1254,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn passing_patch_does_not_hide_unhealthy_execution() {
+    fn completion_contract_passing_patch_does_not_hide_unhealthy_execution() {
         let fatal = b"error: giving up after 4 attempts: HTTP 429 Too Many Requests";
         assert_eq!(verdict(&Exit::Done(false), true, b"", fatal), "infra");
         assert_eq!(verdict(&Exit::Done(false), true, b"", b"error: bad request"), "fail");

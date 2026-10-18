@@ -831,7 +831,7 @@ fn done_reply() -> serde_json::Value {
 }
 
 #[test]
-fn fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
+fn completion_contract_fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
     let s = Sandbox::new("fixed-goal-positive");
     seed_calc(&s);
     let (out, trace, requests) = verified_run(&s, FIXED_CHECK, vec![fix_calc(), done_reply()], "standard", "yolo");
@@ -900,7 +900,7 @@ fn memory_learns_only_from_a_goals_fixed_check() {
 }
 
 #[test]
-fn fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
+fn completion_contract_fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
     for case in ["unchecked", "failed", "stale"] {
         let s = Sandbox::new(&format!("fixed-goal-{case}"));
         seed_calc(&s);
@@ -925,7 +925,7 @@ fn fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
 }
 
 #[test]
-fn completion_is_checked_after_all_calls_in_the_same_reply() {
+fn completion_contract_completion_is_checked_after_all_calls_in_the_same_reply() {
     let s = Sandbox::new("fixed-goal-batch");
     seed_calc(&s);
     let mut batch = done_reply();
@@ -938,7 +938,7 @@ fn completion_is_checked_after_all_calls_in_the_same_reply() {
 }
 
 #[test]
-fn verification_cannot_change_its_inputs_and_then_pass() {
+fn completion_contract_verification_cannot_change_its_inputs_and_then_pass() {
     let s = Sandbox::new("fixed-goal-mutating-check");
     seed_calc(&s);
     let check="python3 -c 'from pathlib import Path; p=Path(\"calc.py\"); p.write_text(p.read_text().replace(\"a - b\",\"a + b\"))'";
@@ -950,7 +950,7 @@ fn verification_cannot_change_its_inputs_and_then_pass() {
 }
 
 #[test]
-fn fixed_verification_cannot_bypass_permissions() {
+fn completion_contract_fixed_verification_cannot_bypass_permissions() {
     let s = Sandbox::new("fixed-goal-denied");
     seed_calc(&s);
     let (out, trace, _) = verified_run(
@@ -967,7 +967,7 @@ fn fixed_verification_cannot_bypass_permissions() {
 }
 
 #[test]
-fn fixed_verification_is_bounded_and_does_not_accept_timeout() {
+fn completion_contract_fixed_verification_is_bounded_and_does_not_accept_timeout() {
     let s = Sandbox::new("fixed-goal-timeout");
     seed_calc(&s);
     let (out, trace, _) =
@@ -977,7 +977,7 @@ fn fixed_verification_is_bounded_and_does_not_accept_timeout() {
 }
 
 #[test]
-fn blocked_goals_skip_fixed_verification_and_review() {
+fn completion_contract_blocked_goals_skip_fixed_verification_and_review() {
     let s = Sandbox::new("fixed-goal-blocked");
     seed_calc(&s);
     let blocked = tool_reply("goal_done", serde_json::json!({"evidence":"need input","blocked":true}));
@@ -990,7 +990,7 @@ fn blocked_goals_skip_fixed_verification_and_review() {
 }
 
 #[test]
-fn fixed_verification_follows_the_careful_review_and_its_edits() {
+fn completion_contract_fixed_verification_follows_the_careful_review_and_its_edits() {
     let s = Sandbox::new("fixed-goal-review");
     seed_calc(&s);
     let (out, trace, requests) = verified_run(
@@ -1007,7 +1007,7 @@ fn fixed_verification_follows_the_careful_review_and_its_edits() {
 }
 
 #[test]
-fn fixed_verification_rejects_invalid_cli_settings() {
+fn completion_contract_fixed_verification_rejects_invalid_cli_settings() {
     let s = Sandbox::new("fixed-goal-flags");
     for args in [
         vec!["--verify", "true"],
@@ -1706,7 +1706,7 @@ fn careful_checks_once_per_goal_not_once_per_goal_turn() {
 }
 
 #[test]
-fn truncated_reply_after_the_check_leaves_the_goal_open() {
+fn truncated_reply_after_the_check_leaves_the_goal_open_completion_contract() {
     let s = Sandbox::new("careful-truncated");
     let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
     let mut truncated = text_reply("I'll fix the empty case by");
@@ -2821,7 +2821,7 @@ fn btw_receives_current_plan_after_main_history_is_compacted() {
 }
 
 #[test]
-fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review() {
+fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review_completion_contract() {
     for mode in ["standard", "careful"] {
         let s = Sandbox::new(&format!("owned-premature-{mode}"));
         let (out, trace, requests) = verified_run(
@@ -2925,7 +2925,7 @@ fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
 }
 
 #[test]
-fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error() {
+fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error_completion_contract() {
     // The M4 cohort's case: the work may be done, but the model never
     // proposes completion and three turns stall. That is exit 2 with a
     // trajectory, like any goal that did not close on a passing check.
@@ -3482,7 +3482,7 @@ fn root_budget_keeps_usage_unknown_when_the_stream_later_fails() {
 }
 
 #[test]
-fn root_budget_overrun_rejects_completion_and_stops_new_dispatch() {
+fn root_budget_overrun_rejects_completion_and_stops_new_dispatch_completion_contract() {
     let s = Sandbox::new("budget-overrun");
     let mut done = tool_reply("goal_done", serde_json::json!({"evidence":"checked"}));
     done["usage"] = serde_json::json!({"prompt_tokens":5_000_000,"completion_tokens":1});
@@ -5666,4 +5666,197 @@ fn concurrent_mcp_configuration_adds_preserve_every_server_across_profiles() {
         assert_eq!(servers[&format!("server{n}")]["command"], "/bin/true");
     }
     assert!(!s.project.join(".mcp.json.pending").exists());
+}
+
+// Scripted model replies exercise the real CLI and shell without provider spend.
+fn pinned_completion(case: &str, replies: Vec<serde_json::Value>) -> (Output, serde_json::Value) {
+    let s = Sandbox::new(&format!("pinned-{case}"));
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (url, server) = scripted_endpoint(replies);
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc.py",
+                "--verify",
+                "python3 check.py",
+                "--verify-file",
+                "check.py",
+                "--stats",
+                "--trajectory",
+            ])
+            .arg(s.home.join("trace.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(15),
+    );
+    let trace = serde_json::from_str(&std::fs::read_to_string(s.home.join("trace.json")).unwrap()).unwrap();
+    server.join().unwrap();
+    (out, trace)
+}
+
+#[test]
+fn completion_contract_pinned_checker_accepts_repair() {
+    let (out, trace) = pinned_completion("repair", vec![fix_calc(), done_reply()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+}
+
+#[test]
+fn completion_contract_pinned_checker_rejects_tampering() {
+    for (case, command) in [
+        ("overwrite", "printf 'pass\\n' > check.py"),
+        ("delete", "rm check.py"),
+        ("symlink", "mv check.py original.py; ln -s original.py check.py"),
+    ] {
+        let (out, trace) = pinned_completion(case, vec![bash_reply(command), done_reply(), text_reply("unresolved")]);
+        assert_eq!(out.status.code(), Some(2), "{case}");
+        assert_eq!(trace["claims"]["accepted"], 0, "{case}: {trace}");
+        assert_eq!(trace["claims"]["check_error"], 1, "{case}: {trace}");
+        assert!(trace["messages"].to_string().contains("pinned verification"), "{trace}");
+    }
+}
+
+#[test]
+fn completion_contract_pinned_checker_can_be_restored_then_rechecked() {
+    let (out, trace) = pinned_completion(
+        "restore",
+        vec![
+            bash_reply("cp check.py original.py; printf 'pass\\n' > check.py"),
+            done_reply(),
+            bash_reply("cp original.py check.py"),
+            fix_calc(),
+            done_reply(),
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(trace["claims"]["check_error"], 1);
+    assert_eq!(trace["claims"]["accepted"], 1);
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+}
+
+#[test]
+fn completion_contract_unpinned_checker_is_not_independent_proof() {
+    let s = Sandbox::new("unpinned-check-control");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (out, trace, _) = verified_run(
+        &s,
+        "python3 check.py",
+        vec![bash_reply("printf 'pass\\n' > check.py"), done_reply()],
+        "standard",
+        "yolo",
+    );
+    assert!(out.status.success());
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    let independent = Command::new("python3")
+        .current_dir(&s.project)
+        .args(["-B", "-c", "from calc import add; assert add(2, 3) == 5"])
+        .output()
+        .unwrap();
+    assert!(!independent.status.success(), "the unchanged broken implementation must fail independent grading");
+}
+
+#[test]
+fn completion_contract_pagination_grader_rejects_plausible_wrong_repairs() {
+    let s = Sandbox::new("pagination-grader");
+    let task = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/verified-pagination");
+    let oracle = "def collect(fetch, start=None):\n    items = []\n    seen = set()\n    cursor = start\n    while True:\n        if cursor in seen:\n            raise ValueError('cycle')\n        seen.add(cursor)\n        page = fetch(cursor)\n        items.extend(page['items'])\n        cursor = page['next']\n        if cursor is None:\n            return items\n";
+    let original = std::fs::read_to_string(task.join("files/pagination.py")).unwrap();
+    for (name, body, passes) in [
+        ("original", original, false),
+        ("oracle", oracle.to_string(), true),
+        ("partial", oracle.replace("raise ValueError('cycle')", "return items"), false),
+        ("duplicates", oracle.replace("return items", "return list(dict.fromkeys(items))"), false),
+        ("ignores-start", oracle.replace("cursor = start", "cursor = None"), false),
+    ] {
+        std::fs::write(s.project.join("pagination.py"), body).unwrap();
+        let out =
+            Command::new("python3").arg("-B").arg(task.join("hidden.py")).current_dir(&s.project).output().unwrap();
+        assert_eq!(out.status.success(), passes, "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn completion_contract_pinned_checker_survives_real_session_resume() {
+    let s = Sandbox::new("pinned-resume");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (url, server) =
+        scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"blocked":true,"evidence":"need input"}))]);
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc.py",
+                "--verify",
+                "python3 -B check.py",
+                "--verify-file",
+                "check.py",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(20),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    server.join().unwrap();
+    std::fs::write(s.project.join("check.py"), "pass\n").unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("unresolved")]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args([
+            "--mode",
+            "standard",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--yolo",
+            "--continue",
+            "--stats",
+            "--trajectory",
+        ])
+        .arg(s.home.join("resumed.json"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    server.join().unwrap();
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("resumed.json")).unwrap()).unwrap();
+    assert_eq!(trace["claims"]["accepted"], 0);
+    assert_eq!(trace["claims"]["check_error"], 1);
+    assert!(trace["messages"].to_string().contains("pinned verification file changed"));
+    assert_eq!(trace["goal"]["status"], "Active");
 }

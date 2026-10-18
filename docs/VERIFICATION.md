@@ -6,6 +6,7 @@ boundary. It is opt-in, local-only, and deliberately small:
 ```sh
 rusty --goal 'repair the pagination boundaries' \
   --verify 'python3 -m pytest tests/test_pages.py' \
+  --verify-file tests/test_pages.py \
   --verify-timeout 120 --mode standard
 ```
 
@@ -24,6 +25,22 @@ reviewer prose are not used as acceptance receipts. Every proposal is checked
 afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
+
+`--verify-file PATH` pins an explicitly selected acceptance file before the
+first model request. Repeat it for the test runner, its helpers, and any fixed
+fixtures that must not change. Paths are relative to the workspace; traversal,
+symlink components, missing files and non-files are rejected. Each file is
+bounded to 128 MiB. Contents, file mode and workspace identity must match at
+completion, both before and after the check. A changed or missing pin rejects
+the claim (`claims.check_error`) without running the altered checker. Restoring
+the original files allows a fresh attempt. Pins survive session saves without
+being refreshed from changed files on resume. Legacy sessions without pins keep
+their previous behavior. Check records include `criterion_sha256`, binding the
+command, deadline and pinned-file digests as well as the workspace fingerprints.
+
+Pin only acceptance inputs that must remain fixed: application source is
+expected to change. Imported helpers and configuration are not discovered
+automatically; name them explicitly when they belong to the fixed criterion.
 
 `--stats` and the trajectory count what happened to each claim in `claims`:
 
@@ -106,15 +123,55 @@ neither, so it claims less.
   host, with the same network and credentials. Anything a command started
   outside its process group, or changed remotely, stays.
 - **Local verification is mutable.** `--verify` runs in the workspace the
-  agent can write. The input fingerprint only catches files that change
-  while the check runs. Before proposing completion, the agent can change
-  what the check reads, or the check's own files. The check also says
+  agent can write. The input fingerprint catches files that change while the
+  check runs; `--verify-file` additionally detects changes to selected acceptance
+  files since startup. Unpinned imports, dependencies, generated directories,
+  external services and same-user races remain outside that guarantee. Pins
+  are a correctness guard, not process isolation or a sandbox. The check says
   nothing about deployed state. An independent grader outside the workspace
   is still required.
 - **The record is the agent's own.** The trajectory, `--stats` and the infra
   audit log are written by the Rusty process, so they show what Rusty
   observed. They are not proof of what happened, and anything running as
   the same user can modify them.
+
+## Completion development suite
+
+```sh
+cargo xtask eval-completion
+```
+
+This offline suite drives the real CLI with scripted model responses and runs
+real edits and acceptance commands. It covers correct repairs, fabricated and
+stale evidence, edits after a completion claim, reviewer repairs, mutable checks,
+timeouts, permissions, blocked goals, outstanding commands, truncated responses,
+stalls and model-budget overruns. Pin-specific cases cover checker replacement,
+deletion, symlinks, restoration, modes, path escapes and serialized pin reuse.
+An unpinned control deliberately accepts a tampered checker while an independent
+grade rejects the unchanged broken code. Scoring counterexamples keep a correct
+patch with a fatal endpoint failure out of the healthy pass cohort. These tests
+also run in `cargo xtask qa` and existing CI via `cargo test --workspace`.
+
+Single-turn evals can add `verify-files.txt`, one workspace-relative pin per
+line, alongside `verify.txt`. `verified-index` and `verified-invoice` pin their
+public checkers. `verified-pagination` adds a repair with empty pages, duplicate
+items, custom starting cursors, cycles and exception propagation. Its hidden
+grader stays outside `files/`; an oracle and plausible wrong repairs qualify the
+grader offline. Public checks are intentionally incomplete, so passing runtime
+acceptance is still distinct from independent correctness.
+
+For an explicitly authorized provider run, use the normal bounded eval harness:
+
+```sh
+RUSTY_MAX_REQUESTS=20 RUSTY_MAX_BUDGET_TOKENS=200000 RUSTY_BUDGET_SECS=120 \
+  EVAL_REPEATS=1 EVAL_JOBS=1 EVAL_TIMEOUT=125 EVAL_MEMORY=off \
+  cargo xtask eval verified-pagination,verified-index,verified-invoice
+```
+
+The offline suite qualifies runtime behavior and grader sensitivity; it does not
+measure model repair quality or establish a speedup. These are development tasks,
+and adding pins changes their experimental conditions. Freeze the source revision
+and use new held-out tasks for performance claims.
 
 ## Benchmark-motivated changes
 
@@ -1070,6 +1127,8 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   else saved settings, else 128k. Pin `--context-tokens` to keep that GET
   off the gateway and the window fixed. The reporting pin assumes 128k and
   estimates fill from characters.
+- **`--verify-file`** (contract 3) pins repeatable workspace-relative acceptance files
+  and requires `--verify`. Capabilities expose `verify.files_flag`.
 - **`--verify`** is optional. Without it, the goal closes on the model's word,
   and exit status 2 means only that the goal stalled.
 - **MCP.** Servers come from `.mcp.json` in the project, or from

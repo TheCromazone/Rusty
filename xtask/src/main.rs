@@ -5,6 +5,7 @@
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
 //!     cargo xtask eval [TASKS]         run the evals against a live model (see eval.rs)
+//!     cargo xtask eval-completion     offline completion contracts and grader counterexamples
 //!     cargo xtask eval-report FILE...  summarise eval runs from target/evals/*.jsonl
 //!     cargo xtask memory-smoke [--live] [--binary PATH] [--report PATH]
 //!                                      memory hooks through the real CLI
@@ -63,6 +64,10 @@ fn run(args: &[String]) -> Result<ExitCode> {
         }
         Some("install-hooks") => install_hooks().map(|()| ExitCode::SUCCESS),
         Some("eval") => eval::run(rest.first().map_or("", String::as_str)).map(passed),
+        Some("eval-completion") => {
+            sh("cargo", &["test", "--workspace", "completion_contract", "--", "--nocapture"])?;
+            Ok(ExitCode::SUCCESS)
+        }
         Some("eval-report") => report::run(rest).map(passed),
         Some("memory-smoke") => memory::smoke_command(rest),
         Some("memory-bench") => memory::bench_command(rest),
@@ -75,7 +80,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         _ => {
             eprintln!(
                 "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks\n    \
-                 | eval [TASKS] | eval-report FILE.jsonl...\n    \
+                 | eval [TASKS] | eval-completion | eval-report FILE.jsonl...\n    \
                  | memory-smoke [...] | memory-bench [...] | memory-summary FILE\n    \
                  | tty [ctrl-c|approval|steady]... [--binary PATH] [--live]\n    \
                  | tty-capture --binary PATH --output DIR | tty-inspect DIR\n    \
