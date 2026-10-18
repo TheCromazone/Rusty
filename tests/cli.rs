@@ -5197,6 +5197,31 @@ fn a_file_missing_now_or_at_startup_is_never_reported_unchanged() {
 }
 
 #[test]
+fn a_compaction_forgets_which_files_were_read() {
+    let s = Sandbox::new("compact-reads");
+    std::fs::write(s.project.join("a.txt"), "one\n").unwrap();
+    let call = |name: &str, args: serde_json::Value| reported(tool_reply(name, args), 50_000);
+    let (_, requests) = smart_run(
+        &s,
+        vec![
+            call("read_file", serde_json::json!({"path": "a.txt"})),
+            call("bash", serde_json::json!({"command": "echo 1"})),
+            call("bash", serde_json::json!({"command": "echo 2"})),
+            reported(bash_reply("echo x"), 55_000),
+            reported(bash_reply("echo y"), 58_000),
+            reported(tool_reply("compact", serde_json::json!({"reason": "the reading is done"})), 60_000),
+            text_reply("1. Task: go."),
+            tool_reply("edit_file", serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "two"})),
+            text_reply("done"),
+        ],
+    );
+    let after = requests.last().unwrap()["messages"].to_string();
+    assert!(after.contains("[Summary of the conversation so far]"), "a compaction ran: {after}");
+    assert!(after.contains("a.txt has not been read yet"), "{after}");
+    assert_eq!(std::fs::read_to_string(s.project.join("a.txt")).unwrap(), "one\n");
+}
+
+#[test]
 fn smart_compaction_measures_fullness_against_the_history_cap() {
     // A 1M window caps history at 128k, so 125k is near the summary point,
     // not 13% full: the model's own compaction must be possible.

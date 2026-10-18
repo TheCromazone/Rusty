@@ -663,6 +663,7 @@ impl Agent {
         self.archived = Vec::new();
         self.history = Vec::new();
         self.session_from = 0;
+        self.read_versions.clear();
         Ok(())
     }
 
@@ -3006,6 +3007,8 @@ impl Agent {
         block.push_str(&format!("{}\n{carried}", context::USER_MESSAGES_HEADER));
         self.archived.append(&mut self.history);
         self.history = vec![json!({"role": "user", "content": block})];
+        // What the model read went with the summarised turns.
+        self.read_versions.clear();
         self.meter.forget_last();
         // Keep user/assistant alternation when the kept tail starts with a user turn.
         if tail.first().is_some_and(|m| m["role"] == "user") {
@@ -3806,6 +3809,21 @@ mod read_first_tests {
         // Without a deny the read check still comes before any prompt.
         let ask = run(&mut agent(dir.clone(), Mode::Ask), "edit_file", edit("five", "six"));
         assert_eq!(ask.refusal, Some(RefusalKind::ReadFirst), "{}", ask.text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_the_conversation_forgets_what_was_read() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let path = file.display().to_string();
+        let mut a = agent(dir.clone(), Mode::Yolo);
+        run(&mut a, "read_file", json!({"path": path}));
+        a.clear().unwrap();
+        let result = run(&mut a, "edit_file", json!({"path": path, "old_string": "one", "new_string": "two"}));
+        assert!(result.text.contains("has not been read yet"), "{}", result.text);
         let _ = std::fs::remove_dir_all(dir);
     }
 
