@@ -1,6 +1,8 @@
 //! Shared redaction and private persistence for the CLI and memory service.
 // ------------------------------------------------------------- redaction
 
+use std::borrow::Cow;
+
 /// A key whose value is a secret when it ends with one of these.
 const SECRET_KEYS: &[&str] = &[
     "password",
@@ -59,6 +61,18 @@ const SECRET_PREFIXES: &[&str] = &[
     "eyJ",
 ];
 
+/// The last letters of [`SECRET_KEYS`].
+const KEY_ENDS: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < SECRET_KEYS.len() {
+        let key = SECRET_KEYS[i].as_bytes();
+        t[key[key.len() - 1] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
 const REDACTED: &str = "[redacted]";
 
 /// Replaces secrets in tool output with `[redacted]` and counts them.
@@ -75,17 +89,106 @@ pub fn redact(text: &str) -> (String, usize) {
 /// secret it fetched without ever reading it. Values already handed out are
 /// replaced wherever they show up again, even without a secret-looking key.
 pub fn redact_with_handles(text: &str) -> (String, usize) {
-    let known: Vec<String> = vault().clone();
-    let mut text = text.to_string();
-    let mut count = 0;
-    for (i, value) in known.iter().enumerate() {
-        if value.chars().count() >= MIN_RECALL && text.contains(value.as_str()) {
-            count += text.matches(value.as_str()).count();
-            text = text.replace(value.as_str(), &handle_name(i));
-        }
-    }
+    // The lock is let go before redaction hands out new handles.
+    let (text, count) = recall_known(&vault(), text);
     let (out, n) = redact_by(&text, &mut handle);
     (out, n + count)
+}
+
+/// Puts each handed-out value's handle wherever the value shows up, with
+/// the answer of replacing one value after another in handle order, but in
+/// one scan and one copy. Usually nothing matches and nothing is copied.
+fn recall_known<'a>(known: &[String], text: &'a str) -> (Cow<'a, str>, usize) {
+    let long = |v: &str| v.chars().count() >= MIN_RECALL;
+    // Replacing one value creates another only where that one overlaps the
+    // inserted `${RUSTY_SECRET_n}`, which needs a `$` or `}` or only the
+    // handle's own letters. Such a vault gets each value replaced in turn.
+    let joins_handle = |v: &str| v.contains(['$', '}']) || v.bytes().all(|b| b"RUSTYEC_0123456789".contains(&b));
+    if known.iter().any(|v| long(v) && joins_handle(v)) {
+        let mut text = Cow::Borrowed(text);
+        let mut count = 0;
+        for (i, value) in known.iter().enumerate().filter(|(_, v)| long(v)) {
+            if let Some((replaced, n)) = replace_counted(&text, value, &handle_name(i)) {
+                text = Cow::Owned(replaced);
+                count += n;
+            }
+        }
+        return (text, count);
+    }
+    let mut found = occurrences(known, text, long);
+    if found.is_empty() {
+        return (Cow::Borrowed(text), 0);
+    }
+    // Otherwise a value's matches after the earlier ones were replaced are
+    // its leftmost non-overlapping occurrences in the original text that no
+    // earlier value's match covers: take them in handle order, then position.
+    found.sort_unstable();
+    let mut taken: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
+    for (value, at) in found {
+        let end = at + known[value].len();
+        if taken.range(..end).next_back().is_some_and(|(_, (e, _))| *e > at) {
+            continue;
+        }
+        taken.insert(at, (end, value));
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (at, (end, value)) in &taken {
+        out.push_str(&text[copied..*at]);
+        out.push_str(&handle_name(*value));
+        copied = *end;
+    }
+    out.push_str(&text[copied..]);
+    (Cow::Owned(out), taken.len())
+}
+
+/// Every place one of the `wanted` needles starts in `hay`, as (needle,
+/// position), overlaps included, in one pass: a bitmap of the needles'
+/// first two bytes skips every position none of them starts at.
+fn occurrences(needles: &[String], hay: &str, wanted: impl Fn(&str) -> bool) -> Vec<(usize, usize)> {
+    let pair = |b: &[u8]| usize::from(b[0]) << 8 | usize::from(b[1]);
+    let mut starts: Vec<(usize, usize)> = needles
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.len() >= 2 && wanted(n))
+        .map(|(i, n)| (pair(n.as_bytes()), i))
+        .collect();
+    starts.sort_unstable();
+    let mut bits = vec![0u64; 1 << 10];
+    for (p, _) in &starts {
+        bits[p >> 6] |= 1 << (p & 63);
+    }
+    let mut found = Vec::new();
+    let hay = hay.as_bytes();
+    for i in 0..hay.len().saturating_sub(1) {
+        let p = pair(&hay[i..]);
+        if bits[p >> 6] >> (p & 63) & 1 == 0 {
+            continue;
+        }
+        let from = starts.partition_point(|(q, _)| *q < p);
+        for &(_, j) in starts[from..].iter().take_while(|(q, _)| *q == p) {
+            if hay[i..].starts_with(needles[j].as_bytes()) {
+                found.push((j, i));
+            }
+        }
+    }
+    found
+}
+
+/// `hay` with every `pat` replaced, and how many there were, or `None` when
+/// there are none. One scan, where `contains`, `matches` and `replace` took three.
+fn replace_counted(hay: &str, pat: &str, with: &str) -> Option<(String, usize)> {
+    let mut matches = hay.match_indices(pat).peekable();
+    matches.peek()?;
+    let (mut out, mut last, mut n) = (String::with_capacity(hay.len()), 0, 0);
+    for (i, _) in matches {
+        out.push_str(&hay[last..i]);
+        out.push_str(with);
+        last = i + pat.len();
+        n += 1;
+    }
+    out.push_str(&hay[last..]);
+    Some((out, n))
 }
 
 /// Redacts one tool's output for the model. A secret store hands back its
@@ -164,7 +267,14 @@ fn handle(value: &str) -> String {
 }
 
 fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
-    let mut lines: Vec<String> = Vec::new();
+    // Lines go straight into one buffer, joined by `\n` as `lines()` split them.
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut started = false;
+    let mut next_line = |out: &mut String| {
+        if std::mem::replace(&mut started, true) {
+            out.push('\n');
+        }
+    };
     let mut count = 0;
     let mut in_pem = false;
     let mut in_secret_data = false;
@@ -177,16 +287,18 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
         if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
             in_pem = true;
             count += 1;
-            lines.push("[redacted private key]".into());
+            next_line(&mut out);
+            out.push_str("[redacted private key]");
             continue;
         }
-        let trimmed = line.trim_start();
         if is_secret_object {
             // Values under `data:` / `stringData:` until the block dedents.
+            let trimmed = line.trim_start();
             let indent = line.len() - trimmed.len();
             if matches!(trimmed.trim_end_matches(" {"), "data:" | "stringData:" | "\"data\":" | "\"stringData\":") {
                 in_secret_data = true;
-                lines.push(line.into());
+                next_line(&mut out);
+                out.push_str(line);
                 continue;
             }
             if in_secret_data && (indent == 0 || trimmed.starts_with('}')) {
@@ -202,16 +314,15 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
                     let quoted = v.len() >= 2 && v.starts_with('"') && v.ends_with('"');
                     let v = if quoted { &v[1..v.len() - 1] } else { v };
                     let q = if quoted { "\"" } else { "" };
-                    lines.push(format!("{}{k} {q}{}{q}{tail}", &line[..indent], mark(v)));
+                    next_line(&mut out);
+                    out.push_str(&format!("{}{k} {q}{}{q}{tail}", &line[..indent], mark(v)));
                     continue;
                 }
             }
         }
-        let (redacted, n) = redact_line(line, mark);
-        count += n;
-        lines.push(redacted);
+        next_line(&mut out);
+        count += redact_line(line, mark, &mut out);
     }
-    let mut out = lines.join("\n");
     if text.ends_with('\n') {
         out.push('\n');
     }
@@ -226,9 +337,9 @@ fn redact_by(text: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize
             })
             .collect()
     }) {
-        if out.contains(secret) {
-            count += out.matches(secret).count();
-            out = out.replace(secret, REDACTED);
+        if let Some((replaced, n)) = replace_counted(&out, secret, REDACTED) {
+            out = replaced;
+            count += n;
         }
     }
     (out, count)
@@ -308,18 +419,19 @@ enum Expect {
     Flag,
 }
 
-fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
+/// Redacts one line onto `out`, returning how many secrets it hid. Scans
+/// bytes: every token character is ASCII, so a token never splits a char.
+fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String, out: &mut String) -> usize {
     let (line, mut count) = redact_urls(line, mark);
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line.as_str();
+    let line: &str = &line;
+    let bytes = line.as_bytes();
+    let mut pos = 0;
     let mut expect: Option<Expect> = None;
     let mut key = "";
-    while !rest.is_empty() {
-        let start = rest.find(is_token_char).unwrap_or(rest.len());
-        let (sep, after) = rest.split_at(start);
-        let end = after.find(|c| !is_token_char(c)).unwrap_or(after.len());
-        let (token, after) = after.split_at(end);
-        rest = after;
+    while pos < line.len() {
+        let start = bytes[pos..].iter().position(|&b| TOKEN[usize::from(b)]).map_or(line.len(), |i| pos + i);
+        let end = bytes[start..].iter().position(|&b| !TOKEN[usize::from(b)]).map_or(line.len(), |i| start + i);
+        let (sep, token, rest) = (&line[pos..start], &line[start..end], &line[end..]);
         out.push_str(sep);
         if token.is_empty() {
             break;
@@ -331,20 +443,19 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             Some(Expect::Flag) => is_assignment(sep) || (!sep.is_empty() && sep.trim().is_empty()),
             None => false,
         };
-        let prefix_len = line.len() - rest.len() - token.len() - sep.len();
-        if (wanted && secret_value(token) && !code_expression(key, sep, token, rest, &line[..prefix_len]))
-            || secret_shape(token)
+        if secret_shape(token)
+            || (wanted && secret_value(token) && !code_expression(key, sep, token, rest, &line[..pos]))
         {
             let padded = rest.trim_start_matches('='); // base64 padding
-            let value = &line[line.len() - rest.len() - token.len()..line.len() - padded.len()];
-            out.push_str(&mark(value));
+            pos = line.len() - padded.len();
+            out.push_str(&mark(&line[start..pos]));
             count += 1;
-            rest = padded;
             continue;
         }
         out.push_str(token);
         key = token;
-        expect = if matches!(token.to_ascii_lowercase().as_str(), "bearer" | "basic") {
+        pos = end;
+        expect = if token.eq_ignore_ascii_case("bearer") || token.eq_ignore_ascii_case("basic") {
             Some(Expect::Header)
         } else if secret_key(token) {
             Some(if token.starts_with("--") { Expect::Flag } else { Expect::Key })
@@ -352,7 +463,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
             None
         };
     }
-    (out, count)
+    count
 }
 
 /// `token = self.token.clone()`, `self.api_key = api_key`, `access_token: String,`:
@@ -360,7 +471,7 @@ fn redact_line(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usi
 /// the key's own name again is source code, not a secret. Anything else
 /// counts, including `{password: …}` in a YAML map, `$(mysql --password=…)` and
 /// `password: SecretValue,`: a capitalised word is not proof of a type.
-fn code_expression(key: &str, sep: &str, value: &str, rest: &str, prefix: &str) -> bool {
+fn code_expression<'a>(key: &'a str, sep: &str, value: &'a str, rest: &str, prefix: &str) -> bool {
     if sep.ends_with(['"', '\'']) {
         return false;
     }
@@ -370,14 +481,18 @@ fn code_expression(key: &str, sep: &str, value: &str, rest: &str, prefix: &str) 
     if sep.starts_with(['"', '\'']) && prefix.contains("json!(") {
         return true;
     }
-    let name = |s: &str| s.rsplit('.').next().unwrap_or("").replace(['_', '-'], "").to_ascii_lowercase();
+    // The last path segment, lowercased, without `_` or `-`.
+    let name = |s: &'a str| {
+        let last = s.rsplit('.').next().unwrap_or("");
+        last.bytes().filter(|b| !matches!(b, b'_' | b'-')).map(|b| b.to_ascii_lowercase())
+    };
     let after = rest.trim_start();
     let typed_field = sep.trim_end().ends_with(':')
         && is_common_type(value)
         && (after.is_empty() || after.starts_with([',', ';', ')', '=', '>']));
     rest.starts_with(['(', '[', '<'])
         || rest.starts_with("::")
-        || name(value) == name(key.trim_start_matches('-'))
+        || name(value).eq(name(key.trim_start_matches('-')))
         || typed_field
 }
 
@@ -418,34 +533,54 @@ fn is_common_type(token: &str) -> bool {
     )
 }
 
-fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '@' | '~' | '%')
-}
+/// The bytes a token is made of, all ASCII.
+const TOKEN: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        let c = b as u8;
+        t[b] = c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+' | b'/' | b'@' | b'~' | b'%');
+        b += 1;
+    }
+    t
+};
 
 /// `=`, `: `, `": "` and the like, ignoring quotes and spaces. A bare colon
 /// joins a namespaced name (`secret:access`, `token:read`), not a value.
 fn is_assignment(sep: &str) -> bool {
-    let core: String = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\'')).collect();
-    core == "=" || (core == ":" && sep != ":")
+    let mut core = sep.chars().filter(|c| !c.is_whitespace() && !matches!(c, '"' | '\''));
+    match (core.next(), core.next()) {
+        (Some('='), None) => true,
+        (Some(':'), None) => sep != ":",
+        _ => false,
+    }
 }
 
 fn secret_key(key: &str) -> bool {
-    let k = key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_').to_ascii_lowercase();
-    // The shell's working-directory variables end in "pwd" but hold paths.
-    if matches!(k.as_str(), "pwd" | "oldpwd") {
+    let k = key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_').as_bytes();
+    // Most words are rejected on their last letter alone.
+    if !k.last().is_some_and(|b| KEY_ENDS[usize::from(b.to_ascii_lowercase())]) {
         return false;
     }
-    SECRET_KEYS.iter().any(|s| k.ends_with(s))
+    // The shell's working-directory variables end in "pwd" but hold paths.
+    if k.eq_ignore_ascii_case(b"pwd") || k.eq_ignore_ascii_case(b"oldpwd") {
+        return false;
+    }
+    SECRET_KEYS.iter().any(|s| k.len() >= s.len() && k[k.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()))
 }
 
 /// Short values and placeholders are not secrets. `${VAR}` and `<value>`
 /// never reach here: `$` and `<` are not token characters, so the
 /// assignment check fails on them.
 fn secret_value(v: &str) -> bool {
-    !v.is_empty() && !matches!(v.to_ascii_lowercase().as_str(), "null" | "none" | "true" | "false" | "changeme")
+    !v.is_empty() && !["null", "none", "true", "false", "changeme"].iter().any(|p| v.eq_ignore_ascii_case(p))
 }
 
 fn secret_shape(token: &str) -> bool {
+    // Every shape below needs a prefix and at least twelve more characters.
+    if token.len() < 15 {
+        return false;
+    }
     if token.starts_with("eyJ") {
         // A JWT: three base64url parts.
         return token.split('.').count() == 3 && token.len() > 30;
@@ -454,28 +589,35 @@ fn secret_shape(token: &str) -> bool {
 }
 
 /// `scheme://user:pass@host` anywhere in the line → `scheme://user:[redacted]@host`.
-fn redact_urls(line: &str, mark: &mut dyn FnMut(&str) -> String) -> (String, usize) {
-    let mut out = String::with_capacity(line.len());
+fn redact_urls<'a>(line: &'a str, mark: &mut dyn FnMut(&str) -> String) -> (Cow<'a, str>, usize) {
+    // Nothing is copied until a URL actually has a password in it.
+    let mut out = String::new();
+    let mut copied = 0;
     let mut count = 0;
     let mut rest = line;
     while let Some(i) = rest.find("://") {
-        let scheme_start = rest[..i].rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+').map_or(0, |j| j + 1);
+        // Step past the whole character before the scheme: `é://` is not `\xa9://`.
+        let scheme_start = rest[..i]
+            .char_indices()
+            .rfind(|(_, c)| !c.is_ascii_alphanumeric() && *c != '+')
+            .map_or(0, |(j, c)| j + c.len_utf8());
         let url_end = rest[i..]
             .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .map_or(rest.len(), |e| i + e);
-        let url = &rest[scheme_start..url_end];
-        out.push_str(&rest[..scheme_start]);
-        match redact_url(url, mark) {
-            Some(redone) => {
-                out.push_str(&redone);
-                count += 1;
-            }
-            None => out.push_str(url),
+        if let Some(redone) = redact_url(&rest[scheme_start..url_end], mark) {
+            let at = line.len() - rest.len();
+            out.push_str(&line[copied..at + scheme_start]);
+            out.push_str(&redone);
+            copied = at + url_end;
+            count += 1;
         }
         rest = &rest[url_end..];
     }
-    out.push_str(rest);
-    (out, count)
+    if count == 0 {
+        return (Cow::Borrowed(line), 0);
+    }
+    out.push_str(&line[copied..]);
+    (Cow::Owned(out), count)
 }
 
 fn redact_url(url: &str, mark: &mut dyn FnMut(&str) -> String) -> Option<String> {
@@ -613,6 +755,12 @@ mod tests {
         assert!(!secret_key("PWD") && !secret_key("OLDPWD"));
         assert!(secret_key("DB_PWD") && secret_key("MYSQL_PWD"));
         assert_eq!(redact("PWD=/home/runner/work/app").0, "PWD=/home/runner/work/app");
+    }
+
+    #[test]
+    fn a_url_right_after_a_wide_character_is_still_checked() {
+        assert_eq!(redact("é://x"), ("é://x".to_string(), 0));
+        assert_eq!(redact("✅postgres://app:pa55w0rd@db/x").0, "✅postgres://app:[redacted]@db/x");
     }
 
     #[test]
