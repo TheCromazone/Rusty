@@ -2018,6 +2018,47 @@ fn truncated_reply_after_the_check_leaves_the_goal_open_completion_contract() {
 }
 
 #[test]
+fn a_link_out_of_the_project_does_not_carry_a_write_with_it() {
+    use std::os::unix::fs::symlink;
+    let s = Sandbox::new("link-escape");
+    // Outside the project, in the (fake) home directory, where writes ask.
+    let outside = s.home.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("notes.md"), "keep\n").unwrap();
+    symlink(&outside, s.project.join("escape")).unwrap();
+    symlink(outside.join("notes.md"), s.project.join("notes.md")).unwrap();
+    let (url, server) = scripted_endpoint(vec![
+        tool_reply("write_file", serde_json::json!({"path": "escape/new.txt", "content": "planted\n"})),
+        tool_reply("edit_file", serde_json::json!({"path": "notes.md", "old_string": "keep", "new_string": "lost"})),
+        tool_reply("write_file", serde_json::json!({"path": "kept.txt", "content": "fine\n"})),
+        text_reply("ok"),
+    ]);
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .args(["--mode", "standard", "--agents", "off", "--memory", "off", "tidy up"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map(|child| wait(child, Duration::from_secs(20)))
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(!outside.join("new.txt").exists(), "a write followed a link out of the project");
+    assert_eq!(std::fs::read_to_string(outside.join("notes.md")).unwrap(), "keep\n");
+    assert_eq!(std::fs::read_to_string(s.project.join("kept.txt")).unwrap(), "fine\n");
+    for i in [1, 2] {
+        let told = requests[i]["messages"].as_array().unwrap().last().unwrap()["content"].to_string();
+        assert!(told.contains("needs approval"), "{told}");
+    }
+    let out = s.repl(&["/permissions check echo planted > escape/new.txt", "/permissions check echo ok > kept.txt"]);
+    assert!(out.contains("writes outside the project through a link: escape/new.txt"), "{out}");
+    assert!(out.contains("runs"), "{out}");
+}
+
+#[test]
 fn yolo_still_refuses_a_destructive_command_when_nobody_is_watching() {
     let s = Sandbox::new("yolo-destructive");
     // Something precious in a (fake) home directory outside the project.

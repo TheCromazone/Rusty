@@ -247,6 +247,9 @@ fn classify_path_write(path: &str, ctx: &Ctx) -> Class {
     if !ctx.writable(path) {
         return risky(format!("writes outside the project: {path}"));
     }
+    if let Some(real) = ctx.leaves_through_link(path) {
+        return risky(format!("writes outside the project through a link: {path} → {}", real.display()));
+    }
     let lower = unq(path).to_lowercase();
     let name = Path::new(&lower).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     if name.starts_with(".env") || lower.contains(".git/") || name.ends_with(".pem") || name.ends_with(".key") {
@@ -282,21 +285,26 @@ impl<'a> Ctx<'a> {
     /// An absolute, normalised path, or None when it depends on the shell
     /// (`$VAR`, `~user`, a relative path after an unknown `cd`).
     fn resolve(&self, p: &str) -> Option<PathBuf> {
+        self.absolute(p).map(|p| normalize(&p))
+    }
+
+    /// `resolve` before normalising: `..` is still there, for the system to
+    /// apply after any link before it.
+    fn absolute(&self, p: &str) -> Option<PathBuf> {
         let p = unq(p);
         if p.is_empty() || p.contains(['$', '`']) {
             return None;
         }
-        let joined = if p == "~" || p.starts_with("~/") {
+        if p == "~" || p.starts_with("~/") {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/home/unknown".into());
-            PathBuf::from(home).join(p.trim_start_matches('~').trim_start_matches('/'))
+            Some(PathBuf::from(home).join(p.trim_start_matches('~').trim_start_matches('/')))
         } else if p.starts_with('~') {
-            return None;
+            None
         } else if Path::new(p).is_absolute() {
-            PathBuf::from(p)
+            Some(PathBuf::from(p))
         } else {
-            self.here.as_ref()?.join(p)
-        };
-        Some(normalize(&joined))
+            Some(self.here.as_ref()?.join(p))
+        }
     }
 
     fn inside(&self, p: &str) -> bool {
@@ -307,6 +315,44 @@ impl<'a> Ctx<'a> {
     fn writable(&self, p: &str) -> bool {
         self.resolve(p).is_some_and(|p| p.starts_with(self.root) || scratch(&p))
     }
+
+    /// Where a write to `p` really lands, when a symlink on the way leads
+    /// out of the project and its temp directories. This is checked when
+    /// the call is judged: a link swapped between then and the write is not
+    /// caught, so it is a boundary for honest mistakes, not a sandbox.
+    fn leaves_through_link(&self, p: &str) -> Option<PathBuf> {
+        let real = real_path(&self.absolute(p)?);
+        (!(real.starts_with(real_path(self.root)) || scratch_under(&real, real_path))).then_some(real)
+    }
+}
+
+/// Where an absolute path lands, resolved the way the system does it: part
+/// by part, each link replaced by its target as it is reached (a last link
+/// too, whose target a write would create) and `..` taken from what is
+/// really there. Parts that don't exist yet are kept as written.
+fn real_path(p: &Path) -> PathBuf {
+    let parts = |p: &Path| p.components().rev().map(|c| c.as_os_str().to_os_string()).collect::<Vec<_>>();
+    let mut todo = parts(p);
+    let mut out = PathBuf::new();
+    let mut links = 0;
+    while let Some(part) = todo.pop() {
+        if part == "/" {
+            out = PathBuf::from("/");
+        } else if part == ".." {
+            out.pop();
+        } else if part != "." {
+            let next = out.join(&part);
+            match std::fs::read_link(&next) {
+                // The system gives up after 40 links; a loop never resolves.
+                Ok(target) if links < 40 => {
+                    links += 1;
+                    todo.extend(parts(&target));
+                }
+                _ => out = next,
+            }
+        }
+    }
+    out
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -326,14 +372,21 @@ fn normalize(p: &Path) -> PathBuf {
 /// Somewhere under a temp directory (not the temp directory itself), and
 /// never inside the home directory, whatever TMPDIR says.
 fn scratch(p: &Path) -> bool {
-    if std::env::var("HOME").is_ok_and(|h| !h.is_empty() && p.starts_with(normalize(Path::new(&h)))) {
+    scratch_under(p, Path::to_path_buf)
+}
+
+/// `scratch` with home and the temp roots passed through `map` first, so a
+/// path whose links are followed is compared with followed roots (macOS
+/// keeps /tmp, /var/tmp and $TMPDIR under /private).
+fn scratch_under(p: &Path, map: impl Fn(&Path) -> PathBuf) -> bool {
+    if std::env::var("HOME").is_ok_and(|h| !h.is_empty() && p.starts_with(map(&normalize(Path::new(&h))))) {
         return false;
     }
     let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp"), PathBuf::from("/var/tmp")];
     if let Ok(t) = std::env::var("TMPDIR") {
         roots.push(normalize(Path::new(&t)));
     }
-    roots.iter().any(|r| p.starts_with(r) && p != r.as_path())
+    roots.iter().map(|r| map(r)).any(|r| p.starts_with(&r) && p != r.as_path())
 }
 
 /// Folders that a build or an install recreates, so deleting them is routine.
@@ -2747,6 +2800,57 @@ mod tests {
         assert_eq!(ro.decide("bash", &json!({"command": "ls"}), cwd), Verdict::Allow);
         let ask = Policy::new(Mode::Ask);
         assert!(matches!(ask.decide("edit_file", &edit, cwd), Verdict::Ask(_)));
+    }
+
+    /// A write a link carries out of the project is a write outside it.
+    /// Only judged here, never written: the outside targets are system paths.
+    #[test]
+    fn writes_go_where_links_lead() {
+        use std::os::unix::fs::symlink;
+        let work = std::env::temp_dir().join(format!("rusty-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/lib.rs"), "").unwrap();
+        symlink("/usr", work.join("system")).unwrap();
+        symlink("/etc/hosts", work.join("hosts")).unwrap();
+        symlink("/nonexistent-rusty-target/new.txt", work.join("dangling")).unwrap();
+        symlink(work.join("src"), work.join("code")).unwrap();
+        symlink("src/lib.rs", work.join("lib.rs")).unwrap();
+        symlink("loop-b", work.join("loop-a")).unwrap();
+        symlink("loop-a", work.join("loop-b")).unwrap();
+        let file = |tool: &str, path: &str| classify(tool, &json!({"path": path, "content": "x"}), &work);
+        for (tool, path) in [
+            ("write_file", "system/new.txt"),
+            ("edit_file", "hosts"),
+            ("write_file", "dangling"),
+            ("write_file", "system/../etc/new.txt"),
+            ("write_file", "code/../system/new.txt"),
+        ] {
+            let class = file(tool, path);
+            assert!(
+                matches!(&class, Class::Risky(why) if why.contains("outside the project through a link")),
+                "{tool} {path}: {class:?}"
+            );
+        }
+        assert!(
+            matches!(file("write_file", "dangling"), Class::Risky(why) if why.ends_with("/nonexistent-rusty-target/new.txt"))
+        );
+        for path in ["src/lib.rs", "src/new.rs", "code/new.rs", "lib.rs", "new/dir/file.rs", "loop-a/x"] {
+            assert_eq!(file("write_file", path), Class::WorkspaceWrite, "{path}");
+        }
+        // The shell's redirects take the same check; other shell writes don't.
+        let shell = |cmd: &str| classify("bash", &json!({"command": cmd}), &work);
+        assert!(matches!(shell("echo hi > system/new.txt"), Class::Risky(_)));
+        assert_eq!(shell("echo hi > code/new.rs"), Class::WorkspaceWrite);
+        // Each mode treats it as any other write outside the project.
+        let args = json!({"path": "system/new.txt", "content": "x"});
+        assert!(matches!(Policy::new(Mode::Auto).decide("write_file", &args, &work), Verdict::Ask(_)));
+        assert!(matches!(Policy::new(Mode::Ask).decide("write_file", &args, &work), Verdict::Ask(_)));
+        assert!(matches!(Policy::new(Mode::ReadOnly).decide("write_file", &args, &work), Verdict::Deny(_)));
+        assert_eq!(Policy::new(Mode::Yolo).decide("write_file", &args, &work), Verdict::Allow);
+        let inside = json!({"path": "code/new.rs", "content": "x"});
+        assert_eq!(Policy::new(Mode::Auto).decide("write_file", &inside, &work), Verdict::Allow);
+        std::fs::remove_dir_all(&work).unwrap();
     }
 
     #[test]

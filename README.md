@@ -542,7 +542,10 @@ yolo                 run               run                run                nee
   - `git reset --hard` and anything else that throws away uncommitted work;
   - deploys, `terraform apply`, `kubectl apply`;
   - opening or merging pull requests;
-  - writes outside the project;
+  - writes outside the project, including a write that a symlink inside it
+    would carry out (file tools and shell redirects follow the link to see
+    where it lands; this is checked when the call is judged, so it is not a
+    sandbox and doesn't cover every shell command);
   - reading `~/.aws/credentials` and other keys;
   - sending local data off the machine;
   - commands rusty doesn't recognise.
