@@ -181,25 +181,7 @@ fn parse_suite(bytes: &[u8]) -> Result<ParsedSuite> {
     parsed.ignored = counts[2];
     Ok(parsed)
 }
-fn parse_time_scale(explicit: Option<&str>) -> Result<u64> {
-    let scale = match explicit {
-        Some(raw) => raw.parse::<u64>().context("RUSTY_TEST_TIME_SCALE must be an integer from 1 to 100")?,
-        None => 1,
-    };
-    if !(1..=100).contains(&scale) {
-        bail!("RUSTY_TEST_TIME_SCALE must be an integer from 1 to 100");
-    }
-    Ok(scale)
-}
-/// Keep ordinary deadlines unless the caller explicitly requests a scale.
-pub fn time_scale() -> Result<u64> {
-    match std::env::var("RUSTY_TEST_TIME_SCALE") {
-        Ok(raw) => parse_time_scale(Some(&raw)),
-        Err(std::env::VarError::NotPresent) => parse_time_scale(None),
-        Err(e) => Err(e).context("RUSTY_TEST_TIME_SCALE is not valid Unicode"),
-    }
-}
-fn suite(bins: &[Binary], scale: u64) -> Result<Run> {
+fn suite(bins: &[Binary]) -> Result<Run> {
     let mut run = Run { failures: BTreeMap::new(), times: Vec::new(), binaries: Vec::new() };
     let jobs: usize =
         std::env::var("RUSTY_TEST_JOBS").unwrap_or_else(|_| "4".into()).parse().context("RUSTY_TEST_JOBS")?;
@@ -220,11 +202,12 @@ fn suite(bins: &[Binary], scale: u64) -> Result<Run> {
                     break;
                 }
                 let out = capture(
-                    Command::new(&bin.path)
-                        .current_dir(super::root())
-                        .env("RUSTC_BOOTSTRAP", "1")
-                        .env("RUSTY_TEST_TIME_SCALE", scale.to_string())
-                        .args(["-Z", "unstable-options", "--format=json", "--report-time"]),
+                    Command::new(&bin.path).current_dir(super::root()).env("RUSTC_BOOTSTRAP", "1").args([
+                        "-Z",
+                        "unstable-options",
+                        "--format=json",
+                        "--report-time",
+                    ]),
                     CAPTURE_LIMIT,
                     CAPTURE_TIMEOUT,
                 );
@@ -302,14 +285,13 @@ fn fresh_report(name: &str) -> Result<PathBuf> {
 
 pub fn tests(only_changed: bool) -> Result<bool> {
     let report = fresh_report("test-suite.json")?;
-    let scale = time_scale()?;
-    println!("Test profile: {} (time scale {scale})", if only_changed { "changed" } else { "full" });
+    println!("Test profile: {}", if only_changed { "changed" } else { "full" });
     let mut bins = binaries()?;
     let selection = if only_changed { changed()? } else { None };
     if let Some(names) = &selection {
         bins.retain(|b| names.contains(&b.name));
     }
-    let mut run = suite(&bins, scale)?;
+    let mut run = suite(&bins)?;
     run.times.sort_by(|a, b| b.1.total_cmp(&a.1));
     println!("\nSlowest 20 tests:");
     for (name, time) in run.times.iter().take(20) {
@@ -352,8 +334,7 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
         bail!("--runs must be positive");
     }
     let report = fresh_report("flaky.json")?;
-    let scale = time_scale()?;
-    println!("Test profile: full (time scale {scale})");
+    println!("Test profile: full");
     let bins = binaries()?;
     let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut observations = Vec::new();
@@ -361,7 +342,7 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
         let start = Instant::now();
         let load = Command::new("uptime").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         println!("\nRun {n}/{runs}: {}", load.as_deref().unwrap_or("load unavailable"));
-        let mut run = suite(&bins, scale)?;
+        let mut run = suite(&bins)?;
         // Doc tests are part of a full suite too.
         let docs = capture(
             Command::new("cargo").args(["test", "--workspace", "--locked", "--doc"]).current_dir(super::root()),
@@ -379,7 +360,7 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
                 String::from_utf8_lossy(&docs.stderr)
             ));
         }
-        observations.push(json!({"run":n,"load":load,"seconds":start.elapsed().as_secs_f64(),"test_time_scale":scale,"failures":run.failures,"binaries":run.binaries,"tests":run.times}));
+        observations.push(json!({"run":n,"load":load,"seconds":start.elapsed().as_secs_f64(),"failures":run.failures,"binaries":run.binaries,"tests":run.times}));
         for (name, messages) in run.failures {
             failures.entry(name).or_default().extend(messages.into_iter().map(|m| format!("run {n}: {m}")));
         }
@@ -396,7 +377,7 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{discovered, parse_suite, parse_time_scale, selected_paths};
+    use super::{discovered, parse_suite, selected_paths};
     use serde_json::{json, Value};
     fn protocol(events: &[Value]) -> Vec<u8> {
         events.iter().map(|v| format!("{v}\n")).collect::<String>().into_bytes()
@@ -474,16 +455,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn timing_profiles_validate_and_canonicalize_before_launch() {
-        assert_eq!(parse_time_scale(None).unwrap(), 1);
-        for (raw, canonical) in [("1", 1), ("001", 1), ("20", 20), ("100", 100)] {
-            assert_eq!(parse_time_scale(Some(raw)).unwrap(), canonical);
-        }
-        for raw in ["0", "101", "1000", "garbage", "", "-1", "1.0", " 1", "18446744073709551616"] {
-            assert!(parse_time_scale(Some(raw)).is_err(), "{raw:?}");
-        }
-    }
     #[test]
     fn test_and_xtask_edits_select_their_binaries() {
         let names = selected_paths("tests/cli.rs\nxtask/src/main.rs\n").unwrap();
