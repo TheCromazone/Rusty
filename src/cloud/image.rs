@@ -6,6 +6,7 @@
 //! from `/object-storage/push-access`, and the snapshot request lists the MD5s.
 
 use anyhow::{bail, Context as _, Result};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -159,7 +160,7 @@ pub fn context_hash(ctx: &Context) -> Result<String> {
     let mut h = Md5::default();
     h.update(ctx.archive.as_bytes());
     if ctx.source.is_file() {
-        h.update(&std::fs::read(&ctx.source)?);
+        super::digest::hash_file(&ctx.source, |bytes| h.update(bytes))?;
         return Ok(h.hex());
     }
     let mut entries = Vec::new();
@@ -175,7 +176,7 @@ pub fn context_hash(ctx: &Context) -> Result<String> {
             }
         } else {
             h.update(rel.as_bytes());
-            h.update(&std::fs::read(&path)?);
+            super::digest::hash_file(&path, |bytes| h.update(bytes))?;
         }
     }
     Ok(h.hex())
@@ -219,17 +220,33 @@ fn tar_header(name: &str, size: u64, mode: u32, mtime: u64, dir: bool) -> Result
     Ok(h)
 }
 
-fn tar_entry(out: &mut Vec<u8>, name: &str, path: &Path) -> Result<()> {
+fn open_context_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK also prevents a concurrent replacement with a FIFO from
+    // blocking open before the descriptor's type can be checked.
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    if !file.metadata()?.is_file() {
+        bail!("refusing to archive {}: not a regular file", path.display());
+    }
+    Ok(file)
+}
+
+fn tar_entry(out: &mut impl Write, name: &str, path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path)?;
     let mtime = meta.mtime().max(0) as u64;
     if meta.is_dir() {
-        out.extend_from_slice(&tar_header(&format!("{name}/"), 0, meta.mode(), mtime, true)?);
+        out.write_all(&tar_header(&format!("{name}/"), 0, meta.mode(), mtime, true)?)?;
     } else if meta.is_file() {
-        let data = std::fs::read(path)?;
-        out.extend_from_slice(&tar_header(name, data.len() as u64, meta.mode(), mtime, false)?);
-        out.extend_from_slice(&data);
-        out.resize(out.len().div_ceil(512) * 512, 0);
+        let file = open_context_file(path)?;
+        let meta = file.metadata()?;
+        let size = meta.len();
+        let mtime = meta.mtime().max(0) as u64;
+        out.write_all(&tar_header(name, size, meta.mode(), mtime, false)?)?;
+        if std::io::copy(&mut file.take(size), out)? != size {
+            bail!("file changed while archiving: {}", path.display());
+        }
+        out.write_all(&[0u8; 512][..((512 - size % 512) % 512) as usize])?;
     } else {
         bail!("refusing to archive {}: not a regular file or directory", path.display());
     }
@@ -239,16 +256,22 @@ fn tar_entry(out: &mut Vec<u8>, name: &str, path: &Path) -> Result<()> {
 /// A ustar archive of one context, named as the Dockerfile refers to it.
 pub fn context_tar(ctx: &Context) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    tar_entry(&mut out, &ctx.archive, &ctx.source)?;
+    write_context_tar(ctx, &mut out)?;
+    Ok(out)
+}
+
+/// Write the identical archive to a stream, without retaining file contents.
+pub fn write_context_tar(ctx: &Context, out: &mut impl Write) -> Result<()> {
+    tar_entry(out, &ctx.archive, &ctx.source)?;
     if ctx.source.is_dir() {
         let mut entries = Vec::new();
         walk(&ctx.source, "", &mut entries)?;
         for (rel, _) in entries {
-            tar_entry(&mut out, &format!("{}/{rel}", ctx.archive), &ctx.source.join(&rel))?;
+            tar_entry(out, &format!("{}/{rel}", ctx.archive), &ctx.source.join(&rel))?;
         }
     }
-    out.extend_from_slice(&[0u8; 1024]);
-    Ok(out)
+    out.write_all(&[0u8; 1024])?;
+    Ok(())
 }
 
 // -------------------------------------------------------------- S3 upload
@@ -305,7 +328,8 @@ fn s3(
     access: &PushAccess,
     method: reqwest::Method,
     key: &str,
-    body: Vec<u8>,
+    body: Option<std::fs::File>,
+    payload: &str,
 ) -> Result<reqwest::blocking::Response> {
     let base = reqwest::Url::parse(access.storage_url.trim_end_matches('/')).context("invalid storage URL")?;
     let prefix = base.path().trim_end_matches('/');
@@ -317,36 +341,62 @@ fn s3(
         Some(p) => format!("{}:{p}", url.host_str().unwrap_or_default()),
         None => url.host_str().unwrap_or_default().to_string(),
     };
-    let payload = sha256_hex(&body);
     let date = amz_date(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
     let headers = [
         ("host", host.as_str()),
-        ("x-amz-content-sha256", payload.as_str()),
+        ("x-amz-content-sha256", payload),
         ("x-amz-date", date.as_str()),
         ("x-amz-security-token", access.session_token.as_str()),
     ];
-    let authorization = sigv4(
-        method.as_str(),
-        &path,
-        "",
-        &headers,
-        &payload,
-        &access.region,
-        &access.access_key,
-        &access.secret,
-        &date,
-    );
+    let authorization =
+        sigv4(method.as_str(), &path, "", &headers, payload, &access.region, &access.access_key, &access.secret, &date);
     let mut rb = http
         .request(method, url)
-        .header("x-amz-content-sha256", &payload)
+        .header("x-amz-content-sha256", payload)
         .header("x-amz-date", &date)
         .header("x-amz-security-token", &access.session_token)
         .header("Authorization", authorization)
         .timeout(Duration::from_secs(4 * 60));
-    if !body.is_empty() {
+    if let Some(body) = body {
         rb = rb.header("Content-Type", "application/x-tar").body(body);
     }
     rb.send().context("object storage request failed")
+}
+
+fn context_spool() -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!("rusty-context-{}", super::digest::random_hex(16)));
+    let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path)?;
+    std::fs::remove_file(path)?;
+    Ok(file)
+}
+
+/// Hash exactly the bytes accepted by the spool, avoiding a second disk pass.
+struct SignedSpool {
+    file: std::fs::File,
+    hash: super::digest::Sha256,
+}
+
+impl Write for SignedSpool {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn signed_context(ctx: &Context) -> Result<(std::fs::File, String)> {
+    let spool = SignedSpool { file: context_spool()?, hash: super::digest::Sha256::default() };
+    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, spool);
+    write_context_tar(ctx, &mut buffered)?;
+    buffered.flush()?;
+    let mut spool = buffered.into_inner().map_err(|e| e.into_error())?;
+    spool.file.rewind()?;
+    Ok((spool.file, spool.hash.hex()))
 }
 
 /// Uploads each context unless the bucket already has it; returns the MD5s
@@ -365,9 +415,12 @@ pub fn upload_contexts(access: &PushAccess, contexts: &[Context]) -> Result<Vec<
     for ctx in contexts {
         let hash = context_hash(ctx)?;
         let key = format!("{}/{hash}/context.tar", access.organization_id);
-        let exists = s3(&http, access, reqwest::Method::HEAD, &key, Vec::new())?.status().is_success();
+        let exists = s3(&http, access, reqwest::Method::HEAD, &key, None, &sha256_hex(b""))?.status().is_success();
         if !exists {
-            let resp = s3(&http, access, reqwest::Method::PUT, &key, context_tar(ctx)?)?;
+            // A private, immediately unlinked spool bounds RAM while retaining
+            // the exact bytes signed for S3, even if source files change later.
+            let (file, hash) = signed_context(ctx)?;
+            let resp = s3(&http, access, reqwest::Method::PUT, &key, Some(file), &hash)?;
             if !resp.status().is_success() {
                 bail!("uploading {} failed with HTTP {}", ctx.archive, resp.status());
             }
@@ -380,6 +433,50 @@ pub fn upload_contexts(access: &PushAccess, contexts: &[Context]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_archives_preserve_bytes_padding_and_hashes() {
+        let dir = std::env::temp_dir().join(format!("rusty-stream-tar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input");
+        for size in [0, 1, 511, 512, 513, 65535, 65536, 65537, 1048577] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &data).unwrap();
+            let ctx = Context { source: path.clone(), archive: "input".into() };
+            let mut h = Md5::default();
+            h.update(b"input");
+            h.update(&data);
+            assert_eq!(context_hash(&ctx).unwrap(), h.hex());
+            let tar = context_tar(&ctx).unwrap();
+            assert_eq!(&tar[512..512 + size], &data);
+            assert_eq!(tar.len(), 512 + size.div_ceil(512) * 512 + 1024);
+            assert!(tar[512 + size..].iter().all(|b| *b == 0));
+            let (mut spool, hash) = signed_context(&ctx).unwrap();
+            assert_eq!(hash, sha256_hex(&tar));
+            let mut got = Vec::new();
+            spool.read_to_end(&mut got).unwrap();
+            assert_eq!(got, tar);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opened_context_rejects_symlinks_and_nonregular_files() {
+        let dir = std::env::temp_dir().join(format!("rusty-no-follow-{}", super::super::digest::random_hex(8)));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"content").unwrap();
+        assert!(open_context_file(&file).is_ok());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(open_context_file(&link).is_err());
+        assert!(open_context_file(&dir).is_err());
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(open_context_file(&fifo).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn archive_names_follow_normpath() {

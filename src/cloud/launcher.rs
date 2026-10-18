@@ -177,10 +177,11 @@ pub fn snapshot_name(binary: &Path, cpu: u8, memory: u8, target: &str) -> Result
     h.update(format!("{cpu}:{memory}").as_bytes());
     h.update(target.as_bytes());
     h.update(PACKAGES.join(" ").as_bytes());
-    h.update(&std::fs::read(binary).with_context(|| format!("reading {}", binary.display()))?);
+    super::digest::hash_file(binary, |bytes| h.update(bytes))
+        .with_context(|| format!("reading {}", binary.display()))?;
     let advisor = binary.with_file_name("rusty-memoryd");
     if advisor.is_file() {
-        h.update(&std::fs::read(advisor)?);
+        super::digest::hash_file(&advisor, |bytes| h.update(bytes))?;
     }
     Ok(format!("rusty-{}", &h.hex()[..12]))
 }
