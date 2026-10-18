@@ -99,16 +99,20 @@ fn after_ms() -> u64 {
 }
 
 /// Pings for `outcome` if pings are on, stdout is a terminal, the user did
-/// not just stop the turn themselves, the turn has run long enough and no
-/// ping went out a moment ago.
+/// not just stop the turn themselves, the turn has run long enough (or is
+/// waiting on an approval) and no ping went out a moment ago. The end of a
+/// turn uses up its start, so a later approval or turn never measures from it.
 pub fn notify(outcome: Outcome, project: &Path) {
     use std::io::IsTerminal;
+    let started = match outcome {
+        Outcome::NeedsApproval => STARTED.load(Ordering::Relaxed),
+        _ => STARTED.swap(0, Ordering::Relaxed),
+    };
     if mode() == "off" || !std::io::stdout().is_terminal() || crate::signal::interrupted() {
         return;
     }
     let now = now_ms();
-    let started = STARTED.load(Ordering::Relaxed);
-    if started == 0 || now.saturating_sub(started) < after_ms() {
+    if !long_enough(outcome, started, now, after_ms()) {
         return;
     }
     let last = LAST.load(Ordering::Relaxed);
@@ -120,6 +124,12 @@ pub fn notify(outcome: Outcome, project: &Path) {
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(payload(outcome, project, mode() == "sound").as_bytes());
     let _ = out.flush();
+}
+
+/// An approval prompt always counts: the agent is blocked on the user however
+/// short the turn was. The end of a turn counts once it ran for `after` ms.
+fn long_enough(outcome: Outcome, started: u64, now: u64, after: u64) -> bool {
+    outcome == Outcome::NeedsApproval || (started != 0 && now.saturating_sub(started) >= after)
 }
 
 /// The bytes written: OSC 9 with fixed words and the filtered folder name,
@@ -164,6 +174,16 @@ mod tests {
         assert_eq!(inner, "rusty · x0owned31mrm-rf: response ready");
         assert_eq!(payload(Outcome::NeedsApproval, Path::new("/"), true), "\x1b]9;rusty: needs approval\x07\x07");
         assert!(payload(Outcome::Verified, Path::new(&"a".repeat(200)), false).len() < 80, "the name is capped");
+    }
+
+    #[test]
+    fn an_approval_pings_however_short_the_turn_but_an_ending_needs_a_long_one() {
+        let after = 10_000;
+        assert!(long_enough(Outcome::NeedsApproval, 1_000, 6_000, after), "blocked on the user at 5s");
+        assert!(long_enough(Outcome::NeedsApproval, 0, 6_000, after), "no turn start recorded");
+        assert!(!long_enough(Outcome::Ready, 1_000, 6_000, after));
+        assert!(long_enough(Outcome::Ready, 1_000, 11_000, after));
+        assert!(!long_enough(Outcome::Failed, 0, 60_000, after), "a spent or missing start never counts");
     }
 
     #[test]

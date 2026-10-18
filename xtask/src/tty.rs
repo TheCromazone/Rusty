@@ -385,10 +385,6 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
     Ok(())
 }
 
-/// A blank answer declines an approval. Then, in the interactive REPL, an
-/// approved write lets the turn resume, and the terminal can still be resized
-/// and used afterwards: a second line editor at the prompt used to replace the
-/// REPL's resize handler, so the next resize aborted rusty.
 /// `/ping`: off by default; once on, a finished turn sends exactly one OSC 9
 /// frame made of fixed words and the folder name, and the setting is saved;
 /// a turn the user stopped with ctrl-c sends nothing. `RUSTY_PING_AFTER=0`
@@ -451,6 +447,10 @@ fn ping(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A blank answer declines an approval. Then, in the interactive REPL, an
+/// approved write lets the turn resume, and the terminal can still be resized
+/// and used afterwards: a second line editor at the prompt used to replace the
+/// REPL's resize handler, so the next resize aborted rusty.
 pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     let approved = dest.join("approved.txt");
     let mut cmd = Command::new(binary);
