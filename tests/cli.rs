@@ -5547,6 +5547,26 @@ fn native_integration_auth_failures_are_redacted_and_credentials_are_never_persi
 }
 
 #[test]
+fn native_integrations_refuse_malformed_permission_rules_before_host_or_config_actions() {
+    let s = Sandbox::new("native-invalid-policy");
+    integration_repo(&s);
+    s.fake("gh", "exit 0");
+    let out = s.cmd().args(["--integrations", "configure", "github"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut files = Vec::new();
+    find_files(&s.home, "json", &mut files);
+    let config = files.iter().find(|p| p.file_name().unwrap() == "integrations.json").unwrap();
+    std::fs::write(config.with_file_name("permissions.json"), "{").unwrap();
+    for args in [vec!["--integrations", "check"], vec!["--integrations", "mcp", "add", "blocked", "/bin/true"]] {
+        let out = s.cmd().args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("permissions"));
+    }
+    assert!(!s.calls().contains("gh auth"));
+    assert!(!s.project.join(".mcp.json").exists());
+}
+
+#[test]
 fn unified_mcp_setup_preserves_other_servers_and_never_launches_on_add_or_list() {
     let s = Sandbox::new("native-mcp-setup");
     let path = s.project.join(".mcp.json");

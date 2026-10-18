@@ -225,7 +225,7 @@ fn run() -> Result<i32> {
         signal::install();
         let project = project_dir(&PathBuf::from(backend.identity(&cwd)));
         let mode = Mode::parse(&cli.permissions).ok_or_else(|| anyhow!("invalid permissions mode"))?;
-        let policy = Policy::load(project.join("permissions.json"), mode);
+        let policy = Policy::load(project.join("permissions.json"), mode)?;
         println!(
             "{}",
             integrations::command(&backend, &policy, &cwd, &project.join("integrations.json"), &cli.prompt)?
