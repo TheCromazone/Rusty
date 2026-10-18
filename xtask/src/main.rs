@@ -19,6 +19,7 @@
 
 mod bench;
 mod eval;
+mod ignores;
 mod json;
 mod memory;
 mod message;
@@ -29,7 +30,9 @@ mod qa;
 mod record;
 mod report;
 mod screen;
+mod testing;
 mod tty;
+mod worktree;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -52,6 +55,15 @@ fn run(args: &[String]) -> Result<ExitCode> {
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
         Some("qa") => qa::command(rest),
+        Some("flaky") => testing::flaky(rest),
+        Some("worktree") => worktree::command(rest),
+        Some("test-suite") => {
+            if !matches!(rest, [] | [_]) || rest.first().is_some_and(|a| a != "--changed") {
+                bail!("usage: cargo xtask test-suite [--changed]");
+            }
+            ignores::check()?;
+            testing::tests(!rest.is_empty()).map(|_| ExitCode::SUCCESS)
+        }
         Some("check-message") => {
             let text = read_arg(rest.first().map_or("-", String::as_str))?;
             Ok(verdict(message::commit_problem(&text)))

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Resolve on every invocation: rustup may change while this shell is open.
+set -eu
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+base=${RUSTY_TARGET_ROOT:-$common/cargo-target}
+compiler=$(rustc -vV)
+if command -v sha256sum >/dev/null 2>&1; then
+    key=$(printf '%s' "$compiler" | sha256sum | cut -d ' ' -f 1)
+else
+    key=$(printf '%s' "$compiler" | shasum -a 256 | cut -d ' ' -f 1)
+fi
+export CARGO_TARGET_DIR="$base/$key"
+# Cargo releases its own lock before an xtask runs test binaries. Keep a
+# command lock too, so another worktree cannot replace rusty under those tests.
+mkdir -p "$CARGO_TARGET_DIR"
+exec python3 - "$CARGO_TARGET_DIR/.rusty-command.lock" "$@" <<'PYTHON'
+import fcntl
+import signal
+import subprocess
+import sys
+
+with open(sys.argv[1], "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    child = subprocess.Popen(["cargo", *sys.argv[2:]])
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda signum, frame: child.send_signal(signum))
+    code = child.wait()
+    sys.exit(code if code >= 0 else 128 - code)
+PYTHON

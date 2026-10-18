@@ -3,7 +3,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
     inputs:
@@ -92,7 +91,7 @@ jobs:
           done < <(git rev-list "$BASE..$HEAD")
       - name: Offline quality
         if: steps.scope.outputs.runtime == 'true' && (inputs.suite == '' || inputs.suite == 'offline')
-        run: cargo xtask qa
+        run: cargo xtask qa --full
       - name: Performance qualification
         if: inputs.suite == 'perf'
         run: cargo xtask qa --perf
