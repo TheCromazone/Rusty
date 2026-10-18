@@ -122,6 +122,9 @@ fn wrap(s: &str, cols: usize, hang: &str) -> String {
     let mut seen_text = false;
     // The last space after some text: its byte offset in `out`, and the column after it.
     let mut space: Option<(usize, usize)> = None;
+    // A space that reached the right edge. The break is made only when another
+    // word follows, so trailing spaces never leave a blank row.
+    let mut edge = false;
     let mut rest = s;
     while !rest.is_empty() {
         if let Some(n) = escape_len(rest) {
@@ -134,10 +137,8 @@ fn wrap(s: &str, cols: usize, hang: &str) -> String {
             if !seen_text {
                 out.push(' ');
                 col += 1;
-            } else if col + 1 > cols {
-                out.push('\n');
-                out.push_str(hang);
-                col = hang_cells;
+            } else if edge || col + 1 > cols {
+                edge = true;
                 space = None;
             } else {
                 out.push(' ');
@@ -154,7 +155,12 @@ fn wrap(s: &str, cols: usize, hang: &str) -> String {
         };
         let word = &rest[..end];
         let w = cells(word);
-        if col + w > cols {
+        if edge {
+            out.push('\n');
+            out.push_str(hang);
+            col = hang_cells;
+            edge = false;
+        } else if col + w > cols {
             if let Some((at, after)) = space.take() {
                 out.replace_range(at..at + 1, &format!("\n{hang}"));
                 col = hang_cells + (col - after);
@@ -264,6 +270,14 @@ mod tests {
             assert_eq!(words, text.split_whitespace().map(String::from).collect::<Vec<_>>(), "no word split or lost");
         }
         assert_eq!(render("short line", &mut false, 79), "short line", "a fitting line is untouched");
+    }
+
+    #[test]
+    fn trailing_spaces_do_not_add_a_blank_terminal_row() {
+        assert_eq!(wrap("12345678 ", 8, ""), "12345678");
+        assert_eq!(wrap("12345678  \x1b[0m", 8, ""), "12345678\x1b[0m", "a style reset after the spaces");
+        assert_eq!(plain("one two three ", &mut false, 13), "one two three");
+        assert_eq!(wrap("1234567890   next", 10, "  "), "1234567890\n  next", "no spaces carried to the next row");
     }
 
     #[test]
