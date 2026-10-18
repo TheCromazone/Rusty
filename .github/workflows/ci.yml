@@ -89,6 +89,18 @@ jobs:
           while IFS= read -r sha; do
             git log -1 --format=%B "$sha" | target/debug/xtask check-message -
           done < <(git rev-list "$BASE..$HEAD")
+      - name: Query test prerequisite
+        if: steps.scope.outputs.runtime == 'true'
+        shell: bash
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            case "$RUNNER_OS" in
+              Linux) sudo apt-get update && sudo apt-get install --yes ripgrep ;;
+              macOS) brew install ripgrep ;;
+              *) echo "Unsupported query test platform: $RUNNER_OS" >&2; exit 1 ;;
+            esac
+          fi
+          rg --version
       - name: Offline quality
         if: steps.scope.outputs.runtime == 'true' && (inputs.suite == '' || inputs.suite == 'offline')
         run: cargo xtask qa --full
