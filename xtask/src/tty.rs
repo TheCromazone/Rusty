@@ -168,7 +168,8 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     let wrapped = format!("USER_PROMPT_START {}pong", "wrapped input ".repeat(16));
     s.send(&wrapped)?;
     s.send("\x0aUSER_PROMPT_END")?;
-    s.drain(0.3)?;
+    // A completed write to the PTY is not a completed line-editor redraw.
+    s.wait_for(&[Lit("USER_PROMPT_END")], "typed input never finished drawing")?;
     inspect_input(&s.text, cols, plain, indexed)?;
     std::fs::write(dest.join("input-live.ansi"), &s.text)?;
     s.send("\r")?;
