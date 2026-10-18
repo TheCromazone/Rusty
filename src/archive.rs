@@ -48,7 +48,9 @@ impl Archive {
             for message in archived.iter().chain(history) {
                 let mut message = message.clone();
                 rusty::privacy::scrub(&mut message);
-                serde_json::to_writer(&mut writer, &message)?;
+                // Recover the original filesystem error from serde_json's I/O
+                // wrapper so callers can inspect raw OS failures such as EFBIG.
+                serde_json::to_writer(&mut writer, &message).map_err(std::io::Error::from)?;
                 writer.write_all(b"\n")?;
             }
             writer.flush()?;

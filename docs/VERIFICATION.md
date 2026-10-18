@@ -1323,7 +1323,8 @@ whose name is immediately unlinked. The agent owns one descriptor until drop;
 this avoids using global temporary storage for an unbounded optional export.
 The opt-in archive can still consume session-volume space. A failed archive
 write retains live history and rejects the transition rather than silently
-losing export data. A partial append is rolled back to the prior byte length.
+losing export data. A partial append is rolled back to the prior byte length. Filesystem error
+causes retain their raw OS codes for diagnosis.
 Reading a trajectory can allocate the complete exported history.
 
 Regression coverage includes clear/resume with an unusable global temporary
