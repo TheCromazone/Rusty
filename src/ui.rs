@@ -157,6 +157,13 @@ pub fn tty() -> bool {
     level() > 0
 }
 
+/// Whether stdout is a terminal, whatever the colour policy (NO_COLOR still
+/// wants text laid out for the screen; a pipe or file gets it untouched).
+pub fn terminal() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::io::stdout().is_terminal())
+}
+
 /// Animations are on for real terminals unless RUSTY_NO_ANIM is set.
 pub fn animate() -> bool {
     tty() && std::env::var_os("RUSTY_NO_ANIM").is_none()
