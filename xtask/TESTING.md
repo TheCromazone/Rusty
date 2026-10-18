@@ -22,6 +22,12 @@ cancel; title/body edits do not trigger CI. The cache includes compiler
 identity and the lockfile. Main publishes caches; PRs restore them. Conventions
 run in `check`. A lightweight `messages` job mirrors that result to preserve
 existing branch-protection check names, with no duplicate compilation.
+The scoped `benchmark` job retains the fixed-input cloud/read comparison:
+separate baseline/candidate targets, exact read/tar/context equivalence, and
+CPU/RSS tables. It runs only for relevant PR paths, once per workflow; no
+second cloud-memory workflow builds those releases. An unselected comparison
+is reported as such. Documentation keeps its separately owned `documentation`
+job when that feature is integrated.
 
 Use Run workflow to select offline, perf, live or cloud. macOS is available
 explicitly for platform qualification; no automatic OS/model/memory matrix,

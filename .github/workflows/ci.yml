@@ -160,3 +160,75 @@ jobs:
         env:
           CHECK_RESULT: ${{ needs.check.result }}
         run: test "$CHECK_RESULT" = success
+
+  benchmark:
+    name: benchmark
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: after
+          fetch-depth: 0
+      - name: Select fixed-input memory comparison
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if git -C after diff --quiet "$BASE" "$HEAD" -- \
+            src/tools.rs src/cloud/image.rs src/cloud/digest.rs src/cloud/api.rs \
+            examples/cloud_perf.rs scripts/cloud-memory-bench.py \
+            .github/workflows/ci.yml .github/workflows/cloud-memory.yml; then
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            echo 'No relevant changes; fixed-input memory comparison was not selected.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            diff_status=$?
+            test "$diff_status" -eq 1
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.scope.outputs.run == 'true'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: before
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.run == 'true'
+      - name: Build baseline and candidate in separate target directories
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          cp after/examples/cloud_perf.rs before/examples/cloud_perf.rs
+          (cd before && cargo build --release --locked --bin rusty --example cloud_perf)
+          (cd after && cargo build --release --locked --bin rusty --example cloud_perf)
+      - name: Measure fixed inputs and assert output equivalence
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          python3 after/scripts/cloud-memory-bench.py before before/target/release/rusty before/target/release/examples/cloud_perf
+          python3 after/scripts/cloud-memory-bench.py after after/target/release/rusty after/target/release/examples/cloud_perf
+          python3 - <<'PY'
+          import json, os
+          before=json.load(open('focused-before.json'))
+          after=json.load(open('focused-after.json'))
+          assert before['read_output_sha256']==after['read_output_sha256']
+          for key in ['context_hash', 'tar_bytes', 'tar_sha256']:
+              assert before['cloud_receipt'][key]==after['cloud_receipt'][key], key
+          rows=['| Workload | CPU ms before → after | Delta | Peak RSS MB before → after | Delta |', '|---|---:|---:|---:|---:|']
+          for name in ['read_64MiB', 'cloud_64MiB']:
+              a,b=before[name],after[name]
+              rows.append(f"| {name} | {a['cpu_ms']:.2f} → {b['cpu_ms']:.2f} | {(b['cpu_ms']/a['cpu_ms']-1)*100:+.1f}% | {a['rss_bytes']/1e6:.2f} → {b['rss_bytes']/1e6:.2f} | {(b['rss_bytes']/a['rss_bytes']-1)*100:+.1f}% |")
+          table='\n'.join(rows)+'\n'
+          open('comparison.md','w').write(table)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f: f.write(table)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scope.outputs.run == 'true'
+        with:
+          name: cloud-memory-comparison
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            focused-before.json
+            focused-after.json
+            comparison.md
