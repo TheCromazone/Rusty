@@ -31,6 +31,24 @@
 
 ---
 
+## How it works
+
+One lead owns your task. It asks the model for a next step, checks proposed
+tool calls, runs allowed work, and feeds the results back into the loop.
+
+```mermaid
+flowchart LR
+    You["Your request"] --> Lead["Lead: goal and plan"]
+    Lead --> Model["Model suggests next step"]
+    Model --> Gate["Permissions and checks"]
+    Gate --> Tools["Read, edit, run tests"]
+    Tools --> Lead
+```
+
+**[Read the simple architecture guide](docs/HOW_IT_WORKS.md)** for diagrams
+and plain explanations of `/goal`, memory, compaction, subagents, swarms,
+execution modes, permissions, side discussions, sessions, tools, and budgets.
+
 ## See the modes in action
 
 Rusty runs in your terminal, with local tools, streamed answers, saved sessions,
@@ -224,7 +242,7 @@ That's separate from what it's allowed to do.
 
 | | |
 |---|---|
-| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions or the model. |
+| `auto` | The default. rusty picks one of the three below for each request and says why on the first line: careful when it mentions production, a migration, a deploy, data, money, security, infrastructure or an incident; vibe for a quick prototype or sketch; standard otherwise, including whenever it's unsure. During a turn it only ever moves up to careful, when a consequential command comes up or three commands fail in a row. It never changes permissions. A configured per-mode model can follow the profile unless you explicitly chose a model. |
 | `careful` | Thinks longer. When it says it's done, a separate read-only checker looks at the real files and your instructions and reports what's wrong. rusty fixes that and verifies it, with no second review. A plain question isn't checked, and a goal gets one checker attempt, including after saving and resuming. |
 | `standard` | Normal effort, and it checks what it changed. |
 | `vibe` | Quick passes and small checks. It can send out up to three read-only workers to look things up in parallel. It still has to run a relevant check before it calls something done. |
