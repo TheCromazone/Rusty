@@ -16,7 +16,13 @@ const MAX_OUTPUT: usize = 30_000;
 const SKIP_DIRS: &[&str] =
     &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
 
-pub fn definitions() -> Value {
+/// The built-in tool schemas. They never change, so they are built once.
+pub fn definitions() -> &'static Value {
+    static DEFS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DEFS.get_or_init(build_definitions)
+}
+
+fn build_definitions() -> Value {
     json!([
         tool("read_file", "Read a text file. Returns numbered lines. For big files, outline or search first and read only the range you need.", json!({
             "path": {"type": "string", "description": "File path"},
@@ -170,6 +176,64 @@ pub fn execute(name: &str, args: &Value) -> Result<String> {
         "bash" => bash(args),
         other => bail!("unknown tool `{other}`"),
     }
+}
+
+/// Tools that only read local files, in this process: no shell, no child
+/// process, nothing written. Several in a row may run side by side.
+pub const IN_PROCESS_READS: &[&str] = &["read_file", "list_files", "glob", "outline"];
+
+/// The largest file a read runs ahead for. Bigger ones wait their turn, so
+/// reads side by side never hold several large files in memory at once.
+pub const READ_AHEAD_MAX_BYTES: u64 = 1 << 20;
+
+/// Runs in-process reads side by side on at most `threads` scoped threads,
+/// the caller's among them, and returns each result at its call's index.
+/// Whole-file reads take turns: they are quick but hold the file, while the
+/// tree walks beside them are slow and hold little, so memory stays near
+/// what one read at a time needs.
+/// No thread outlives the call. A read not started because `stop` said so
+/// (the user interrupted) is None, as is anything not in `IN_PROCESS_READS`:
+/// a tool that starts a process must never run here, since on macOS a child
+/// spawned on another thread can inherit a pipe that is still being set up.
+pub fn read_ahead(
+    calls: &[(&str, &Value)],
+    threads: usize,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Vec<Option<Result<String>>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let whole_file = std::sync::Mutex::new(());
+    let work = || {
+        let mut done = Vec::with_capacity(calls.len());
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some((name, args)) = calls.get(i) else { break };
+            if stop() {
+                break;
+            }
+            if !IN_PROCESS_READS.contains(name) {
+                continue;
+            }
+            let _turn = (*name == "read_file").then(|| whole_file.lock().unwrap_or_else(|e| e.into_inner()));
+            done.push((i, execute(name, args)));
+        }
+        done
+    };
+    let mut out: Vec<Option<Result<String>>> = calls.iter().map(|_| None).collect();
+    std::thread::scope(|s| {
+        let work = &work;
+        let helpers: Vec<_> = (1..threads.min(calls.len()))
+            .filter_map(|_| std::thread::Builder::new().spawn_scoped(s, work).ok())
+            .collect();
+        let mut done = work();
+        // A helper that panicked loses only its reads; they run again in order.
+        for helper in helpers {
+            done.extend(helper.join().unwrap_or_default());
+        }
+        for (i, result) in done {
+            out[i] = Some(result);
+        }
+    });
+    out
 }
 
 fn arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -724,6 +788,55 @@ mod tests {
 
     fn which(tool: &str) -> bool {
         std::process::Command::new(tool).arg("--version").output().is_ok()
+    }
+
+    #[test]
+    fn reads_side_by_side_match_reads_in_order() {
+        let dir = std::env::temp_dir().join(format!("rusty-ahead-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        for i in 0..6 {
+            fs::write(dir.join(format!("sub/f{i}.rs")), format!("fn f{i}() {{}}\n").repeat(50 + i)).unwrap();
+        }
+        let d = dir.display().to_string();
+        let args: Vec<Value> = (0..6)
+            .map(|i| json!({"path": format!("{d}/sub/f{i}.rs")}))
+            .chain([json!({"path": d, "max_depth": 2}), json!({"pattern": "*.rs", "path": d}), json!({"path": d})])
+            .chain([json!({"path": format!("{d}/missing.rs")})])
+            .collect();
+        let names = ["read_file"; 6].into_iter().chain(["list_files", "glob", "outline", "read_file"]);
+        let calls: Vec<(&str, &Value)> = names.zip(&args).collect();
+        let ahead = read_ahead(&calls, 4, &|| false);
+        assert_eq!(ahead.len(), calls.len());
+        for ((name, args), got) in calls.iter().zip(ahead) {
+            let want = execute(name, args).map_err(|e| e.to_string());
+            assert_eq!(got.expect("every read ran").map_err(|e| e.to_string()), want, "{name} {args}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_ahead_stop_when_told_and_never_start_a_process() {
+        let dir = std::env::temp_dir().join(format!("rusty-ahead-stop-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, "a\n").unwrap();
+        let read = json!({"path": file.display().to_string()});
+        let marker = dir.join("ran");
+        let shell = json!({"command": format!("touch {}", marker.display())});
+        let search = json!({"pattern": "a", "path": dir.display().to_string()});
+        let calls = [("read_file", &read), ("bash", &shell), ("search", &search), ("read_file", &read)];
+        let ahead = read_ahead(&calls, 2, &|| false);
+        assert!(ahead[0].is_some() && ahead[3].is_some());
+        assert!(ahead[1].is_none() && ahead[2].is_none(), "only in-process reads run ahead");
+        assert!(!marker.exists(), "the shell call never ran");
+        // Stopped after the first read: the rest are left for the caller.
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        let ahead = read_ahead(&[("read_file", &read); 5], 1, &stop);
+        assert!(ahead[0].is_some());
+        assert!(ahead[1..].iter().all(Option::is_none));
+        assert!(read_ahead(&[("read_file", &read); 3], 3, &|| true).iter().all(Option::is_none));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

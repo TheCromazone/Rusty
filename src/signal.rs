@@ -91,6 +91,13 @@ pub fn interrupted() -> bool {
         .unwrap_or_else(|| INTERRUPTED.load(Ordering::SeqCst))
 }
 
+/// `interrupted` as this thread sees it, for threads it starts to check:
+/// a run's own cancel token lives in a thread-local they don't share.
+pub fn interrupted_from_here() -> impl Fn() -> bool + Send + Sync {
+    let token = RUN_CANCEL.with(|c| c.borrow().clone());
+    move || token.as_ref().map_or_else(|| INTERRUPTED.load(Ordering::SeqCst), |t| t.load(Ordering::SeqCst))
+}
+
 pub fn reset() {
     INTERRUPTED.store(false, Ordering::SeqCst);
 }

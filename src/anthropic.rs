@@ -11,7 +11,7 @@
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Response;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::io::Read;
 
 use crate::execution::ExecutionMode;
@@ -513,21 +513,30 @@ fn finish(
     reply
 }
 
-/// Removes keys rusty keeps for itself before a message goes to an
-/// OpenAI-compatible endpoint.
-pub fn strip_private(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|m| match m.as_object() {
-            Some(o) if o.keys().any(|k| k.starts_with('_')) => Value::Object(
-                o.iter()
-                    .filter(|(k, _)| !k.starts_with('_'))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<Map<_, _>>(),
-            ),
-            _ => m.clone(),
-        })
-        .collect()
+/// Messages as an OpenAI-compatible endpoint gets them: without the keys
+/// rusty keeps for itself. Serialised straight from history, not copied.
+pub struct Public<'a>(pub &'a [Value]);
+
+impl serde::Serialize for Public<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Message<'a>(&'a Value);
+        impl serde::Serialize for Message<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let Some(o) = self.0.as_object() else { return self.0.serialize(s) };
+                let mut map = s.serialize_map(None)?;
+                for (k, v) in o.iter().filter(|(k, _)| !k.starts_with('_')) {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+        let mut seq = s.serialize_seq(Some(self.0.len()))?;
+        for m in self.0 {
+            seq.serialize_element(&Message(m))?;
+        }
+        seq.end()
+    }
 }
 
 #[cfg(test)]
@@ -733,7 +742,7 @@ mod tests {
 
     #[test]
     fn strips_private_keys_for_other_providers() {
-        let m = vec![json!({"role": "assistant", "content": "x", "_anthropic": []})];
-        assert_eq!(strip_private(&m), vec![json!({"role": "assistant", "content": "x"})]);
+        let m = vec![json!({"role": "assistant", "content": "x", "_anthropic": []}), json!("plain")];
+        assert_eq!(serde_json::to_value(Public(&m)).unwrap(), json!([{"role": "assistant", "content": "x"}, "plain"]));
     }
 }
