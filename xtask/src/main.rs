@@ -31,6 +31,7 @@ mod qa;
 mod record;
 mod report;
 mod screen;
+mod test_process;
 mod testing;
 mod tty;
 

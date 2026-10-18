@@ -61,7 +61,7 @@ jobs:
       - name: Reset quality receipts
         if: always()
         shell: bash
-        run: rm -rf target/qa
+        run: rm -rf target/qa target/test-suite.json target/flaky.json
       - name: Pull request conventions
         if: github.event_name == 'pull_request'
         env:
@@ -138,6 +138,8 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
           path: |
+            target/test-suite.json
+            target/flaky.json
             target/qa/summary.json
             target/qa/summary.md
             target/qa/memory*.json
@@ -145,3 +147,16 @@ jobs:
             target/qa/terminal/**/alignment.json
             target/evals/*.jsonl
             target/evals/*.md
+
+  # Retain the existing required-check name without rebuilding xtask twice.
+  messages:
+    name: messages
+    needs: check
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Required conventions status
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: test "$CHECK_RESULT" = success

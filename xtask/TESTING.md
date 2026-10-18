@@ -20,7 +20,8 @@ for diagnosis; CI invokes the same QA command developers run locally.
 and main pushes run `check` and the full offline gate. Superseded code runs
 cancel; title/body edits do not trigger CI. The cache includes compiler
 identity and the lockfile. Main publishes caches; PRs restore them. Conventions
-run in the same job, without a second runner.
+run in `check`. A lightweight `messages` job mirrors that result to preserve
+existing branch-protection check names, with no duplicate compilation.
 
 Use Run workflow to select offline, perf, live or cloud. macOS is available
 explicitly for platform qualification; no automatic OS/model/memory matrix,
@@ -43,7 +44,14 @@ A controller timeout is not proof the remote sandbox was cleaned up.
 
 `target/qa/summary.json` and `summary.md` show each gate's pass/fail/running/
 not-run status and duration. A failed child exits nonzero, stops later gates,
-and leaves a receipt. Process termination leaves running/not-run entries,
+and leaves a receipt. Test discovery must finish and find at least one binary.
+Every libtest binary must emit a complete, consistent JSON suite, including
+legitimate zero-test binaries. `target/test-suite.json` records passed, failed
+and ignored counts plus per-binary and per-test durations. Captured Cargo,
+libtest and doctest processes have a 16 MiB output limit and a ten-minute
+command deadline. Cancellation stops their owned groups, with a two-second
+termination grace before a final kill and reap. Fixtures that create a new
+process group still own their explicit cleanup. Process termination leaves running/not-run entries,
 not a success receipt. Reports record the source commit, dirty state and selected eval configuration; a local dirty run is
 not an immutable release qualification. CI uploads small receipts for three
 days, not all transcripts or every successful terminal capture. Failed local
