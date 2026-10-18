@@ -1145,7 +1145,8 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   Notifications cannot extend request deadlines. Closing a connection stops and
   joins its reader, kills its owned process group, and reaps its child. Escaped
   process groups are outside containment; these limits do not establish that
-  arbitrary external servers are leak-free.
+  arbitrary external servers are leak-free. Outbound JSON is capped during
+  serialization, including escape expansion.
 
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
