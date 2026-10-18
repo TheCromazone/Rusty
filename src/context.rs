@@ -606,14 +606,61 @@ pub fn manual_split(history: &[Value]) -> Option<usize> {
 /// the last compaction are dropped, oldest first; then, if a long session's
 /// carried block still doesn't fit, its middle entries go too, oldest first.
 pub fn user_messages(history: &[Value], max_chars: usize) -> String {
+    carry(history, max_chars, false)
+}
+
+/// What compaction carries: the user's messages as above, each followed by
+/// the reply that ended its turn. What rusty told the user (a name it chose,
+/// a value it found, a choice it made) binds the rest of the session as
+/// much as what the user said, and a summary can paraphrase it away. When the
+/// block is over budget, replies go first, oldest first, before any of the
+/// user's own text is cut.
+pub fn carried_messages(history: &[Value], max_chars: usize) -> String {
+    carry(history, max_chars, true)
+}
+
+/// Longest reply carried with a message; a longer one keeps its start and end.
+const REPLY_CHARS: usize = 400;
+/// Starts the reply carried after a user message.
+const REPLY_MARK: &str = "\n(rusty answered: ";
+
+fn carry(history: &[Value], max_chars: usize, replies: bool) -> String {
     let mut entries: Vec<String> = Vec::new();
     // Entries before this index came from an earlier compaction.
     let mut carried = 0;
-    for m in history.iter().filter(|m| m["role"] == "user") {
+    // The newest entry this span can still attach a reply to, and that reply.
+    let mut open: Option<(usize, String)> = None;
+    let attach = |entries: &mut Vec<String>, open: &mut Option<(usize, String)>| {
+        if let Some((i, reply)) = open.take().filter(|(_, r)| !r.is_empty()) {
+            let reply = if reply.chars().count() > REPLY_CHARS {
+                let start: String = reply.chars().take(REPLY_CHARS / 2).collect();
+                let end: String =
+                    reply.chars().rev().take(REPLY_CHARS / 2).collect::<Vec<_>>().into_iter().rev().collect();
+                format!("{start} … {end}")
+            } else {
+                reply
+            };
+            entries[i].push_str(&format!("{REPLY_MARK}{})", reply.replace(CARRY_SEPARATOR, "\n- - -\n")));
+        }
+    };
+    for m in history {
+        if m["role"] == "assistant" {
+            let text = m["content"].as_str().unwrap_or("").trim();
+            let calls = m["tool_calls"].as_array().is_some_and(|c| !c.is_empty());
+            if let (Some((_, reply)), false, false) = (&mut open, text.is_empty(), calls) {
+                *reply = text.to_string();
+            }
+            continue;
+        }
+        if m["role"] != "user" {
+            continue;
+        }
         let Some(text) = m["content"].as_str() else { continue };
         if text.starts_with("[Summary of the conversation so far]") {
-            // Already-carried messages live inside the previous summary block.
-            if let Some((_, kept)) = text.split_once(USER_MESSAGES_HEADER) {
+            // Already-carried messages live inside the previous summary block,
+            // with their replies; the acknowledgement after it is no reply.
+            attach(&mut entries, &mut open);
+            if let Some(kept) = carried_block(text) {
                 entries.extend(kept.trim().split(CARRY_SEPARATOR).filter(|e| !e.is_empty()).map(String::from));
                 carried = entries.len();
             }
@@ -623,10 +670,24 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
             // rusty's own nudges and reviews are not things the user said.
             continue;
         }
+        attach(&mut entries, &mut open);
         // A separator inside a message would split it when carried again.
         entries.push(crate::ui::truncate(text, 2_000).replace(CARRY_SEPARATOR, "\n- - -\n"));
+        if replies {
+            open = Some((entries.len() - 1, String::new()));
+        }
     }
+    attach(&mut entries, &mut open);
     let total = |e: &[String]| e.iter().map(|x| x.len() + CARRY_SEPARATOR.len()).sum::<usize>();
+    // Replies are the first thing cut, oldest first: the user's words outrank
+    // rusty's account of its own answers.
+    let mut i = 0;
+    while i < entries.len() && total(&entries) > max_chars {
+        if let Some(at) = entries[i].rfind(REPLY_MARK).filter(|_| entries[i].ends_with(')')) {
+            entries[i].truncate(at);
+        }
+        i += 1;
+    }
     let last = entries.len().saturating_sub(1);
     // Cut older entries to a first line, oldest first; the first and newest stay whole.
     for i in 1..last {
@@ -652,7 +713,17 @@ pub fn user_messages(history: &[Value], max_chars: usize) -> String {
 
 const CARRY_SEPARATOR: &str = "\n---\n";
 
-pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
+pub const USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim, each with rusty's reply trimmed]";
+/// The header before replies were carried, still found in saved sessions.
+const OLD_USER_MESSAGES_HEADER: &str = "[Your messages so far, verbatim]";
+
+/// The carried messages inside a summary block, under either header.
+fn carried_block(summary: &str) -> Option<&str> {
+    summary
+        .split_once(USER_MESSAGES_HEADER)
+        .or_else(|| summary.split_once(OLD_USER_MESSAGES_HEADER))
+        .map(|(_, kept)| kept)
+}
 
 /// Marks a message rusty wrote into the user role (goal nudges, careful-mode
 /// reviews), so compaction never carries it over as something the user said.
@@ -873,6 +944,72 @@ mod tests {
         ];
         let carried = user_messages(&h, 8000);
         assert!(carried.contains("keep the API stable") && !carried.contains("Second look"), "{carried}");
+    }
+
+    #[test]
+    fn carried_messages_keep_the_reply_that_ended_each_turn() {
+        let call = json!({"role": "assistant", "content": "Reading it.", "tool_calls": [{"id": "r", "function": {"name": "read_file", "arguments": "{}"}}]});
+        let h = vec![
+            json!({"role": "user", "content": "pick a codename, a bird"}),
+            json!({"role": "assistant", "content": "Kestrel"}),
+            json!({"role": "user", "content": "count the functions in big.py"}),
+            call,
+            json!({"role": "tool", "tool_call_id": "r", "content": "def a(): ..."}),
+            json!({"role": "user", "content": format!("{NOTE}keep going")}),
+            json!({"role": "assistant", "content": "It defines 41 functions."}),
+            json!({"role": "user", "content": "thanks"}),
+        ];
+        let carried = carried_messages(&h, 8_000);
+        assert!(carried.contains("pick a codename, a bird\n(rusty answered: Kestrel)"), "{carried}");
+        assert!(
+            carried.contains("count the functions in big.py\n(rusty answered: It defines 41 functions.)"),
+            "{carried}"
+        );
+        assert!(!carried.contains("Reading it.") && carried.ends_with("thanks"), "{carried}");
+        assert!(!user_messages(&h, 8_000).contains("rusty answered"), "plain constraints carry no replies");
+
+        // A later compaction keeps them, and the acknowledgement after the
+        // summary is not taken for a reply.
+        let again = carried_messages(
+            &[
+                json!({"role": "user", "content": format!("[Summary of the conversation so far]\nx\n\n{USER_MESSAGES_HEADER}\n{carried}")}),
+                json!({"role": "assistant", "content": "Got it. I'll continue from this summary."}),
+                json!({"role": "user", "content": "write the codename to a file"}),
+            ],
+            8_000,
+        );
+        assert!(again.contains("(rusty answered: Kestrel)") && !again.contains("Got it"), "{again}");
+
+        // A long reply keeps its start and its end.
+        let long = format!("I looked. {} So I chose Wren.", "detail ".repeat(200));
+        let one = carried_messages(
+            &[json!({"role": "user", "content": "choose"}), json!({"role": "assistant", "content": long})],
+            8_000,
+        );
+        assert!(one.contains("(rusty answered: I looked.") && one.ends_with("So I chose Wren.)"), "{one}");
+        assert!(one.len() < 600, "{}", one.len());
+    }
+
+    #[test]
+    fn replies_are_cut_before_any_user_text_and_old_blocks_still_read() {
+        let mut h = Vec::new();
+        for i in 0..6 {
+            h.push(json!({"role": "user", "content": format!("request {i}: keep rule {i}")}));
+            h.push(json!({"role": "assistant", "content": format!("reply {i}: {}", "r".repeat(380))}));
+        }
+        let all = carried_messages(&h, 100_000);
+        assert_eq!(all.matches("(rusty answered:").count(), 6, "{all}");
+        // Room for every user line but not every reply: replies go, oldest first.
+        let tight = carried_messages(&h, all.len() - 900);
+        for i in 0..6 {
+            assert!(tight.contains(&format!("request {i}: keep rule {i}")), "user text kept: {tight}");
+        }
+        assert!(!tight.contains("reply 0:") && !tight.contains("reply 1:") && tight.contains("reply 5:"), "{tight}");
+
+        // A block saved under the header used before replies were carried.
+        let old = json!({"role": "user", "content": format!("[Summary of the conversation so far]\nx\n\n{OLD_USER_MESSAGES_HEADER}\nfix the parser")});
+        assert!(carried_messages(&[old, json!({"role": "user", "content": "and ship"})], 8_000)
+            .starts_with("fix the parser"));
     }
 
     #[test]

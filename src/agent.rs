@@ -2988,7 +2988,7 @@ impl Agent {
             }
             return Ok(());
         }
-        let carried = context::user_messages(&self.history[..split], self.carry_chars());
+        let carried = context::carried_messages(&self.history[..split], self.carry_chars());
         let (working_set, reverted) = self.collapse_reverts(&context::working_set(&self.history[..split]));
         let mut messages =
             vec![json!({"role": "system", "content": "You write precise hand-off summaries of coding sessions."})];
