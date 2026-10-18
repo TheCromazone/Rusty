@@ -918,13 +918,17 @@ r,w=os.pipe()
 if os.fork()==0:
     os.close(r)
     os.setsid()
-    with open(sys.argv[1],'w') as f: f.write(str(os.getpid()))
     os.write(w,b'x')
     os.close(w)
+    # Cancellation may kill the launcher as soon as readiness is visible.
+    # Finish the handshake first, then publish a complete PID atomically.
+    with open(sys.argv[1]+'.tmp','w') as f: f.write(str(os.getpid()))
+    os.replace(sys.argv[1]+'.tmp',sys.argv[1])
     time.sleep(30)
     os._exit(0)
 os.close(w)
 os.read(r,1)
+while not os.path.exists(sys.argv[1]): time.sleep(0.001)
 print('ready',flush=True)
 if sys.argv[2]!='exit': time.sleep(30)
 os._exit(0)
