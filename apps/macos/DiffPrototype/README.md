@@ -5,6 +5,19 @@ Mac app. It is not the app, a shipped inspector, or a replacement for the Rust
 worker. Nothing here is imported by the Rust CLI or the separate RustyKit package.
 Requires macOS 14 or newer and the Xcode Swift toolchain.
 
+## Current running prototype
+
+These app-only screenshots show the Release AppKit harness with 20,000 synthetic
+rows, captured from its running window. They demonstrate folding and additions/
+deletions, not a connected coding session or notification delivery.
+
+![Collapsed native diff](../../../docs/screenshots/native-diff-collapsed.png)
+
+![Expanded native diff](../../../docs/screenshots/native-diff-expanded.png)
+
+Capture provenance is in [the screenshot manifest](../../../docs/screenshots/native-diff-capture.json).
+
+
 ```sh
 swift test --package-path apps/macos/DiffPrototype --jobs 2 -c release
 swift build --package-path apps/macos/DiffPrototype -c release --jobs 2

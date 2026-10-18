@@ -1,0 +1,17 @@
+{
+  "captured_at": "2026-10-18T03:07:10.816333+00:00",
+  "app_build_source_head": "5739555",
+  "build": "Xcode Release, local ad-hoc signature verified",
+  "executable_sha256": "2ea41134aa998c702e57866b035d26e971ca5c90ed15028604d23944c26e5f77",
+  "capture": "Actual running native window; synthetic20k-row fixture; app-only pixels; no offscreen rendering or notification implementation",
+  "ui_source_sha256": {
+    "apps/macos/DiffPrototype/Sources/DiffPrototype/main.swift": "61c32524141ee6796cfd68a92a4764ab3728fccacf23cce5ee2e113e037a3a68",
+    "apps/macos/DiffPrototype/Sources/DiffPrototype/PrototypeWindowController.swift": "c63beb51699cfc523d737f75d39cab8307dcea23367a43fed35faf93c874ca76",
+    "apps/macos/DiffPrototype/Sources/DiffPrototype/DiffRowView.swift": "a44748c69bbed6af7be65c6bcae28554de2be413a054df82471ac7f2f0bc90a1",
+    "apps/macos/DiffPrototype/Sources/DiffPrototypeCore/DiffModel.swift": "8a95e8bd4aaa2863d68d9db652ca0d99de992176eaf7f377de8eccb9ee81dcfd"
+  },
+  "images_sha256": {
+    "docs/screenshots/native-diff-collapsed.png": "35dc263b0efaac51fb81de69930337285b5ef63c1e114f1eaa9723209b487d0c",
+    "docs/screenshots/native-diff-expanded.png": "d271e2750c0f56ab653a41e88aa77a372f46393e37eb3612cb8698d121b9518b"
+  }
+}
