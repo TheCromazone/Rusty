@@ -231,9 +231,9 @@ fn interactive_fixed_verification_rejects_remote_tools_before_setting_a_criterio
         .take()
         .unwrap()
         .write_all(
-            b"/goal verify printf forbidden > verification-ran\n\
-              /goal verify --timeout 7 printf forbidden > verification-ran\n\
-              /goal pin acceptance.txt\n/goal status\n/exit\n",
+            b"/goal --verify printf forbidden > verification-ran\n\
+              /goal --verify --timeout 7 printf forbidden > verification-ran\n\
+              /goal --pin acceptance.txt\n/goal status\n/exit\n",
         )
         .unwrap();
     let out = wait(child, Duration::from_secs(30));
@@ -241,12 +241,12 @@ fn interactive_fixed_verification_rejects_remote_tools_before_setting_a_criterio
     let output = text(&out);
     assert!(out.status.success(), "{output}");
     assert_eq!(
-        output.matches("/goal verify requires local tools; remote acceptance is not qualified").count(),
+        output.matches("/goal --verify requires local tools; remote acceptance is not qualified").count(),
         2,
         "{output}"
     );
     // Pinning must still see no configured check after both rejected commands.
-    assert!(output.contains("set /goal verify <command> first"), "{output}");
+    assert!(output.contains("set /goal --verify <command> first"), "{output}");
     assert!(output.contains("no goal."), "{output}");
     assert!(!output.contains("fixed check set for future goals"), "{output}");
     assert!(!h.host.join("verification-ran").exists());

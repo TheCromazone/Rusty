@@ -451,7 +451,9 @@ fn bash(args: &Value) -> Result<String> {
         None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
         None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
     };
-    let _ = writeln!(out, "capture_complete: {capture_complete}");
+    if !capture_complete {
+        let _ = writeln!(out, "capture_complete: false");
+    }
     if !stdout.is_empty() {
         let _ = write!(out, "stdout:\n{stdout}");
     }

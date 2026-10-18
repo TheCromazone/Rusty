@@ -15,7 +15,7 @@ const MAX_BYTES: u64 = 128 * 1024 * 1024;
 // external services or arbitrary native processes. Document the exclusions.
 const GENERATED: &[&str] = &[".git", "target", "__pycache__", ".pytest_cache"];
 
-/// A fresh private Python bytecode namespace for each executor-owned check.
+/// Fresh private Python bytecode and Cargo artifact namespaces for each executor-owned check.
 /// `-B` alone does not prevent Python from loading planted cached bytecode.
 pub struct CheckCache(PathBuf);
 impl CheckCache {
@@ -39,7 +39,7 @@ impl CheckCache {
     }
     pub fn command(&self, command: &str) -> String {
         let path = self.0.to_string_lossy().replace('\'', "'\"'\"'");
-        format!("export PYTHONPYCACHEPREFIX='{path}';\n{command}")
+        format!("export PYTHONPYCACHEPREFIX='{path}/python'; export CARGO_TARGET_DIR='{path}/cargo';\n{command}")
     }
 }
 impl Drop for CheckCache {
@@ -74,14 +74,14 @@ impl CheckSpec {
         Ok(Self { command: command.into(), timeout_secs, pinned_files: Vec::new() })
     }
 
-    /// `/goal verify [--timeout SECONDS] COMMAND`; commands stay literal shell text.
+    /// `/goal --verify [--timeout SECONDS] COMMAND`; commands stay literal shell text.
     pub fn parse_interactive(value: &str) -> Result<Self> {
         let value = value.trim();
         if let Some(rest) = value.strip_prefix("--timeout ") {
             let (seconds, command) = rest
                 .trim_start()
                 .split_once(char::is_whitespace)
-                .context("usage: /goal verify --timeout SECONDS COMMAND")?;
+                .context("usage: /goal --verify --timeout SECONDS COMMAND")?;
             return Self::new(command.trim_start(), seconds.parse().context("invalid verification timeout")?);
         }
         Self::new(value, 120)
@@ -415,6 +415,57 @@ cache.write_bytes(header + marshal.dumps(compile('def add(a, b): return a + b', 
             .status()
             .unwrap()
             .success());
+        drop(cache);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn completion_contract_fresh_cargo_target_rejects_restored_pinned_test() {
+        use std::process::Command;
+        let workspace = Workspace::new();
+        fs::create_dir(workspace.0.join("tests")).unwrap();
+        fs::create_dir(workspace.0.join("src")).unwrap();
+        fs::write(workspace.0.join("Cargo.toml"), "[package]\nname='cache_probe'\nversion='0.1.0'\nedition='2021'\n")
+            .unwrap();
+        fs::write(workspace.0.join("src/lib.rs"), "").unwrap();
+        let source = "#[test] fn acceptance() { assert!(false); }\n";
+        fs::write(workspace.0.join("tests/acceptance.rs"), source).unwrap();
+        let check = CheckSpec::new("cargo test --offline --test acceptance", 120)
+            .unwrap()
+            .pin_files(&workspace.0, &[PathBuf::from("tests/acceptance.rs")])
+            .unwrap();
+        // Build a passing replacement, then restore both original bytes and mtime.
+        let control = Command::new("python3")
+            .current_dir(&workspace.0)
+            .env("CARGO_TARGET_DIR", workspace.0.join("target"))
+            .args([
+                "-c",
+                r#"
+import os, pathlib, subprocess
+p = pathlib.Path('tests/acceptance.rs')
+original, st = p.read_bytes(), p.stat()
+p.write_text('#[test] fn acceptance() { assert!(true); }\n')
+subprocess.run(['cargo','test','--offline','--test','acceptance'], check=True, timeout=60)
+p.write_bytes(original)
+os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+subprocess.run(['cargo','test','--offline','--test','acceptance'], check=True, timeout=60)
+"#,
+            ])
+            .output()
+            .unwrap();
+        assert!(control.status.success(), "{}", String::from_utf8_lossy(&control.stderr));
+        check.validate_files(&workspace.0).unwrap();
+        let cache = CheckCache::new().unwrap();
+        let path = cache.0.clone();
+        let output = Command::new("bash")
+            .current_dir(&workspace.0)
+            .env("CARGO_TARGET_DIR", workspace.0.join("target"))
+            .args(["-c", &cache.command(check.command())])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(101), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("acceptance ... FAILED"));
+        check.validate_files(&workspace.0).unwrap();
         drop(cache);
         assert!(!path.exists());
     }

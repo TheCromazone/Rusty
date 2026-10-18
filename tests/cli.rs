@@ -6104,7 +6104,7 @@ fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
         .unwrap();
     writeln!(
         child.stdin.take().unwrap(),
-        "/goal verify --timeout 7 python3 check.py\n/goal pin check.py\n/goal repair calc.py\n/goal status\n/exit"
+        "/goal --verify --timeout 7 python3 check.py\n/goal --pin check.py\n/goal repair calc.py\n/goal status\n/exit"
     )
     .unwrap();
     let out = wait(child, Duration::from_secs(15));
@@ -6138,7 +6138,7 @@ fn goal_allowance_resets_only_on_explicit_invocation_and_checkpoints_limits() {
             .unwrap();
         writeln!(
             child.stdin.take().unwrap(),
-            "/goal verify python3 -B check.py\n/goal pin check.py\n/goal inspect this fixture\n/goal resume\n/exit"
+            "/goal --verify python3 -B check.py\n/goal --pin check.py\n/goal inspect this fixture\n/goal resume\n/exit"
         )
         .unwrap();
         let out = wait(child, Duration::from_secs(20));
@@ -6291,4 +6291,22 @@ cache.write_bytes(importlib.util.MAGIC_NUMBER + struct.pack('<III', 0, int(st.st
     assert_eq!(trace["verification"][0]["exit_code"], 1);
     assert_eq!(std::fs::read(s.project.join("calc.py")).unwrap(), before);
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn completion_contract_verify_and_pin_words_remain_ordinary_objectives() {
+    for objective in ["verify the checkout flow works", "pin the release version"] {
+        let s = Sandbox::new("ordinary-goal-prefix");
+        let (url, server) = scripted_endpoint(vec![done_reply()]);
+        let path = s.home.join("trace.json");
+        let mut cmd = s.cmd();
+        cmd.env("RUSTY_BASE_URL", url).args(["--memory", "off", "--mode", "standard", "--trajectory"]).arg(&path);
+        let out = s.repl_with(cmd, &[&format!("/goal {objective}"), "/exit"]);
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(trace["goal"]["objective"], objective);
+        assert!(trace["goal"]["check"].is_null());
+        assert_eq!(trace["goal_outcome"], "completed_unverified");
+        assert!(!out.contains("fixed check set"));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 }

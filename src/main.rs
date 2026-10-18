@@ -1108,21 +1108,24 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
         }
         "/goal" => match rest {
-            "verify off" => {
+            "--verify" | "--pin" => {
+                return Err(anyhow!("usage: /goal --verify [--timeout SECONDS] COMMAND or /goal --pin PATH"))
+            }
+            "--verify off" => {
                 agent.goal_check = None;
                 println!("  future goals have no fixed check; the current goal is unchanged");
             }
-            value if value.starts_with("verify ") => {
+            value if value.starts_with("--verify ") => {
                 if agent.backend.name() != "local" {
-                    return Err(anyhow!("/goal verify requires local tools; remote acceptance is not qualified"));
+                    return Err(anyhow!("/goal --verify requires local tools; remote acceptance is not qualified"));
                 }
-                let check = verification::CheckSpec::parse_interactive(&value[7..])?;
+                let check = verification::CheckSpec::parse_interactive(&value[9..])?;
                 agent.goal_check = Some(check);
-                println!("  fixed check set for future goals; /goal pin <path> pins an acceptance file");
+                println!("  fixed check set for future goals; /goal --pin <path> pins an acceptance file");
             }
-            value if value.starts_with("pin ") => {
-                let check = agent.goal_check.clone().ok_or_else(|| anyhow!("set /goal verify <command> first"))?;
-                agent.goal_check = Some(check.pin_files(cwd, &[PathBuf::from(&value[4..])])?);
+            value if value.starts_with("--pin ") => {
+                let check = agent.goal_check.clone().ok_or_else(|| anyhow!("set /goal --verify <command> first"))?;
+                agent.goal_check = Some(check.pin_files(cwd, &[PathBuf::from(&value[6..])])?);
                 println!("  acceptance file pinned for future goals");
             }
             "" | "status" => match &agent.goal {

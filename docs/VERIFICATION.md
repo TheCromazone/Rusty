@@ -138,7 +138,7 @@ neither, so it claims less.
 ## Completion development suite
 
 ```sh
-cargo xtask eval-completion
+cargo test --workspace completion_contract
 ```
 
 This offline suite drives the real CLI with scripted model responses and runs
@@ -1130,10 +1130,10 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   else saved settings, else 128k. Pin `--context-tokens` to keep that GET
   off the gateway and the window fixed. The reporting pin assumes 128k and
   estimates fill from characters.
-- **`--verify-file`** (contract 3) pins repeatable workspace-relative acceptance files
+- **`--verify-file`** (contract 4) pins repeatable workspace-relative acceptance files
   and requires `--verify`. Capabilities expose `verify.files_flag`.
 - **`--verify`** is optional. Without it, the goal closes on the model's word,
-  and exit status 2 means only that the goal stalled.
+  and exit status 2 means the goal remains open or blocked, including a stall or exhausted turn allowance.
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
   key and exits 1 if a server marked `required`, or one of its
@@ -1158,7 +1158,7 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
 | Code | Meaning |
 |---|---|
 | 0 | finished; with `--verify`, the check passed |
-| 2 | the goal did not close: with `--verify`, not on a passing check; with or without it, after stalling three turns in a row (contract 2 and later; contract 1 exited 1 on a stall) |
+| 2 | the goal remains open or blocked, including a failed fixed check, a stall, or an exhausted turn allowance; applies with and without `--verify` |
 | 130 | interrupted |
 | 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
 
@@ -1221,15 +1221,15 @@ no key, so a harness can refuse an unsupported setting before any model call.
 Configure a fixed check before starting an interactive goal:
 
 ```text
-/goal verify --timeout 120 python3 -B check_public.py
-/goal pin check_public.py
+/goal --verify --timeout 120 python3 -B check_public.py
+/goal --pin check_public.py
 /goal fix pagination while preserving ordering
 /goal status
 ```
 
 `verify` replaces the check (and clears its pins) for future goals. `pin` adds
 one workspace-relative file, capturing its bytes immediately. The default
-check deadline is 120 seconds. `/goal verify off` disables checks for future
+check deadline is 120 seconds. `/goal --verify off` disables checks for future
 goals. These commands never weaken an existing goal's criterion; `/goal resume`
 uses that goal's saved criterion and runs fresh verification. Pending settings
 are process-local; the criterion is saved once a goal starts. Local tools only.
@@ -1251,7 +1251,7 @@ workspace observation unavailable retains its output, exit code and receipt.
 Its `EvidenceUnavailable` outcome rejects completion; `observation_error`
 explains the missing evidence. A check refused before execution has no receipt.
 
-Run `cargo xtask eval-completion` for offline contract evals, including the
+Run `cargo test --workspace completion_contract` for offline contract evals, including the
 interactive journey, unchecked completion, blocked and turn-limited goals,
 checker tampering, fresh acceptance, resume and independent hidden grading.
 Before comparing model quality, run the existing hidden-graded tasks with
@@ -1283,9 +1283,12 @@ A crash between checkpoints can leave a started attempt without a stop reason;
 its effects need inspection. Pinned criteria, checker usage, verification
 freshness and permission decisions retain their existing contracts.
 
-Fixed checks use a fresh private `PYTHONPYCACHEPREFIX` directory for each execution,
-removed afterward. This prevents Python from loading planted workspace bytecode;
-`-B` alone only disables writing bytecode. `/goal verify` requires local tools
+Fixed checks use fresh private `PYTHONPYCACHEPREFIX` and `CARGO_TARGET_DIR`
+directories for each execution, removed afterward. Cargo recompiles into the
+private target, so restored source mtimes cannot reuse a tampered workspace binary.
+Checks that explicitly override these variables or execute prebuilt binaries are
+outside this cache-isolation guarantee. This prevents Python from loading planted workspace bytecode;
+`-B` alone only disables writing bytecode. `/goal --verify` requires local tools
 and accepts `--timeout SECONDS` from 1 to 600 (default 120).
 
 Shell exit status and `capture_complete` are separate observations. An exit-0
