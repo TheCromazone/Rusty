@@ -1,8 +1,7 @@
 //! Real-process service tests. No model or cloud account is involved.
-use rusty::advisor::{rpc, Hooks, Level, Request, Response, KNOWN_PREFIX, SAVED_PREFIX};
+use rusty::advisor::{rpc, Level, Request, Response, KNOWN_PREFIX, SAVED_PREFIX};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
