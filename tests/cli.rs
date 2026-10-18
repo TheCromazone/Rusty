@@ -149,19 +149,8 @@ impl Drop for Sandbox {
     }
 }
 
-fn wait(mut child: std::process::Child, limit: Duration) -> Output {
-    // A deadlock watchdog, independent of the deadline under test.
-    let limit = limit.max(Duration::from_secs(120));
-    let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if start.elapsed() > limit {
-            let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            panic!("rusty did not exit within {limit:?}: {}", String::from_utf8_lossy(&out.stderr));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+fn wait(child: std::process::Child, limit: Duration) -> Output {
+    sync::wait(child, limit.max(Duration::from_secs(120)))
 }
 
 #[test]

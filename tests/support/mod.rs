@@ -81,21 +81,8 @@ pub fn wait(child: Child, limit: Duration) -> Output {
     wait_command(child, limit.max(Duration::from_secs(120)))
 }
 
-pub fn wait_command(mut child: Child, limit: Duration) -> Output {
-    let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if start.elapsed() > limit {
-            let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            panic!(
-                "did not exit within {limit:?}\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+pub fn wait_command(child: Child, limit: Duration) -> Output {
+    sync::wait(child, limit)
 }
 
 /// Splits a POSIX shell command line into words (quotes and backslashes).

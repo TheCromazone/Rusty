@@ -272,7 +272,16 @@ fn run(bin: &str, args: &[&str]) -> Option<String> {
         let _ = std::io::Read::read_to_string(&mut stdout, &mut buf);
         let _ = done.send(buf);
     });
-    let deadline = Instant::now() + Duration::from_secs(PROBE_SECS);
+    // Scheduling a fixture executable is not the probe deadline under test.
+    // Release builds retain the original duration without an environment lookup.
+    let secs = PROBE_SECS;
+    #[cfg(debug_assertions)]
+    let secs = std::env::var("RUSTY_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| (1..=1000).contains(n))
+        .map_or(secs, |n| secs.saturating_mul(n));
+    let deadline = Instant::now() + Duration::from_secs(secs);
     // Output ends when the probe exits (or closes stdout), so wake then
     // rather than on a polling tick.
     let out = output.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
