@@ -72,13 +72,17 @@ fn read_note(parent: &Path, path: &Path) -> Result<Transfer> {
     Ok(transfer)
 }
 pub fn file_version(cwd: &Path, path: &str) -> Option<(String, String)> {
+    file_contents(cwd, path).map(|(relative, bytes)| (relative, digest(&bytes)))
+}
+/// A regular workspace file of at most 4 MB, by its path relative to `cwd`.
+pub fn file_contents(cwd: &Path, path: &str) -> Option<(String, Vec<u8>)> {
     let root = cwd.canonicalize().ok()?;
     let file = cwd.join(path).canonicalize().ok()?;
     let relative = file.strip_prefix(&root).ok()?.to_string_lossy().into_owned();
     if !file.is_file() || file.metadata().ok()?.len() > 4 * 1024 * 1024 {
         return None;
     }
-    Some((relative, digest(&std::fs::read(file).ok()?)))
+    Some((relative, std::fs::read(file).ok()?))
 }
 
 #[cfg(test)]

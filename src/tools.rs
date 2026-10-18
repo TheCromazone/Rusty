@@ -29,11 +29,11 @@ fn build_definitions() -> Value {
             "offset": {"type": "integer", "description": "1-based line to start at (default 1)"},
             "limit": {"type": "integer", "description": "Max lines to return (default 800)"}
         }), &["path"]),
-        tool("write_file", "Create or overwrite a file with the given content. Creates parent directories. Overwriting an existing file fails unless you read it with read_file first, and again if it changed since.", json!({
+        tool("write_file", "Create or overwrite a file with the given content. Creates parent directories. Overwriting an existing file fails unless you read all of it with read_file first (or wrote it yourself), and again if it changed since; for a file too big to read whole, use edit_file.", json!({
             "path": {"type": "string"},
             "content": {"type": "string", "description": "Full new file content"}
         }), &["path", "content"]),
-        tool("edit_file", "Replace an exact string in a file. old_string must match exactly once unless replace_all is true. Fails unless you read the file with read_file first, and again if it changed since.", json!({
+        tool("edit_file", "Replace an exact string in a file. old_string must match exactly once unless replace_all is true. Fails unless you read the file with read_file first (any part will do), and again if it changed since.", json!({
             "path": {"type": "string"},
             "old_string": {"type": "string", "description": "Exact text to replace, including whitespace"},
             "new_string": {"type": "string"},
@@ -240,11 +240,15 @@ fn arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args[key].as_str().ok_or_else(|| anyhow!("missing string argument `{key}`"))
 }
 
+/// Lines read_file shows without a limit, and the longest line it shows whole.
+const READ_LIMIT: u64 = 800;
+const READ_LINE_BYTES: usize = 2000;
+
 fn read_file(args: &Value) -> Result<String> {
     let path = arg(args, "path")?;
     let text = fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(800).max(1) as usize;
+    let limit = args["limit"].as_u64().unwrap_or(READ_LIMIT).max(1) as usize;
     // Count delimiters directly so LLVM can vectorize the full-file scan.
     // str::lines excludes the empty segment after a final newline.
     let line_count =
@@ -254,13 +258,30 @@ fn read_file(args: &Value) -> Result<String> {
     }
     let mut out = String::new();
     for (i, l) in text.lines().enumerate().skip(offset - 1).take(limit) {
-        let _ = writeln!(out, "{:>6}\t{}", i + 1, truncate(l, 2000));
+        let _ = writeln!(out, "{:>6}\t{}", i + 1, truncate(l, READ_LINE_BYTES));
     }
     let shown_to = (offset - 1).saturating_add(limit).min(line_count);
     if shown_to < line_count {
         let _ = writeln!(out, "… {} more lines (use offset={})", line_count - shown_to, shown_to + 1);
     }
     Ok(cap(out))
+}
+
+/// Whether read_file with `args` shows all of `text`: from the first line
+/// through the last, with no line and no part of the output cut.
+pub fn read_shows_all(args: &Value, text: &str) -> bool {
+    let offset = args["offset"].as_u64().unwrap_or(1);
+    let limit = args["limit"].as_u64().unwrap_or(READ_LIMIT).max(1);
+    let (mut lines, mut bytes) = (0u64, 0usize);
+    for line in text.lines() {
+        if line.len() > READ_LINE_BYTES {
+            return false;
+        }
+        lines += 1;
+        // "{:>6}\t{line}\n", as read_file writes it.
+        bytes += (lines.ilog10() as usize + 1).max(6) + line.len() + 2;
+    }
+    offset <= 1 && lines <= limit && bytes <= MAX_OUTPUT
 }
 
 fn write_file(args: &Value) -> Result<String> {
@@ -876,6 +897,32 @@ pub fn cap(s: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_shows_all_only_from_the_top_past_the_end_uncut() {
+        let text = "one\ntwo\n";
+        assert!(read_shows_all(&json!({"path": "a"}), text));
+        assert!(read_shows_all(&json!({"path": "a", "offset": 1, "limit": 2}), text));
+        assert!(read_shows_all(&json!({"path": "a"}), ""));
+        assert!(!read_shows_all(&json!({"path": "a", "limit": 1}), text));
+        assert!(!read_shows_all(&json!({"path": "a", "offset": 2}), text));
+        assert!(!read_shows_all(&json!({"path": "a"}), &"x".repeat(READ_LINE_BYTES + 1)));
+        assert!(!read_shows_all(&json!({"path": "a"}), &"x\n".repeat(READ_LIMIT as usize + 1)));
+        let wide = format!("{}\n", "x".repeat(1000)).repeat(40);
+        assert!(!read_shows_all(&json!({"path": "a"}), &wide), "read_file would cap it");
+        // The output it predicts is the output read_file writes.
+        let dir = std::env::temp_dir().join(format!("rusty-read-all-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        for lines in [100, 306, 307, 700] {
+            let text = format!("{}\n", "y".repeat(90)).repeat(lines);
+            fs::write(&file, &text).unwrap();
+            let args = json!({"path": file.display().to_string()});
+            let out = read_file(&args).unwrap();
+            assert_eq!(read_shows_all(&args, &text), !out.contains("bytes omitted"), "{lines} lines");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn file_ranges_match_the_previous_formatter() {

@@ -424,8 +424,9 @@ pub struct Agent {
     /// Files a worker opened, so the lead can see what a swarm never looked at.
     opened: std::collections::BTreeSet<PathBuf>,
     /// Each workspace file's digest as this agent last read or wrote it, by
-    /// relative path, so an edit never lands on a file it hasn't seen as it is.
-    read_versions: BTreeMap<String, String>,
+    /// relative path, so an edit never lands on a file it hasn't seen as it
+    /// is, and whether it has seen all of it, which an overwrite needs.
+    read_versions: BTreeMap<String, (String, bool)>,
     progress: Option<Arc<AtomicUsize>>,
 }
 
@@ -711,8 +712,8 @@ impl Agent {
         s.push_str(
             "How to work:\n\
              - Look before you change. Find code with search, glob and outline; read only the ranges you need. \
-             Read a file with read_file before editing or overwriting it; edits to unread or since-changed \
-             files are refused.\n\
+             Read a file with read_file before editing it, and all of it before overwriting it; changes to \
+             unread or since-changed files are refused.\n\
              - Make the smallest change that fully solves the task, in the project's existing style.\n\
              - Verify with a build, the tests, or by running the code. Never claim something works without evidence.\n\
              - For multi-step work keep a short plan with the plan tool and update it as you go.\n",
@@ -1827,7 +1828,7 @@ impl Agent {
         if matches!(name, "edit_file" | "write_file")
             && !matches!(self.backend.decide(name, args, &self.policy, &self.cwd), Ok(Verdict::Deny(_)))
         {
-            if let Err(e) = self.check_read(args) {
+            if let Err(e) = self.check_read(name, args) {
                 return Err(refusal_error(RefusalKind::ReadFirst, e.to_string()));
             }
         }
@@ -1855,8 +1856,9 @@ impl Agent {
         if result.is_ok() {
             if let Some((path, hash)) = observed {
                 // A read counts only when the file was the same after it as before.
-                let unchanged =
-                    crate::inbox::file_version(&self.cwd, &path).as_ref().is_some_and(|(_, after)| after == &hash);
+                let after = crate::inbox::file_contents(&self.cwd, &path)
+                    .filter(|(_, bytes)| crate::inbox::digest(bytes) == hash);
+                let unchanged = after.is_some();
                 if let Some(meta) = &mut self.side_meta {
                     if unchanged {
                         meta.observations.insert(path.clone(), hash.clone());
@@ -1865,17 +1867,25 @@ impl Agent {
                     }
                 }
                 if name == "read_file" {
-                    if unchanged {
-                        self.read_versions.insert(path, hash);
-                    } else {
-                        self.read_versions.remove(&path);
+                    match after {
+                        Some((_, bytes)) => {
+                            // A part of a file already seen whole leaves it seen whole.
+                            let whole = tools::read_shows_all(args, &String::from_utf8_lossy(&bytes))
+                                || self.read_versions.get(&path).is_some_and(|(seen, whole)| *whole && *seen == hash);
+                            self.read_versions.insert(path, (hash, whole));
+                        }
+                        None => {
+                            self.read_versions.remove(&path);
+                        }
                     }
                 }
             } else if local && matches!(name, "edit_file" | "write_file") {
-                // The agent knows what it just wrote; the next edit needs no re-read.
+                // The agent knows what it just wrote; the next edit needs no
+                // re-read. A write is the whole file; an edit keeps what was seen.
                 if let Some((path, hash)) = args["path"].as_str().and_then(|p| crate::inbox::file_version(&self.cwd, p))
                 {
-                    self.read_versions.insert(path, hash);
+                    let whole = name == "write_file" || self.read_versions.get(&path).is_some_and(|(_, whole)| *whole);
+                    self.read_versions.insert(path, (hash, whole));
                 }
             }
         }
@@ -1884,9 +1894,11 @@ impl Agent {
 
     /// Refuses an edit, or an overwrite of an existing file, that the agent
     /// hasn't read with read_file, or that changed since it last read or
-    /// wrote it, whoever changed it. A new file is always fine. Only a local workspace file
-    /// small enough to hash is checked.
-    fn check_read(&self, args: &Value) -> Result<()> {
+    /// wrote it, whoever changed it. An overwrite also needs the whole file
+    /// read, or written by the agent; a part is enough for edit_file, whose
+    /// old_string must match exactly anyway. A new file is always fine. Only
+    /// a local workspace file small enough to hash is checked.
+    fn check_read(&self, name: &str, args: &Value) -> Result<()> {
         if self.backend.name() != "local" {
             return Ok(());
         }
@@ -1894,12 +1906,16 @@ impl Agent {
         let Some((relative, now)) = crate::inbox::file_version(&self.cwd, path) else { return Ok(()) };
         match self.read_versions.get(&relative) {
             None => bail!("{path} has not been read yet. Read it with read_file first, then make the change."),
-            Some(seen) if *seen != now => {
+            Some((seen, _)) if *seen != now => {
                 bail!(
                     "{path} changed since you last read it; a command you ran, a formatter or the user may have \
                      changed it. Read it again with read_file, then retry."
                 )
             }
+            Some((_, false)) if name == "write_file" => bail!(
+                "only part of {path} has been read. Read all of it with read_file (no offset, a limit past its last \
+                 line) before overwriting it, or change it with edit_file."
+            ),
             Some(_) => Ok(()),
         }
     }
@@ -3848,6 +3864,35 @@ mod read_first_tests {
         assert_eq!(std::fs::read_to_string(&old).unwrap(), "keep\n");
         run(&mut a, "read_file", json!({"path": old}));
         assert!(run(&mut a, "write_file", json!({"path": old, "content": "gone\n"})).text.starts_with("wrote"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_overwrite_needs_the_whole_file_but_an_edit_does_not() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-read-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let path = file.display().to_string();
+        let write = json!({"path": path, "content": "new\n"});
+        let mut a = agent(dir.clone(), Mode::Yolo);
+
+        run(&mut a, "read_file", json!({"path": path, "limit": 1}));
+        let partial = run(&mut a, "write_file", write.clone());
+        assert!(partial.text.contains("only part of"), "{}", partial.text);
+        assert_eq!(partial.refusal, Some(RefusalKind::ReadFirst));
+        run(&mut a, "read_file", json!({"path": path, "offset": 2}));
+        assert!(run(&mut a, "write_file", write.clone()).text.contains("only part of"), "two parts aren't a read");
+        // A part is enough to edit, and the edit leaves the file partly seen.
+        let edit = json!({"path": path, "old_string": "one", "new_string": "uno"});
+        assert!(run(&mut a, "edit_file", edit).text.starts_with("edited"));
+        assert!(run(&mut a, "write_file", write.clone()).text.contains("only part of"));
+
+        run(&mut a, "read_file", json!({"path": path}));
+        // A later part of a file already seen whole doesn't undo that.
+        run(&mut a, "read_file", json!({"path": path, "offset": 3}));
+        assert!(run(&mut a, "write_file", write).text.starts_with("wrote"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new\n");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
