@@ -282,6 +282,19 @@ fn sessions_get_ids_titles_listing_search_and_resume() {
     assert!(repl.contains(id) && repl.contains("picks one up"), "{repl}");
 }
 
+#[test]
+fn resume_shows_saved_conversation_without_a_model_request() {
+    let s = Sandbox::new("resume-preview");
+    scripted_run(&s, &["--memory", "off", "fix the parser"], vec![text_reply("Parser fixed; tests pass.")]);
+    let out = s.cmd().args(["--memory", "off", "-c"]).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success());
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("Earlier in this task") && out.contains("Parser fixed; tests pass."), "{out}");
+    let id = sessions_listed(&s, &[])[0].0.clone();
+    let out = s.repl_off(&[&format!("/resume {id}")]);
+    assert!(out.contains("Earlier in this task") && out.contains("Parser fixed; tests pass."), "{out}");
+}
+
 /// `rusty --sessions [words]` as (id, "age  n msgs  title") pairs.
 fn sessions_listed(s: &Sandbox, words: &[&str]) -> Vec<(String, String)> {
     let out = s.cmd().arg("--sessions").args(words).stdin(Stdio::null()).output().unwrap();

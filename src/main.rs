@@ -595,6 +595,7 @@ fn expand_skill(cwd: &Path, input: &str) -> Option<String> {
 
 fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Settings) -> Result<()> {
     banner(agent, client, cwd);
+    print_resume_preview(agent);
     // Typing / opens the command menu under the prompt (see slash.rs).
     let menu = slash::Shared::default();
     let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
@@ -817,6 +818,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 [entry] => {
                     agent.end_session()?;
                     resume_session(agent, &dir, entry)?;
+                    print_resume_preview(agent);
                 }
                 [] => {
                     let hits = session::search(&dir, rest)?;
@@ -1473,9 +1475,114 @@ fn resume_session(agent: &mut Agent, dir: &Path, entry: &session::Entry) -> Resu
     Ok(())
 }
 
+/// Display saved conversation only; never feed the preview back into history.
+fn print_resume_preview(agent: &Agent) {
+    let rows = resume_preview(&agent.history, ui::width(), ui::height());
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n{}", ui::bold(&ui::fit("  Earlier in this task", ui::width().saturating_sub(1))));
+    for (role, lines) in rows {
+        println!("{}", if role == "user" { ui::user("  You") } else { ui::accent("  Rusty") });
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+    println!("{}", ui::dim(&ui::fit("  Recent excerpts · context restored", ui::width().saturating_sub(1))));
+}
+
+fn resume_preview(history: &[serde_json::Value], width: usize, height: usize) -> Vec<(&str, Vec<String>)> {
+    let cells = width.saturating_sub(3).max(1);
+    let count = (height.saturating_sub(12) / 3).clamp(1, 4);
+    let mut recent: Vec<_> = history
+        .iter()
+        .rev()
+        .filter_map(|message| {
+            let role = message["role"].as_str()?;
+            if !matches!(role, "user" | "assistant") {
+                return None;
+            }
+            let text = match &message["content"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => return None,
+            };
+            let text = text.trim();
+            if text.is_empty()
+                || text.starts_with(context::NOTE)
+                || text.starts_with("[Summary of the conversation so far]")
+            {
+                return None;
+            }
+            let safe = rusty::privacy::redact(text).0;
+            let safe: String = safe.chars().filter(|c| !c.is_control() || c.is_whitespace()).collect();
+            let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut first = ui::fit(&safe, cells);
+            if first.len() < safe.len() && !safe[first.len()..].starts_with(' ') {
+                if let Some(space) = first.rfind(' ') {
+                    if space > 0 {
+                        first.truncate(space);
+                    }
+                }
+            }
+            let rest = &safe[first.len()..];
+            let mut lines = vec![first];
+            if !rest.is_empty() {
+                let second = ui::fit(rest.trim_start(), cells);
+                if second.len() < rest.trim_start().len() {
+                    lines.push(format!("{}…", ui::fit(&second, cells.saturating_sub(1))));
+                } else {
+                    lines.push(second);
+                }
+            }
+            Some((role, lines))
+        })
+        .take(count)
+        .collect();
+    recent.reverse();
+    recent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_preview_is_recent_bounded_and_only_visible_conversation() {
+        use serde_json::json;
+        use unicode_width::UnicodeWidthStr;
+        let history = vec![
+            json!({"role":"user","content":"old request"}),
+            json!({"role":"assistant","content":"old answer"}),
+            json!({"role":"system","content":"private system"}),
+            json!({"role":"user","content":"fix the parser"}),
+            json!({"role":"tool","content":"private tool output"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Parser fixed; tests pass."}]}),
+            json!({"role":"user","content":format!("{}internal note", context::NOTE)}),
+            json!({"role":"assistant","content":null,"tool_calls":[{}]}),
+        ];
+        let original = history.clone();
+        let rows = resume_preview(&history, 80, 24);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2], ("user", vec!["fix the parser".into()]));
+        assert_eq!(rows[3], ("assistant", vec!["Parser fixed; tests pass.".into()]));
+        assert_eq!(history, original);
+        let long = vec![json!({"role":"assistant","content":"界\n\u{1b}\r".repeat(100)})];
+        for width in [4, 24, 40, 80, 120] {
+            let rows = resume_preview(&long, width, 24);
+            assert!(rows[0].1.last().unwrap().ends_with('…'));
+            for line in &rows[0].1 {
+                assert!(line.width() <= width - 3);
+                assert!(!line.chars().any(char::is_control));
+            }
+        }
+        assert!(resume_preview(&[], 80, 24).is_empty());
+    }
 
     #[test]
     fn the_goodbye_says_how_to_resume_and_fits_the_terminal() {

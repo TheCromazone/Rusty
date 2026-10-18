@@ -151,6 +151,8 @@ rusty --capabilities                          # accepted values as JSON, for har
 rusty --toolset shell "fix the build"         # offer only bash, for interface experiments
 ```
 
+Interactive resume (`rusty -c` or `/resume <id>`) shows recent requests and replies above the input. The preview is bounded to the terminal size; saved context is retained, with no model request or command replay.
+
 Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
 to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,
