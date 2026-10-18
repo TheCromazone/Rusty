@@ -1,8 +1,10 @@
 //! One gate locally and in CI. Extensions spend nothing unless requested.
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::Instant;
 
 #[derive(Default)]
@@ -208,6 +210,7 @@ fn save(out: &Path, report: &Value) -> Result<()> {
             s["seconds"].as_f64().unwrap()
         ));
     }
+    md.push_str(&format!("\nSource unchanged at recorded boundaries: {}.\n", report["source_unchanged"]));
     md.push_str(&format!("\nScope: {}. A changed-only run is not full qualification.\n", report["scope"]));
     md.push_str(&format!("\nExtensions requested: live={}, performance={}, hosted cloud={}.\nUnrequested or unrun gates are not qualification evidence.\n", report["live"], report["perf"], report["cloud"]));
     std::fs::write(out.join("summary.md"), md)?;
@@ -215,7 +218,13 @@ fn save(out: &Path, report: &Value) -> Result<()> {
 }
 /// Save before starting and after every step. A failed or never-run gate
 /// cannot disappear from the receipt or be mistaken for success.
-fn execute(steps: &[Step], out: &Path, report: &mut Value, mut run: impl FnMut(&Step) -> Result<()>) -> Result<()> {
+fn execute(
+    steps: &[Step],
+    out: &Path,
+    report: &mut Value,
+    mut run: impl FnMut(&Step) -> Result<()>,
+    mut identity: impl FnMut() -> Result<Value>,
+) -> Result<()> {
     save(out, report)?;
     for (i, step) in steps.iter().enumerate() {
         println!("\n▸ {}", step.name);
@@ -223,6 +232,14 @@ fn execute(steps: &[Step], out: &Path, report: &mut Value, mut run: impl FnMut(&
         save(out, report)?;
         let start = Instant::now();
         let result = run(step);
+        let observed = identity();
+        report["source_end"] = observed.as_ref().ok().cloned().unwrap_or(Value::Null);
+        report["source_unchanged"] = json!(observed.as_ref().is_ok_and(|s| *s == report["source_start"]));
+        let source_check = observed.and_then(|source| {
+            ensure!(source == report["source_start"], "source changed during {}; qualification stopped", step.name);
+            Ok(())
+        });
+        let result = result.and(source_check);
         report["steps"][i]["seconds"] = json!(start.elapsed().as_secs_f64());
         report["steps"][i]["status"] = json!(if result.is_ok() { "pass" } else { "fail" });
         if let Err(e) = result {
@@ -244,7 +261,8 @@ fn execute(steps: &[Step], out: &Path, report: &mut Value, mut run: impl FnMut(&
     report["status"] = json!("pass");
     save(out, report)
 }
-fn receipt(o: &Options, steps: &[Step]) -> Value {
+fn receipt(o: &Options, steps: &[Step]) -> Result<Value> {
+    let source = source_identity(&super::root())?;
     let configuration: serde_json::Map<String, Value> = [
         "EVAL_MODELS",
         "EVAL_MEMORY",
@@ -258,10 +276,134 @@ fn receipt(o: &Options, steps: &[Step]) -> Value {
     .iter()
     .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), Value::String(v))))
     .collect();
-    json!({"revision": git(&["rev-parse", "HEAD"]), "dirty": git(&["status", "--porcelain"]).is_none_or(|s| !s.is_empty()),
+    Ok(
+        json!({"revision": source["revision"], "dirty": source["dirty"], "source_start":source, "source_end":null, "source_unchanged":null,
         "status": "running", "scope": if o.changed { "changed-only" } else { "full" }, "live": o.live, "perf": o.perf, "cloud": o.cloud,
         "configuration": configuration,
-        "steps": steps.iter().map(|s| json!({"name": s.name, "status": "not-run", "seconds": 0.0})).collect::<Vec<_>>()})
+        "steps": steps.iter().map(|s| json!({"name": s.name, "status": "not-run", "seconds": 0.0})).collect::<Vec<_>>()}),
+    )
+}
+
+const MAX_IDENTITY_OUTPUT: usize = 256 * 1024;
+const MAX_IDENTITY_PATHS: usize = 512;
+const MAX_IDENTITY_FILE: u64 = 4 * 1024 * 1024;
+const MAX_IDENTITY_CONTENT: u64 = 16 * 1024 * 1024;
+
+/// Bound pipe reads before allocation. All callers capture trusted Git builtins,
+/// with external diff/text conversion and fsmonitor disabled.
+fn bounded_output(mut child: std::process::Child, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let read = child.stdout.take().unwrap().take((limit + 1) as u64).read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() > limit {
+        let _ = child.kill();
+        let _ = child.wait();
+        read?;
+        bail!("QA source identity output exceeds {limit} bytes");
+    }
+    ensure!(child.wait()?.success(), "cannot inspect QA source identity");
+    Ok(bytes)
+}
+
+/// Git identity plus Git-reported tracked changes and nonignored file hashes.
+/// Boundary observations do not attest ignored/external inputs or transient
+/// edits restored entirely within one stage; ownership still freezes source.
+fn source_identity(root: &Path) -> Result<Value> {
+    let query = |args: &[&std::ffi::OsStr]| -> Result<Vec<u8>> {
+        let child = Command::new("git")
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        bounded_output(child, MAX_IDENTITY_OUTPUT)
+    };
+    fn args<'a>(items: &[&'a str]) -> Vec<&'a std::ffi::OsStr> {
+        items.iter().map(|s| std::ffi::OsStr::new(*s)).collect()
+    }
+    let revision = query(&args(&["rev-parse", "HEAD"]))?;
+    let tree = query(&args(&["rev-parse", "HEAD^{tree}"]))?;
+    let status = query(&args(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]))?;
+    // Raw metadata, never binary patch bodies. Hash bounded changed files
+    // individually so a large dirty blob cannot be duplicated in this process.
+    let diff = query(&args(&[
+        "diff",
+        "--raw",
+        "--no-abbrev",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD",
+        "--",
+    ]))?;
+    let changed = query(&args(&[
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--diff-filter=ACMRTUXB",
+        "-z",
+        "HEAD",
+        "--",
+    ]))?;
+    let untracked = query(&args(&["ls-files", "--others", "--exclude-standard", "-z"]))?;
+    let mut paths = std::collections::BTreeSet::new();
+    for path in changed.split(|b| *b == 0).chain(untracked.split(|b| *b == 0)).filter(|p| !p.is_empty()) {
+        paths.insert(path);
+        ensure!(
+            paths.len() <= MAX_IDENTITY_PATHS,
+            "QA source identity exceeds {MAX_IDENTITY_PATHS} changed/untracked paths"
+        );
+    }
+    let mut data = Vec::new();
+    let mut part = |bytes: &[u8]| {
+        data.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        data.extend_from_slice(bytes);
+    };
+    part(&status);
+    part(&diff);
+    let mut content = 0u64;
+    for path in paths {
+        part(path);
+        let path = std::ffi::OsStr::from_bytes(path);
+        let full = root.join(path);
+        let metadata = std::fs::symlink_metadata(&full)?;
+        ensure!(
+            metadata.len() <= MAX_IDENTITY_FILE,
+            "QA source identity file exceeds 4 MiB; commit or ignore large inputs first"
+        );
+        content = content.saturating_add(metadata.len());
+        ensure!(content <= MAX_IDENTITY_CONTENT, "QA source identity changed contents exceed 16 MiB");
+        use std::os::unix::fs::PermissionsExt;
+        part(&metadata.permissions().mode().to_le_bytes());
+        if metadata.file_type().is_symlink() {
+            part(std::fs::read_link(&full)?.as_os_str().as_bytes());
+        } else {
+            ensure!(metadata.is_file(), "QA source identity requires regular files or symlinks");
+            part(&query(&["hash-object".as_ref(), "--no-filters".as_ref(), "--".as_ref(), path])?);
+        }
+    }
+    let mut hash = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Err(error) = hash.stdin.take().unwrap().write_all(&data) {
+        let _ = hash.kill();
+        let _ = hash.wait();
+        return Err(error.into());
+    }
+    let fingerprint = bounded_output(hash, 128)?;
+    ensure!(revision == query(&args(&["rev-parse", "HEAD"]))?, "source changed while taking identity");
+    Ok(
+        json!({"root":root.canonicalize()?, "revision":String::from_utf8(revision)?.trim(), "tree":String::from_utf8(tree)?.trim(),
+        "dirty":!status.is_empty() || !diff.is_empty() || !untracked.is_empty(),
+        "fingerprint":String::from_utf8(fingerprint)?.trim()}),
+    )
 }
 
 fn git(args: &[&str]) -> Option<String> {
@@ -302,14 +444,14 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
     if terminal.exists() {
         std::fs::remove_dir_all(&terminal).context("resetting QA-owned terminal fixtures")?;
     }
-    let mut report = receipt(&o, &steps);
+    let mut report = receipt(&o, &steps)?;
     if let Err(e) = o.preflight() {
         report["status"] = json!("fail");
         report["error"] = json!(e.to_string());
         save(&out, &report)?;
         return Err(e);
     }
-    execute(&steps, &out, &mut report, Step::run)?;
+    execute(&steps, &out, &mut report, Step::run, || source_identity(&super::root()))?;
     println!("\n✓ qa passed; receipt: {}", out.join("summary.md").display());
     Ok(ExitCode::SUCCESS)
 }
@@ -347,8 +489,8 @@ mod tests {
                 args: vec!["-c".into(), format!("touch '{}'", out.join("unexpected").display())],
             },
         ];
-        let mut r = receipt(&Options::default(), &steps);
-        assert!(execute(&steps, &out, &mut r, Step::run).is_err());
+        let mut r = receipt(&Options::default(), &steps).unwrap();
+        assert!(execute(&steps, &out, &mut r, Step::run, || source_identity(&super::super::root())).is_err());
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
         assert_eq!(saved["status"], "fail");
         assert_eq!(saved["steps"][0]["status"], "fail");
@@ -388,6 +530,123 @@ mod tests {
         git(&["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "test: runtime change"]);
         assert_eq!(scope("HEAD^"), "runtime=true\n");
         assert_eq!(scope("missing-revision"), "runtime=true\n");
+        std::fs::remove_dir_all(out).unwrap();
+    }
+    #[test]
+    fn source_drift_stops_later_stages_and_records_both_identities() {
+        let out = std::env::temp_dir().join(format!("rusty-qa-drift-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        let steps = vec![Step::cargo("edited", &[]), Step::cargo("must-not-run", &[])];
+        let mut report = receipt(&Options::default(), &steps).unwrap();
+        let original = report["source_start"].clone();
+        let observed = std::cell::RefCell::new(original.clone());
+        let calls = std::cell::Cell::new(0);
+        let result = execute(
+            &steps,
+            &out,
+            &mut report,
+            |_| {
+                calls.set(calls.get() + 1);
+                observed.borrow_mut()["fingerprint"] = json!("different contents");
+                Ok(())
+            },
+            || Ok(observed.borrow().clone()),
+        );
+        assert!(result.unwrap_err().to_string().contains("source changed"));
+        assert_eq!(calls.get(), 1);
+        let saved: Value = serde_json::from_slice(&std::fs::read(out.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(saved["status"], "fail");
+        assert_eq!(saved["source_start"], original);
+        assert_ne!(saved["source_start"], saved["source_end"]);
+        assert_eq!(saved["source_unchanged"], false);
+        assert_eq!(saved["steps"][1]["status"], "not-run");
+        std::fs::remove_dir_all(out).unwrap();
+    }
+    #[test]
+    fn identity_detects_changes_while_dirty_status_stays_true() {
+        let root = std::env::temp_dir().join(format!(
+            "rusty-qa-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git").args(args).current_dir(&root).status().unwrap().success());
+        };
+        git(&["init", "-q"]);
+        let tracked = root.join("tracked.rs");
+        std::fs::write(&tracked, "baseline").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "test: identity fixture",
+        ]);
+        let clean = source_identity(&root).unwrap();
+        assert_eq!(clean["dirty"], false);
+        std::fs::write(&tracked, "dirty one").unwrap();
+        let one = source_identity(&root).unwrap();
+        std::fs::write(&tracked, "dirty two").unwrap();
+        let two = source_identity(&root).unwrap();
+        assert_eq!(one["dirty"], true);
+        assert_eq!(two["dirty"], true);
+        assert_ne!(one["fingerprint"], two["fingerprint"]);
+        let untracked = root.join("new.rs");
+        std::fs::write(&untracked, "new one").unwrap();
+        let one = source_identity(&root).unwrap();
+        std::fs::write(&untracked, "new two").unwrap();
+        let two = source_identity(&root).unwrap();
+        assert_ne!(one["fingerprint"], two["fingerprint"]);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mode_one = source_identity(&root).unwrap();
+        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode_two = source_identity(&root).unwrap();
+        assert_eq!(mode_one["dirty"], mode_two["dirty"]);
+        assert_ne!(mode_one["fingerprint"], mode_two["fingerprint"]);
+        std::fs::write(root.join("large.bin"), vec![b'x'; MAX_IDENTITY_FILE as usize + 1]).unwrap();
+        assert!(source_identity(&root).unwrap_err().to_string().contains("exceeds 4 MiB"));
+        std::fs::remove_file(root.join("large.bin")).unwrap();
+        for n in 0..MAX_IDENTITY_PATHS {
+            std::fs::write(root.join(format!("extra-{n}")), b"").unwrap();
+        }
+        assert!(source_identity(&root).unwrap_err().to_string().contains("changed/untracked paths"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn oversized_git_capture_is_bounded_and_its_child_is_reaped() {
+        let pidfile = std::env::temp_dir().join(format!("rusty-qa-output-{}", std::process::id()));
+        let script = "import os,sys,time;open(sys.argv[1],'w').write(str(os.getpid()));sys.stdout.write('x'*1048576);sys.stdout.flush();time.sleep(60)";
+        let child = Command::new("python3")
+            .args(["-c", script])
+            .arg(&pidfile)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(bounded_output(child, MAX_IDENTITY_OUTPUT).unwrap_err().to_string().contains("exceeds"));
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        let _ = std::fs::remove_file(pidfile);
+    }
+    #[test]
+    fn unchanged_source_can_pass() {
+        let out = std::env::temp_dir().join(format!("rusty-qa-stable-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        let steps = vec![Step::cargo("ok", &[])];
+        let mut report = receipt(&Options::default(), &steps).unwrap();
+        let identity = report["source_start"].clone();
+        execute(&steps, &out, &mut report, |_| Ok(()), || Ok(identity.clone())).unwrap();
+        assert_eq!(report["status"], "pass");
+        assert_eq!(report["source_unchanged"], true);
         std::fs::remove_dir_all(out).unwrap();
     }
 }
