@@ -751,6 +751,146 @@ fn bash_reply(command: &str) -> serde_json::Value {
     tool_reply("bash", serde_json::json!({"command": command}))
 }
 
+/// A private control channel owns this escaped pipe holder's lifetime. The
+/// fixture never stores or signals a PID; dropping STOP also releases it.
+#[cfg(unix)]
+struct CaptureHolder {
+    command: String,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    control: Option<std::thread::JoinHandle<bool>>,
+}
+#[cfg(unix)]
+impl CaptureHolder {
+    fn new(s: &Sandbox) -> Self {
+        use std::io::Read;
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        std::fs::set_permissions(&s.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = s.home.join("capture.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let script = s.home.join("capture.py");
+        std::fs::write(
+            &script,
+            r#"import os,socket,sys
+r,w=os.pipe()
+if os.fork()==0:
+    os.close(r)
+    os.setsid()
+    control=socket.socket(socket.AF_UNIX)
+    control.settimeout(25)
+    control.connect(sys.argv[1])
+    control.sendall(b'READY')
+    os.write(w,b'x')
+    os.close(w)
+    try: control.recv(1)
+    finally: os._exit(0)
+os.close(w)
+os.read(r,1)
+os.close(r)
+print('launcher completed',flush=True)
+os._exit(0)
+"#,
+        )
+        .unwrap();
+        let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
+        let command = format!("python3 {} {}", quote(&script), quote(&socket));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let control = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            // Darwin can inherit the listener's nonblocking flag on accept.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ready = [0; 5];
+            stream.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"READY");
+            let _ = stopped.recv_timeout(Duration::from_secs(20));
+            // Probe before STOP: EOF would mean timeout/natural exit, not
+            // evidence that capture returned while a live holder owned pipes.
+            stream.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+            let mut byte = [0];
+            let live = matches!(stream.read(&mut byte), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            if live {
+                stream.write_all(b"S").unwrap();
+                assert_eq!(stream.read(&mut byte).unwrap(), 0, "holder did not close its owned channel");
+            }
+            live
+        });
+        Self { command, stop: Some(stop), control: Some(control) }
+    }
+    fn finish(mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        assert!(self.control.take().unwrap().join().unwrap(), "holder must remain live until capture returned");
+    }
+}
+#[cfg(unix)]
+impl Drop for CaptureHolder {
+    fn drop(&mut self) {
+        self.stop.take(); // EOF releases the fixture on assertion failure too.
+        if let Some(control) = self.control.take() {
+            let _ = control.join();
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn completion_contract_cli_keeps_exit_zero_but_rejects_incomplete_fixed_check_capture() {
+    let ordinary = Sandbox::new("capture-ordinary");
+    let holder = CaptureHolder::new(&ordinary);
+    let (stdout, stderr, requests) = scripted_run(
+        &ordinary,
+        &["--mode", "standard", "--agents", "off", "--memory", "off", "--permissions", "yolo", "inspect"],
+        vec![bash_reply(&holder.command), text_reply("observed")],
+    );
+    holder.finish();
+    assert_eq!(requests.len(), 2);
+    let tool_results = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(tool_results.contains("exit code: 0"), "{tool_results}");
+    assert!(tool_results.contains("capture_complete: false"), "{tool_results}");
+    assert!(!tool_results.contains("timed out"), "{tool_results}");
+    assert!(!format!("{stdout}{stderr}").contains("timed out"));
+
+    let fixed = Sandbox::new("capture-fixed");
+    let holder = CaptureHolder::new(&fixed);
+    let (out, trace, _) = verified_run(
+        &fixed,
+        &holder.command,
+        vec![done_reply(), text_reply("capture remains incomplete")],
+        "standard",
+        "yolo",
+    );
+    holder.finish();
+    assert_eq!(out.status.code(), Some(2));
+    let records = trace["verification"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{trace}");
+    assert_eq!(records[0]["exit_code"], 0);
+    assert_eq!(records[0]["outcome"], "EvidenceUnavailable", "{trace}");
+    assert!(records[0]["observation_error"].as_str().unwrap().contains("capture"));
+    assert_ne!(trace["goal_outcome"], "verified");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+}
+
 const FIXED_CHECK: &str = "python3 -c 'from calc import add; assert add(2,3)==5 and add(-2,3)==1'";
 
 fn verified_run(
@@ -831,7 +971,7 @@ fn done_reply() -> serde_json::Value {
 }
 
 #[test]
-fn fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
+fn completion_contract_fixed_goal_accepts_a_correct_patch_with_fresh_executed_evidence() {
     let s = Sandbox::new("fixed-goal-positive");
     seed_calc(&s);
     let (out, trace, requests) = verified_run(&s, FIXED_CHECK, vec![fix_calc(), done_reply()], "standard", "yolo");
@@ -900,7 +1040,7 @@ fn memory_learns_only_from_a_goals_fixed_check() {
 }
 
 #[test]
-fn fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
+fn completion_contract_fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
     for case in ["unchecked", "failed", "stale"] {
         let s = Sandbox::new(&format!("fixed-goal-{case}"));
         seed_calc(&s);
@@ -925,7 +1065,7 @@ fn fixed_goal_rejects_unchecked_failed_and_stale_completion_claims() {
 }
 
 #[test]
-fn completion_is_checked_after_all_calls_in_the_same_reply() {
+fn completion_contract_completion_is_checked_after_all_calls_in_the_same_reply() {
     let s = Sandbox::new("fixed-goal-batch");
     seed_calc(&s);
     let mut batch = done_reply();
@@ -938,7 +1078,7 @@ fn completion_is_checked_after_all_calls_in_the_same_reply() {
 }
 
 #[test]
-fn verification_cannot_change_its_inputs_and_then_pass() {
+fn completion_contract_verification_cannot_change_its_inputs_and_then_pass() {
     let s = Sandbox::new("fixed-goal-mutating-check");
     seed_calc(&s);
     let check="python3 -c 'from pathlib import Path; p=Path(\"calc.py\"); p.write_text(p.read_text().replace(\"a - b\",\"a + b\"))'";
@@ -950,7 +1090,7 @@ fn verification_cannot_change_its_inputs_and_then_pass() {
 }
 
 #[test]
-fn fixed_verification_cannot_bypass_permissions() {
+fn completion_contract_fixed_verification_cannot_bypass_permissions() {
     let s = Sandbox::new("fixed-goal-denied");
     seed_calc(&s);
     let (out, trace, _) = verified_run(
@@ -967,7 +1107,7 @@ fn fixed_verification_cannot_bypass_permissions() {
 }
 
 #[test]
-fn fixed_verification_is_bounded_and_does_not_accept_timeout() {
+fn completion_contract_fixed_verification_is_bounded_and_does_not_accept_timeout() {
     let s = Sandbox::new("fixed-goal-timeout");
     seed_calc(&s);
     let (out, trace, _) =
@@ -977,7 +1117,7 @@ fn fixed_verification_is_bounded_and_does_not_accept_timeout() {
 }
 
 #[test]
-fn blocked_goals_skip_fixed_verification_and_review() {
+fn completion_contract_blocked_goals_skip_fixed_verification_and_review() {
     let s = Sandbox::new("fixed-goal-blocked");
     seed_calc(&s);
     let blocked = tool_reply("goal_done", serde_json::json!({"evidence":"need input","blocked":true}));
@@ -990,7 +1130,7 @@ fn blocked_goals_skip_fixed_verification_and_review() {
 }
 
 #[test]
-fn fixed_verification_follows_the_careful_review_and_its_edits() {
+fn completion_contract_fixed_verification_follows_the_careful_review_and_its_edits() {
     let s = Sandbox::new("fixed-goal-review");
     seed_calc(&s);
     let (out, trace, requests) = verified_run(
@@ -1004,10 +1144,11 @@ fn fixed_verification_follows_the_careful_review_and_its_edits() {
     assert_eq!(requests.len(), 4);
     assert_eq!(trace["verification"].as_array().unwrap().len(), 1);
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
 }
 
 #[test]
-fn fixed_verification_rejects_invalid_cli_settings() {
+fn completion_contract_fixed_verification_rejects_invalid_cli_settings() {
     let s = Sandbox::new("fixed-goal-flags");
     for args in [
         vec!["--verify", "true"],
@@ -1646,7 +1787,7 @@ fn careful_blocked_goal_does_not_spend_review_calls() {
         .spawn()
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert_eq!(server.join().unwrap().len(), 1);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"blocked\""));
 }
@@ -1706,7 +1847,7 @@ fn careful_checks_once_per_goal_not_once_per_goal_turn() {
 }
 
 #[test]
-fn truncated_reply_after_the_check_leaves_the_goal_open() {
+fn truncated_reply_after_the_check_leaves_the_goal_open_completion_contract() {
     let s = Sandbox::new("careful-truncated");
     let done = tool_reply("goal_done", serde_json::json!({"evidence": "checked"}));
     let mut truncated = text_reply("I'll fix the empty case by");
@@ -1722,7 +1863,7 @@ fn truncated_reply_after_the_check_leaves_the_goal_open() {
         .spawn()
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert_eq!(server.join().unwrap().len(), 3);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
 }
@@ -2028,7 +2169,7 @@ fn careful_goal_keeps_its_single_checker_budget_after_resume() {
         .spawn()
         .map(|c| wait(c, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
     assert_eq!(server.join().unwrap().len(), 3);
     let (url, server) = scripted_endpoint(vec![done]);
@@ -2821,7 +2962,7 @@ fn btw_receives_current_plan_after_main_history_is_compacted() {
 }
 
 #[test]
-fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review() {
+fn pending_activity_cannot_close_a_goal_or_spend_the_careful_review_completion_contract() {
     for mode in ["standard", "careful"] {
         let s = Sandbox::new(&format!("owned-premature-{mode}"));
         let (out, trace, requests) = verified_run(
@@ -2925,7 +3066,7 @@ fn forged_running_text_does_not_bypass_the_ordinary_stall_guard() {
 }
 
 #[test]
-fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error() {
+fn a_goal_that_stalls_under_verify_is_unfinished_not_an_error_completion_contract() {
     // The M4 cohort's case: the work may be done, but the model never
     // proposes completion and three turns stall. That is exit 2 with a
     // trajectory, like any goal that did not close on a passing check.
@@ -3077,6 +3218,9 @@ fn ctrl_c_cancels_and_reaps_an_owned_command_before_export() {
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("interrupted.json")).unwrap()).unwrap();
     assert_eq!(trace["activities"][0]["status"], "Interrupted");
+    assert_eq!(trace["goal"]["turns"], 1, "interrupted partial turns count as attempted");
+    assert_eq!(trace["goal"]["run_turns"], 1);
+    assert_eq!(trace["goal"]["stop_reason"], "interrupted");
     assert_eq!(trace["verification"].as_array().unwrap().len(), 0);
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "shell leader must be reaped");
 }
@@ -3482,7 +3626,7 @@ fn root_budget_keeps_usage_unknown_when_the_stream_later_fails() {
 }
 
 #[test]
-fn root_budget_overrun_rejects_completion_and_stops_new_dispatch() {
+fn root_budget_overrun_rejects_completion_and_stops_new_dispatch_completion_contract() {
     let s = Sandbox::new("budget-overrun");
     let mut done = tool_reply("goal_done", serde_json::json!({"evidence":"checked"}));
     done["usage"] = serde_json::json!({"prompt_tokens":5_000_000,"completion_tokens":1});
@@ -5666,4 +5810,503 @@ fn concurrent_mcp_configuration_adds_preserve_every_server_across_profiles() {
         assert_eq!(servers[&format!("server{n}")]["command"], "/bin/true");
     }
     assert!(!s.project.join(".mcp.json.pending").exists());
+}
+
+// Scripted model replies exercise the real CLI and shell without provider spend.
+fn pinned_completion(case: &str, replies: Vec<serde_json::Value>) -> (Output, serde_json::Value) {
+    let s = Sandbox::new(&format!("pinned-{case}"));
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (url, server) = scripted_endpoint(replies);
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc.py",
+                "--verify",
+                "python3 check.py",
+                "--verify-file",
+                "check.py",
+                "--stats",
+                "--trajectory",
+            ])
+            .arg(s.home.join("trace.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(15),
+    );
+    let trace = serde_json::from_str(&std::fs::read_to_string(s.home.join("trace.json")).unwrap()).unwrap();
+    server.join().unwrap();
+    (out, trace)
+}
+
+#[test]
+fn completion_contract_pinned_checker_accepts_repair() {
+    let (out, trace) = pinned_completion("repair", vec![fix_calc(), done_reply()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
+}
+
+#[test]
+fn completion_contract_pinned_checker_rejects_tampering() {
+    for (case, command) in [
+        ("overwrite", "printf 'pass\\n' > check.py"),
+        ("delete", "rm check.py"),
+        ("symlink", "mv check.py original.py; ln -s original.py check.py"),
+    ] {
+        let (out, trace) = pinned_completion(case, vec![bash_reply(command), done_reply(), text_reply("unresolved")]);
+        assert_eq!(out.status.code(), Some(2), "{case}");
+        assert_eq!(trace["claims"]["accepted"], 0, "{case}: {trace}");
+        assert_eq!(trace["claims"]["check_error"], 1, "{case}: {trace}");
+        assert!(trace["messages"].to_string().contains("pinned verification"), "{trace}");
+    }
+}
+
+#[test]
+fn completion_contract_pinned_checker_can_be_restored_then_rechecked() {
+    let (out, trace) = pinned_completion(
+        "restore",
+        vec![
+            bash_reply("cp check.py original.py; printf 'pass\\n' > check.py"),
+            done_reply(),
+            bash_reply("cp original.py check.py"),
+            fix_calc(),
+            done_reply(),
+        ],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(trace["claims"]["check_error"], 1);
+    assert_eq!(trace["claims"]["accepted"], 1);
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
+}
+
+#[test]
+fn completion_contract_unpinned_checker_is_not_independent_proof() {
+    let s = Sandbox::new("unpinned-check-control");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (out, trace, _) = verified_run(
+        &s,
+        "python3 check.py",
+        vec![bash_reply("printf 'pass\\n' > check.py"), done_reply()],
+        "standard",
+        "yolo",
+    );
+    assert!(out.status.success());
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    let independent = Command::new("python3")
+        .current_dir(&s.project)
+        .args(["-B", "-c", "from calc import add; assert add(2, 3) == 5"])
+        .output()
+        .unwrap();
+    assert!(!independent.status.success(), "the unchanged broken implementation must fail independent grading");
+}
+
+#[test]
+fn completion_contract_pagination_grader_rejects_plausible_wrong_repairs() {
+    let s = Sandbox::new("pagination-grader");
+    let task = Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/verified-pagination");
+    let oracle = "def collect(fetch, start=None):\n    items = []\n    seen = set()\n    cursor = start\n    while True:\n        if cursor in seen:\n            raise ValueError('cycle')\n        seen.add(cursor)\n        page = fetch(cursor)\n        items.extend(page['items'])\n        cursor = page['next']\n        if cursor is None:\n            return items\n";
+    let original = std::fs::read_to_string(task.join("files/pagination.py")).unwrap();
+    for (name, body, passes) in [
+        ("original", original, false),
+        ("oracle", oracle.to_string(), true),
+        ("partial", oracle.replace("raise ValueError('cycle')", "return items"), false),
+        ("duplicates", oracle.replace("return items", "return list(dict.fromkeys(items))"), false),
+        ("ignores-start", oracle.replace("cursor = start", "cursor = None"), false),
+    ] {
+        std::fs::write(s.project.join("pagination.py"), body).unwrap();
+        let out =
+            Command::new("python3").arg("-B").arg(task.join("hidden.py")).current_dir(&s.project).output().unwrap();
+        assert_eq!(out.status.success(), passes, "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn completion_contract_pinned_checker_survives_real_session_resume() {
+    let s = Sandbox::new("pinned-resume");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2, 3) == 5\n").unwrap();
+    let (url, server) =
+        scripted_endpoint(vec![tool_reply("goal_done", serde_json::json!({"blocked":true,"evidence":"need input"}))]);
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc.py",
+                "--verify",
+                "python3 -B check.py",
+                "--verify-file",
+                "check.py",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(20),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    server.join().unwrap();
+    std::fs::write(s.project.join("check.py"), "pass\n").unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("unresolved")]);
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "1")
+        .args([
+            "--mode",
+            "standard",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--yolo",
+            "--continue",
+            "--stats",
+            "--trajectory",
+        ])
+        .arg(s.home.join("resumed.json"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    server.join().unwrap();
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("resumed.json")).unwrap()).unwrap();
+    assert_eq!(trace["claims"]["accepted"], 0);
+    assert_eq!(trace["claims"]["check_error"], 1);
+    assert!(trace["messages"].to_string().contains("pinned verification file changed"));
+    assert_eq!(trace["goal"]["status"], "Active");
+}
+
+#[test]
+fn completion_contract_goal_outcomes_without_a_checker() {
+    for (case, reply, code, outcome) in [
+        ("claim", done_reply(), 0, "completed_unverified"),
+        ("blocked", tool_reply("goal_done", serde_json::json!({"blocked":true,"evidence":"need input"})), 2, "blocked"),
+        ("turn-limit", text_reply("still investigating"), 2, "incomplete"),
+    ] {
+        let s = Sandbox::new(&format!("outcome-{case}"));
+        let (url, server) = scripted_endpoint(vec![reply]);
+        let path = s.home.join("trace.json");
+        let out = wait(
+            s.cmd()
+                .env("RUSTY_BASE_URL", url)
+                .env("RUSTY_GOAL_MAX_TURNS", "1")
+                .args(["--mode", "standard", "--memory", "off", "--goal", "inspect", "--stats", "--trajectory"])
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            Duration::from_secs(15),
+        );
+        assert_eq!(out.status.code(), Some(code), "{case}: {}", String::from_utf8_lossy(&out.stderr));
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(trace["goal_outcome"], outcome);
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("\"goal_outcome\":\"{outcome}\"")));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn completion_contract_executed_check_retains_receipt_when_pin_changes() {
+    let s = Sandbox::new("check-changes-pin");
+    std::fs::write(s.project.join("criterion.txt"), "original").unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("cannot finish")]);
+    let path = s.home.join("trace.json");
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "inspect",
+                "--verify",
+                "printf changed > criterion.txt; printf receipt-marker",
+                "--verify-file",
+                "criterion.txt",
+                "--trajectory",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(15),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 1);
+    let receipt = &trace["verification"][0];
+    assert_eq!(receipt["outcome"], "EvidenceUnavailable");
+    assert_eq!(receipt["exit_code"], 0);
+    assert!(receipt["output"].as_str().unwrap().contains("receipt-marker"));
+    assert!(receipt["observation_error"].as_str().unwrap().contains("criterion.txt"));
+    assert_eq!(trace["claims"]["check_failed"], 1);
+    assert_eq!(trace["claims"]["check_error"], 0);
+    assert_eq!(trace["goal_outcome"], "incomplete");
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
+    let s = Sandbox::new("interactive-fixed-goal");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2,3)==5\n").unwrap();
+    let (url, server) = scripted_endpoint(vec![fix_calc(), done_reply()]);
+    let path = s.home.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .args(["--mode", "standard", "--memory", "off", "--yolo", "--trajectory"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "/goal --verify --timeout 7 python3 check.py\n/goal --pin check.py\n/goal repair calc.py\n/goal status\n/exit"
+    )
+    .unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["goal_outcome"], "verified");
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal"]["check"]["timeout_secs"], 7);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("verified:"));
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn goal_allowance_resets_only_on_explicit_invocation_and_checkpoints_limits() {
+    for limit in [0usize, 1, 2] {
+        let s = Sandbox::new(&format!("goal-allowance-{limit}"));
+        std::fs::write(s.project.join("check.py"), "assert True\n").unwrap();
+        let (url, server) = scripted_endpoint(vec![text_reply("Work remains open."); limit * 2]);
+        let first = s.home.join("first.json");
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", limit.to_string())
+            .env("RUSTY_RETRY_SECS", "1")
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--yolo", "--trajectory"])
+            .arg(&first)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "/goal --verify python3 -B check.py\n/goal --pin check.py\n/goal inspect this fixture\n/goal resume\n/exit"
+        )
+        .unwrap();
+        let out = wait(child, Duration::from_secs(20));
+        assert!(out.status.success(), "limit {limit}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(server.join().unwrap().len(), limit * 2, "actual requests at limit {limit}");
+        let before: serde_json::Value = serde_json::from_slice(&std::fs::read(first).unwrap()).unwrap();
+        assert_eq!(before["goal"]["turns"], limit * 2);
+        assert_eq!(before["goal"]["run_turns"], limit);
+        assert_eq!(before["goal"]["run_limit"], limit);
+        assert_eq!(before["goal"]["stop_reason"], "turn_limit");
+        assert_eq!(before["goal_end"], "turn_limit");
+        assert_eq!(before["goal_outcome"], "incomplete");
+
+        let (url, server) = scripted_endpoint(vec![text_reply("Still working."); limit]);
+        let second = s.home.join("second.json");
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", limit.to_string())
+            .env("RUSTY_RETRY_SECS", "1")
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--yolo", "--continue", "--trajectory"])
+            .arg(&second)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "/goal status\n/goal resume\n/exit").unwrap();
+        let out = wait(child, Duration::from_secs(20));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(server.join().unwrap().len(), limit, "restart never replays a goal before explicit resume");
+        let shown = String::from_utf8_lossy(&out.stdout);
+        assert!(shown.contains("last stop: turn limit") && shown.contains("lifetime turns"), "{shown}");
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(second).unwrap()).unwrap();
+        assert_eq!(after["goal"]["turns"], limit * 3);
+        assert_eq!(after["goal"]["run_turns"], limit);
+        assert_eq!(after["goal"]["run_limit"], limit);
+        assert_eq!(after["goal"]["stop_reason"], "turn_limit");
+        assert_eq!(after["goal"]["check"], before["goal"]["check"], "resume retains pinned acceptance");
+        assert!(after["verification"].as_array().unwrap().is_empty());
+        let path = std::fs::read_dir(sessions_dir(&s))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json") && p.file_stem().unwrap().len() == 32)
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["goal"], after["goal"], "checkpoint includes final counters and stop transition");
+    }
+}
+
+#[test]
+fn goal_allowance_does_not_reset_a_finite_resource_budget() {
+    let s = Sandbox::new("goal-allowance-budget");
+    let ledger = s.home.join("ledger.json");
+    let (url, server) = scripted_endpoint(vec![text_reply("Keep working."); 3]);
+    let path = s.home.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "2")
+        .env("RUSTY_BUDGET_LEDGER", &ledger)
+        .env("RUSTY_RETRY_SECS", "1")
+        .args([
+            "--mode",
+            "standard",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--yolo",
+            "--max-requests",
+            "3",
+            "--trajectory",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal inspect this fixture\n/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 3, "resume cannot buy another resource allowance");
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["goal"]["turns"], 4, "the denied partial turn is still attempted");
+    assert_eq!(trace["goal"]["run_turns"], 2);
+    assert_eq!(trace["goal"]["stop_reason"], "error");
+    let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(ledger).unwrap()).unwrap();
+    assert_eq!(ledger["requests"], 3);
+    assert!(ledger["denied_requests"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn completion_contract_planted_python_bytecode_cannot_verify_broken_source() {
+    let s = Sandbox::new("pinned-bytecode");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2,3)==5\n").unwrap();
+    let planted = Command::new("python3").current_dir(&s.project).args(["-B", "-c", r#"
+import importlib.util, marshal, pathlib, struct, sys
+sys.pycache_prefix = None
+source = pathlib.Path('calc.py')
+cache = pathlib.Path(importlib.util.cache_from_source(str(source)))
+cache.parent.mkdir(exist_ok=True)
+st = source.stat()
+cache.write_bytes(importlib.util.MAGIC_NUMBER + struct.pack('<III', 0, int(st.st_mtime), st.st_size) + marshal.dumps(compile('def add(a, b): return a + b', 'calc.py', 'exec')))
+"#]).status().unwrap();
+    assert!(planted.success());
+    let control = Command::new("python3")
+        .current_dir(&s.project)
+        .args(["-B", "-c", "import sys; sys.pycache_prefix=None; from calc import add; assert add(2,3)==5"])
+        .status()
+        .unwrap();
+    assert!(control.success(), "negative control must load the planted bytecode");
+    let before = std::fs::read(s.project.join("calc.py")).unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("still broken")]);
+    let path = s.home.join("trace.json");
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--agents",
+                "off",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "repair calc",
+                "--verify",
+                "python3 -B check.py",
+                "--verify-file",
+                "check.py",
+                "--trajectory",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(20),
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["claims"]["accepted"], 0);
+    assert_eq!(trace["verification"][0]["outcome"], "Failed");
+    assert_eq!(trace["verification"][0]["exit_code"], 1);
+    assert_eq!(std::fs::read(s.project.join("calc.py")).unwrap(), before);
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn completion_contract_verify_and_pin_words_remain_ordinary_objectives() {
+    for objective in ["verify the checkout flow works", "pin the release version"] {
+        let s = Sandbox::new("ordinary-goal-prefix");
+        let (url, server) = scripted_endpoint(vec![done_reply()]);
+        let path = s.home.join("trace.json");
+        let mut cmd = s.cmd();
+        cmd.env("RUSTY_BASE_URL", url).args(["--memory", "off", "--mode", "standard", "--trajectory"]).arg(&path);
+        let out = s.repl_with(cmd, &[&format!("/goal {objective}"), "/exit"]);
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(trace["goal"]["objective"], objective);
+        assert!(trace["goal"]["check"].is_null());
+        assert_eq!(trace["goal_outcome"], "completed_unverified");
+        assert!(!out.contains("fixed check set"));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
 }

@@ -131,6 +131,10 @@ struct Cli {
     #[arg(long, requires = "goal", value_name = "COMMAND")]
     verify: Option<String>,
 
+    /// Pin an acceptance file before work starts; repeat for each workspace-relative file
+    #[arg(long, requires = "verify", value_name = "PATH")]
+    verify_file: Vec<PathBuf>,
+
     /// Deadline for the fixed acceptance command (1..600 seconds)
     #[arg(long, requires = "verify", default_value = "120", value_parser = clap::value_parser!(u64).range(1..=600))]
     verify_timeout: u64,
@@ -484,7 +488,9 @@ fn run() -> Result<i32> {
                             "--verify currently requires local tools; remote acceptance is not qualified"
                         ));
                     }
-                    agent.goal_check = Some(verification::CheckSpec::new(command, cli.verify_timeout)?);
+                    agent.goal_check = Some(
+                        verification::CheckSpec::new(command, cli.verify_timeout)?.pin_files(&cwd, &cli.verify_file)?,
+                    );
                 }
                 agent.run_goal(Some(goal))
             }
@@ -507,7 +513,7 @@ fn run() -> Result<i32> {
         return Ok(if signal::interrupted() {
             130
         } else if agent.goal_end == Some("stalled")
-            || cli.verify.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
+            || cli.goal.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
         {
             2
         } else {
@@ -536,7 +542,7 @@ fn joined<T>(probe: std::thread::JoinHandle<T>) -> T {
 
 /// Bumped when a harness-facing flag, exit code or `--stats` key changes
 /// meaning (docs/VERIFICATION.md, "Harness contract").
-const CONTRACT: u32 = 2;
+const CONTRACT: u32 = 4;
 
 /// What this build accepts, so a harness can refuse an unsupported setting
 /// before any model call. Each list is filtered through the parser that
@@ -565,12 +571,12 @@ fn capabilities() -> serde_json::Value {
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
         "tools": ["local", "daytona", "ssh"],
         "toolset": ["full", "shell"],
-        "verify": {"supported": true, "timeout_secs": [1, 600]},
+        "verify": {"supported": true, "timeout_secs": [1, 600], "files_flag": true},
         "integrations": {"flag": true, "hosts": ["github", "gitlab", "bitbucket-cloud"], "git_views": ["status", "diff", "log"], "mcp_management": ["list", "add", "remove", "check"]},
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal", "goal_end", "context", "compactions"],
+        "stats": ["model_budget", "claims", "safety", "goal", "goal_end", "goal_outcome", "context", "compactions"],
     })
 }
 
@@ -591,6 +597,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
             "goal_end": agent.goal_end,
+            "goal_outcome": agent.goal_outcome(),
             "claims": agent.completion,
             "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
@@ -1101,17 +1108,47 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
         }
         "/goal" => match rest {
+            "--verify" | "--pin" => {
+                return Err(anyhow!("usage: /goal --verify [--timeout SECONDS] COMMAND or /goal --pin PATH"))
+            }
+            "--verify off" => {
+                agent.goal_check = None;
+                println!("  future goals have no fixed check; the current goal is unchanged");
+            }
+            value if value.starts_with("--verify ") => {
+                if agent.backend.name() != "local" {
+                    return Err(anyhow!("/goal --verify requires local tools; remote acceptance is not qualified"));
+                }
+                let check = verification::CheckSpec::parse_interactive(&value[9..])?;
+                agent.goal_check = Some(check);
+                println!("  fixed check set for future goals; /goal --pin <path> pins an acceptance file");
+            }
+            value if value.starts_with("--pin ") => {
+                let check = agent.goal_check.clone().ok_or_else(|| anyhow!("set /goal --verify <command> first"))?;
+                agent.goal_check = Some(check.pin_files(cwd, &[PathBuf::from(&value[6..])])?);
+                println!("  acceptance file pinned for future goals");
+            }
             "" | "status" => match &agent.goal {
                 Some(g) => {
                     let status = match &g.status {
                         GoalStatus::Active => "active".to_string(),
-                        GoalStatus::Done(e) => format!("done: {e}"),
+                        GoalStatus::Done(e) => {
+                            format!("{}: {e}", agent.goal_outcome().unwrap_or("completed_unverified"))
+                        }
                         GoalStatus::Blocked(e) => format!("blocked: {e}"),
                     };
                     println!(
                         "  goal {}\n  {}",
                         ui::bold(&g.objective),
-                        ui::dim(&format!("{status} · {} turns", g.turns))
+                        ui::dim(&format!(
+                            "{status} · {}/{} turns this run · {} lifetime turns{}",
+                            g.run_turns,
+                            g.run_limit,
+                            g.turns,
+                            g.stop_reason
+                                .map(|reason| format!(" · last stop: {}", reason.name().replace('_', " ")))
+                                .unwrap_or_default()
+                        ))
                     );
                 }
                 None => println!("{}", ui::dim("  no goal. /goal <objective> to start one")),

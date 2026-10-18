@@ -445,12 +445,15 @@ fn search(args: &Value) -> Result<String> {
 fn bash(args: &Value) -> Result<String> {
     let command = arg(args, "command")?;
     let timeout = Duration::from_secs(args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600));
-    let (status, stdout, stderr) = run(command, timeout)?;
+    let ShellCapture { status, stdout, stderr, capture_complete } = run_capture(command, timeout)?;
     let mut out = match status {
         Some(code) => format!("exit code: {}\n", code.map_or("signal".into(), |c| c.to_string())),
         None if signal::interrupted() => "interrupted by the user (killed)\n".to_string(),
         None => format!("timed out after {}s (killed)\n", timeout.as_secs()),
     };
+    if !capture_complete {
+        let _ = writeln!(out, "capture_complete: false");
+    }
     if !stdout.is_empty() {
         let _ = write!(out, "stdout:\n{stdout}");
     }
@@ -486,6 +489,20 @@ fn only_changes_directory(cmd: &str) -> bool {
 /// Some(None) when it died from a signal. Also used by the infra harness
 /// for its own snapshot and verification commands.
 pub fn run(command: &str, timeout: Duration) -> Result<(Option<Option<i32>>, String, String)> {
+    let capture = run_capture(command, timeout)?;
+    Ok((capture.status, capture.stdout, capture.stderr))
+}
+
+/// Exit status and capture completeness describe independent observations.
+/// A successful launcher can leave inherited output pipes open elsewhere.
+pub struct ShellCapture {
+    pub status: Option<Option<i32>>,
+    pub stdout: String,
+    pub stderr: String,
+    pub capture_complete: bool,
+}
+
+pub fn run_capture(command: &str, timeout: Duration) -> Result<ShellCapture> {
     run_owned(command, timeout, None)
 }
 
@@ -495,18 +512,15 @@ pub(crate) fn run_cancellable(
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(Option<Option<i32>>, String, String)> {
-    run_owned(command, timeout, Some(cancel))
+    let capture = run_owned(command, timeout, Some(cancel))?;
+    Ok((capture.status, capture.stdout, capture.stderr))
 }
 
-fn run_owned(
-    command: &str,
-    timeout: Duration,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<(Option<Option<i32>>, String, String)> {
+fn run_owned(command: &str, timeout: Duration, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<ShellCapture> {
     use std::sync::atomic::Ordering;
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     if cancelled() || signal::interrupted() {
-        return Ok((None, String::new(), String::new()));
+        return Ok(ShellCapture { status: None, stdout: String::new(), stderr: String::new(), capture_complete: true });
     }
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -522,8 +536,8 @@ fn run_owned(
     // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
     let so = child.0.stdout.take().unwrap();
     let se = child.0.stderr.take().unwrap();
-    let t_out = std::thread::spawn(move || drain(so));
-    let t_err = std::thread::spawn(move || drain(se));
+    let t_out = ShellReader::new(so)?;
+    let t_err = ShellReader::new(se)?;
 
     let start = Instant::now();
     let status = loop {
@@ -543,9 +557,93 @@ fn run_owned(
     // Kill descendants even when the shell exited first, before joining pipe
     // readers. A background child must not keep verification alive forever.
     drop(child);
-    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
-    Ok((status, stdout, stderr))
+    // One shared grace budget tolerates delayed scheduling without allowing an
+    // escaped pipe holder to retain either reader indefinitely. This is capture
+    // policy, not proof of process containment or a change to the exit status.
+    let until = Instant::now() + Duration::from_secs(2);
+    let (out, out_complete) = t_out.finish_until(until);
+    let (err, err_complete) = t_err.finish_until(until);
+    let stdout = String::from_utf8_lossy(&out).to_string();
+    let mut stderr = String::from_utf8_lossy(&err).to_string();
+    let capture_complete = out_complete && err_complete;
+    if !capture_complete {
+        stderr.push_str(
+            "\n[output capture incomplete: inherited pipe remained open or reader failed; readers stopped]\n",
+        );
+    }
+    Ok(ShellCapture { status, stdout, stderr, capture_complete })
+}
+
+// Reader ownership is independent of descendant process-group containment.
+// A setsid descendant can retain a pipe; it must not retain our thread or FD.
+struct ShellReader {
+    eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+impl ShellReader {
+    fn new<T: Read + std::os::fd::AsRawFd + Send + 'static>(pipe: T) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        struct Cancellable<T> {
+            eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            pipe: T,
+            stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl<T: Read + AsRawFd> Read for Cancellable<T> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                loop {
+                    if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "shell reader stopped"));
+                    }
+                    match self.pipe.read(bytes) {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            let mut fd = libc::pollfd { fd: self.pipe.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                            let rc = unsafe { libc::poll(&mut fd, 1, 25) };
+                            if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        }
+                        Ok(0) => {
+                            self.eof.store(true, std::sync::atomic::Ordering::Release);
+                            return Ok(0);
+                        }
+                        result => return result,
+                    }
+                }
+            }
+        }
+        let fd = pipe.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("setting shell output nonblocking");
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let input = Cancellable { pipe, stop: stop.clone(), eof: eof.clone() };
+        let thread = Some(std::thread::spawn(move || drain(input)));
+        Ok(Self { stop, thread, eof })
+    }
+
+    fn finish_until(mut self, until: Instant) -> (Vec<u8>, bool) {
+        let thread = self.thread.as_ref().unwrap();
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        match self.thread.take().unwrap().join() {
+            Ok(output) => (output, self.eof.load(std::sync::atomic::Ordering::Acquire)),
+            Err(_) => (Vec::new(), false),
+        }
+    }
+}
+impl Drop for ShellReader {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct OwnedShell(std::process::Child);
@@ -793,6 +891,122 @@ mod tests {
         fs::write(&path, b"ok\n\xff").unwrap();
         assert!(read_file(&json!({"path":path,"limit":1})).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_waits_for_delayed_normal_drain_and_reports_missing_eof() {
+        use std::os::unix::net::UnixStream;
+        let (read, mut write) = UnixStream::pair().unwrap();
+        let reader = ShellReader::new(read).unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::io::Write::write_all(&mut write, b"delayed output").unwrap();
+        });
+        let (bytes, complete) = reader.finish_until(Instant::now() + Duration::from_secs(2));
+        writer.join().unwrap();
+        assert!(complete);
+        assert_eq!(bytes, b"delayed output");
+        let (read, _held_writer) = UnixStream::pair().unwrap();
+        let reader = ShellReader::new(read).unwrap();
+        let (_, complete) = reader.finish_until(Instant::now() + Duration::from_millis(50));
+        assert!(!complete, "an open pipe cannot establish EOF");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_preserves_launcher_status_when_detached_holder_keeps_pipes_open() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        for mode in ["exit", "timeout", "cancel"] {
+            let fixture = Fixture(std::path::PathBuf::from("/tmp").join(format!(
+                "rusty-capture-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )));
+            fs::create_dir(&fixture.0).unwrap();
+            fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = fixture.0.join("stop");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let script = fixture.0.join("holder.py");
+            fs::write(
+                &script,
+                r#"import os,socket,sys,time
+r,w=os.pipe()
+if os.fork()==0:
+    os.close(r)
+    os.setsid()
+    control=socket.socket(socket.AF_UNIX)
+    control.settimeout(20)
+    control.connect(sys.argv[1])
+    os.write(w,b'x')
+    os.close(w)
+    try:
+        control.sendall(b'READY')
+        control.recv(1)
+    finally:
+        os._exit(0)
+os.close(w)
+os.read(r,1)
+os.close(r)
+print('launcher ready',flush=True)
+if sys.argv[2]!='exit': time.sleep(20)
+os._exit(0)
+"#,
+            )
+            .unwrap();
+            let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"));
+            let command = format!("python3 {} {} {mode}", quote(&script), quote(&socket));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let flag = cancel.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let run = std::thread::spawn(move || {
+                let _scope = signal::cancel_scope(flag.clone());
+                let timeout = if mode == "timeout" { Duration::from_secs(2) } else { Duration::from_secs(10) };
+                let _ = tx.send(run_owned(&command, timeout, Some(&flag)));
+            });
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut control = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "fixture failed to connect");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept fixture: {error}"),
+                }
+            };
+            control.set_nonblocking(false).unwrap();
+            control.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            control.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ready = [0; 5];
+            control.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"READY");
+            if mode == "cancel" {
+                cancel.store(true, Ordering::Release);
+            }
+            let capture = rx.recv_timeout(Duration::from_secs(8)).expect("capture retained an escaped reader").unwrap();
+            run.join().unwrap();
+            assert_eq!(capture.status, if mode == "exit" { Some(Some(0)) } else { None });
+            assert!(!capture.capture_complete, "{mode}: detached holder is still live");
+            assert!(capture.stderr.contains("output capture incomplete"));
+            // The connected holder owns its lifetime. No saved PID or process
+            // group is ever signalled by this fixture; EOF also stops it on panic.
+            std::io::Write::write_all(&mut control, b"S").unwrap();
+            let mut eof = [0];
+            assert_eq!(control.read(&mut eof).unwrap(), 0);
+        }
     }
 
     #[test]

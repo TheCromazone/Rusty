@@ -6,6 +6,7 @@ boundary. It is opt-in, local-only, and deliberately small:
 ```sh
 rusty --goal 'repair the pagination boundaries' \
   --verify 'python3 -m pytest tests/test_pages.py' \
+  --verify-file tests/test_pages.py \
   --verify-timeout 120 --mode standard
 ```
 
@@ -24,6 +25,22 @@ reviewer prose are not used as acceptance receipts. Every proposal is checked
 afresh. A completion proposal followed by an edit in the same reply is checked
 against that edit, including in standard and vibe mode. Without `--verify`, the
 legacy goal policy remains available for conversational and read-only tasks.
+
+`--verify-file PATH` pins an explicitly selected acceptance file before the
+first model request. Repeat it for the test runner, its helpers, and any fixed
+fixtures that must not change. Paths are relative to the workspace; traversal,
+symlink components, missing files and non-files are rejected. Each file is
+bounded to 128 MiB. Contents, file mode and workspace identity must match at
+completion, both before and after the check. A changed or missing pin rejects
+the claim (`claims.check_error`) without running the altered checker. Restoring
+the original files allows a fresh attempt. Pins survive session saves without
+being refreshed from changed files on resume. Legacy sessions without pins keep
+their previous behavior. Check records include `criterion_sha256`, binding the
+command, deadline and pinned-file digests as well as the workspace fingerprints.
+
+Pin only acceptance inputs that must remain fixed: application source is
+expected to change. Imported helpers and configuration are not discovered
+automatically; name them explicitly when they belong to the fixed criterion.
 
 `--stats` and the trajectory count what happened to each claim in `claims`:
 
@@ -106,15 +123,55 @@ neither, so it claims less.
   host, with the same network and credentials. Anything a command started
   outside its process group, or changed remotely, stays.
 - **Local verification is mutable.** `--verify` runs in the workspace the
-  agent can write. The input fingerprint only catches files that change
-  while the check runs. Before proposing completion, the agent can change
-  what the check reads, or the check's own files. The check also says
+  agent can write. The input fingerprint catches files that change while the
+  check runs; `--verify-file` additionally detects changes to selected acceptance
+  files since startup. Unpinned imports, dependencies, generated directories,
+  external services and same-user races remain outside that guarantee. Pins
+  are a correctness guard, not process isolation or a sandbox. The check says
   nothing about deployed state. An independent grader outside the workspace
   is still required.
 - **The record is the agent's own.** The trajectory, `--stats` and the infra
   audit log are written by the Rusty process, so they show what Rusty
   observed. They are not proof of what happened, and anything running as
   the same user can modify them.
+
+## Completion development suite
+
+```sh
+cargo test --workspace completion_contract
+```
+
+This offline suite drives the real CLI with scripted model responses and runs
+real edits and acceptance commands. It covers correct repairs, fabricated and
+stale evidence, edits after a completion claim, reviewer repairs, mutable checks,
+timeouts, permissions, blocked goals, outstanding commands, truncated responses,
+stalls and model-budget overruns. Pin-specific cases cover checker replacement,
+deletion, symlinks, restoration, modes, path escapes and serialized pin reuse.
+An unpinned control deliberately accepts a tampered checker while an independent
+grade rejects the unchanged broken code. Scoring counterexamples keep a correct
+patch with a fatal endpoint failure out of the healthy pass cohort. These tests
+also run in `cargo xtask qa` and existing CI via `cargo test --workspace`.
+
+Single-turn evals can add `verify-files.txt`, one workspace-relative pin per
+line, alongside `verify.txt`. `verified-index` and `verified-invoice` pin their
+public checkers. `verified-pagination` adds a repair with empty pages, duplicate
+items, custom starting cursors, cycles and exception propagation. Its hidden
+grader stays outside `files/`; an oracle and plausible wrong repairs qualify the
+grader offline. Public checks are intentionally incomplete, so passing runtime
+acceptance is still distinct from independent correctness.
+
+For an explicitly authorized provider run, use the normal bounded eval harness:
+
+```sh
+RUSTY_MAX_REQUESTS=20 RUSTY_MAX_BUDGET_TOKENS=200000 RUSTY_BUDGET_SECS=120 \
+  EVAL_REPEATS=1 EVAL_JOBS=1 EVAL_TIMEOUT=125 EVAL_MEMORY=off \
+  cargo xtask eval verified-pagination,verified-index,verified-invoice
+```
+
+The offline suite qualifies runtime behavior and grader sensitivity; it does not
+measure model repair quality or establish a speedup. These are development tasks,
+and adding pins changes their experimental conditions. Freeze the source revision
+and use new held-out tasks for performance claims.
 
 ## Benchmark-motivated changes
 
@@ -298,8 +355,11 @@ The input digest covers the canonical workspace identity, inherited environment,
 file contents, paths, and Unix permission modes. Environment values and file
 contents are hashed rather than exported. It includes untracked files and
 lockfiles. Symlinks and special files are rejected. Enumeration is bounded at
-50,000 entries and 128 MiB of contents; exceeding either limit leaves the goal
-unverified rather than silently dropping inputs.
+50,000 enumerated entries and 128 MiB of contents; exceeding either limit leaves
+the goal unverified rather than silently dropping inputs. The entry budget is
+checked while reading each directory, includes excluded directory entries (but
+not their contents), and is shared across the traversal. Traversal is iterative
+so deeply nested inputs cannot exhaust the call stack.
 
 `.git`, `target`, `__pycache__`, and `.pytest_cache` are excluded. These generated
 artifacts often change during a check. This is a **source-input manifest**, not a
@@ -1070,8 +1130,10 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
   else saved settings, else 128k. Pin `--context-tokens` to keep that GET
   off the gateway and the window fixed. The reporting pin assumes 128k and
   estimates fill from characters.
+- **`--verify-file`** (contract 4) pins repeatable workspace-relative acceptance files
+  and requires `--verify`. Capabilities expose `verify.files_flag`.
 - **`--verify`** is optional. Without it, the goal closes on the model's word,
-  and exit status 2 means only that the goal stalled.
+  and exit status 2 means the goal remains open or blocked, including a stall or exhausted turn allowance.
 - **MCP.** Servers come from `.mcp.json` in the project, or from
   `RUSTY_MCP_CONFIG`. `rusty --mcp-check` is a preflight: it needs no model
   key and exits 1 if a server marked `required`, or one of its
@@ -1096,7 +1158,7 @@ rusty --yolo --memory off --agents off --mode standard --model <id> \
 | Code | Meaning |
 |---|---|
 | 0 | finished; with `--verify`, the check passed |
-| 2 | the goal did not close: with `--verify`, not on a passing check; with or without it, after stalling three turns in a row (contract 2 and later; contract 1 exited 1 on a stall) |
+| 2 | the goal remains open or blocked, including a failed fixed check, a stall, or an exhausted turn allowance; applies with and without `--verify` |
 | 130 | interrupted |
 | 1 | error: bad flags, model budget exhausted, provider failure, required MCP server or tool missing, or an unreadable or locked budget ledger |
 
@@ -1153,3 +1215,84 @@ no key, so a harness can refuse an unsupported setting before any model call.
 - a qualified live Daytona journey;
 - remote (HTTP/SSE) MCP transports, which are skipped;
 - that any memory level improves hard tasks.
+
+## Interactive goals and completion outcomes
+
+Configure a fixed check before starting an interactive goal:
+
+```text
+/goal --verify --timeout 120 python3 -B check_public.py
+/goal --pin check_public.py
+/goal fix pagination while preserving ordering
+/goal status
+```
+
+`verify` replaces the check (and clears its pins) for future goals. `pin` adds
+one workspace-relative file, capturing its bytes immediately. The default
+check deadline is 120 seconds. `/goal --verify off` disables checks for future
+goals. These commands never weaken an existing goal's criterion; `/goal resume`
+uses that goal's saved criterion and runs fresh verification. Pending settings
+are process-local; the criterion is saved once a goal starts. Local tools only.
+
+Stats and trajectories expose `goal_outcome`: `verified` means the fixed check
+passed during this process; `completed_unverified` means completion lacks a
+current passing receipt; `blocked` and `incomplete` cannot count as success.
+A restored completed goal has no fresh receipt and is therefore unverified.
+`goal_end` still provides the termination reason, including errors and limits.
+These are bounded check results, not a claim of comprehensive correctness.
+
+Headless goals that remain open or blocked exit 2 whether or not `--verify` was
+supplied. Runtime errors exit 1 and interruptions exit 130. Unchecked model
+completion still exits 0 for compatibility; automation requiring proof must
+select a fixed check and require `goal_outcome == "verified"`.
+
+A command that executes but invalidates its pinned files or makes the final
+workspace observation unavailable retains its output, exit code and receipt.
+Its `EvidenceUnavailable` outcome rejects completion; `observation_error`
+explains the missing evidence. A check refused before execution has no receipt.
+
+Run `cargo test --workspace completion_contract` for offline contract evals, including the
+interactive journey, unchecked completion, blocked and turn-limited goals,
+checker tampering, fresh acceptance, resume and independent hidden grading.
+Before comparing model quality, run the existing hidden-graded tasks with
+verification and careful review independently toggled, identical starting
+files/model/total budgets, and repeated trials. Report external pass rate,
+false completion, latency and total lead-plus-worker usage separately.
+
+
+### Goal invocation allowance (contract 4)
+
+`RUSTY_GOAL_MAX_TURNS` (default 25) bounds each explicit new goal or
+`/goal resume` invocation. Zero creates a saved, discoverable goal and pauses
+before any turn or model request. Resume does not run automatically on load.
+Each invocation starts a fresh turn allowance; the existing model resource
+budget and optional persisted ledger are not reset.
+
+`goal.turns` counts lifetime turn attempts and never resets on resume. An
+attempt is counted and checkpointed before `run_turn`, including a later
+interruption, failure, or resource denial. It does not imply a successful
+model request. `goal.run_turns` and `goal.run_limit` describe the latest
+invocation. The saved `goal.stop_reason` is one of `done`, `blocked`,
+`paused`, `interrupted`, `turn_limit`, `stalled`, or `error`. Older sessions
+without these fields retain their lifetime count and have no known saved
+stop reason. `/goal status` exposes these values. A saved reason is diagnostic
+context, not permission to resume work, replay commands or restore processes.
+
+Counters are checkpointed before execution and after the stop transition.
+A crash between checkpoints can leave a started attempt without a stop reason;
+its effects need inspection. Pinned criteria, checker usage, verification
+freshness and permission decisions retain their existing contracts.
+
+Fixed checks use fresh private `PYTHONPYCACHEPREFIX` and `CARGO_TARGET_DIR`
+directories for each execution, removed afterward. Cargo recompiles into the
+private target, so restored source mtimes cannot reuse a tampered workspace binary.
+Checks that explicitly override these variables or execute prebuilt binaries are
+outside this cache-isolation guarantee. This prevents Python from loading planted workspace bytecode;
+`-B` alone only disables writing bytecode. `/goal --verify` requires local tools
+and accepts `--timeout SECONDS` from 1 to 600 (default 120).
+
+Shell exit status and `capture_complete` are separate observations. An exit-0
+launcher with a detached pipe holder remains exit 0; its output is incomplete.
+Fixed verification rejects incomplete capture. Readers share a two-second EOF
+grace and are stopped and joined afterward; this does not prove containment of
+descendants that escape the owned process group.

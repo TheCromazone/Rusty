@@ -165,6 +165,9 @@ mod tests {
             objective: "keep working".into(),
             status: GoalStatus::Active,
             turns: 3,
+            run_turns: 0,
+            run_limit: 0,
+            stop_reason: None,
             checker_used: false,
             check: None,
         });
