@@ -41,6 +41,7 @@ pub struct Capture {
     pub stderr: Vec<u8>,
     pub problem: Option<String>,
     pub cleanup_error: Option<String>,
+    pub cleanup_notes: Vec<String>,
     pub pid: u32,
 }
 impl Capture {
@@ -49,51 +50,140 @@ impl Capture {
     }
 }
 
-struct Owned(Child, bool);
+struct Owned {
+    child: Child,
+    may_signal: bool,
+    reap_started: bool,
+}
 impl Owned {
-    fn stop(&mut self) {
-        // Let nested captures handle cancellation before the final kill.
-        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGTERM) };
+    fn new(child: Child) -> Self {
+        Self { child, may_signal: true, reap_started: false }
+    }
+    fn exited(&mut self) -> Result<bool> {
+        anyhow::ensure!(!self.reap_started, "child ownership already transferred to wait");
+        // WNOWAIT reserves the PID through the final cancellation signal.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } < 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                self.may_signal = false;
+                self.reap_started = true;
+            }
+            return Err(error).context("observing owned child exit");
+        }
+        let pid = unsafe { info.si_pid() };
+        anyhow::ensure!(pid == 0 || pid == self.child.id() as libc::pid_t, "unexpected child exit identity");
+        Ok(pid != 0)
+    }
+    fn signal(&mut self, sig: libc::c_int, notes: &mut Vec<String>) {
+        if !self.may_signal || self.reap_started {
+            return;
+        }
+        if unsafe { libc::kill(-(self.child.id() as i32), sig) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                self.may_signal = false;
+            } else {
+                notes.push(format!("signal {sig}: {error}"));
+            }
+        }
+    }
+    fn stop(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.may_signal || self.reap_started {
+            return notes;
+        }
+        if let Err(error) = self.exited() {
+            notes.push(format!("child ownership before termination: {error}"));
+            return notes;
+        }
+        self.signal(libc::SIGTERM, &mut notes);
         let end = Instant::now() + Duration::from_secs(2);
-        loop {
-            let _ = self.0.try_wait();
-            if !group_present(self.0.id()) || Instant::now() >= end {
+        while self.may_signal && Instant::now() < end {
+            if matches!(group_present(self.child.id()), Ok(false)) {
+                self.may_signal = false;
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        if group_present(self.0.id()) {
-            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+        if self.may_signal && !self.reap_started {
+            if let Err(error) = self.exited() {
+                notes.push(format!("child ownership before final kill: {error}"));
+                return notes;
+            }
+            match group_present(self.child.id()) {
+                Ok(true) => self.signal(libc::SIGKILL, &mut notes),
+                Ok(false) => self.may_signal = false,
+                Err(error) => notes.push(format!("group observation before final kill: {error}")),
+            }
         }
-        let _ = self.0.kill();
+        notes
+    }
+    fn reap(&mut self) -> Result<ExitStatus> {
+        anyhow::ensure!(!self.reap_started, "child wait already started");
+        if !self.exited()? {
+            // Still an unreaped direct child, even if group observation was
+            // denied. A direct kill does not rely on an unverified group.
+            self.child.kill().context("stopping owned direct child")?;
+            let end = Instant::now() + Duration::from_secs(2);
+            while !self.exited()? {
+                anyhow::ensure!(Instant::now() < end, "owned child exit remains unverified after kill");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        self.may_signal = false;
+        self.reap_started = true;
+        Ok(self.child.wait()?)
+    }
+    fn finish(mut self) -> Result<ExitStatus> {
+        self.reap()
     }
 }
 impl Drop for Owned {
     fn drop(&mut self) {
-        if self.1 {
-            self.stop();
-        }
-        let _ = self.0.wait();
-        if self.1 {
-            let _ = group_absent(self.0.id());
+        if !self.reap_started {
+            let _ = self.stop();
+            if let Err(error) = self.reap() {
+                eprintln!("owned child {} cleanup failed: {error}", self.child.id());
+            }
+            if !matches!(group_absent(self.child.id()), Ok(true)) {
+                eprintln!("cleanup of owned process group {} remains unverified", self.child.id());
+            }
         }
     }
 }
-fn group_present(pid: u32) -> bool {
+
+fn group_present(pid: u32) -> Result<bool> {
     if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
-        return true;
+        return Ok(true);
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error.into())
+    }
 }
-fn group_absent(pid: u32) -> bool {
+fn group_absent(pid: u32) -> Result<bool> {
     let end = Instant::now() + Duration::from_secs(2);
-    while group_present(pid) {
+    loop {
+        let observation = group_present(pid);
+        if matches!(observation, Ok(false)) {
+            return Ok(true);
+        }
         if Instant::now() >= end {
-            return false;
+            return observation.map(|_| false);
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    true
 }
 
 fn nonblocking(pipe: &impl AsRawFd) -> Result<()> {
@@ -129,21 +219,28 @@ fn drain<R: Read>(pipe: &mut Option<R>, bytes: &mut Vec<u8>, limit: usize) -> Re
 /// group must supply their own cleanup; they cannot inherit these output pipes.
 pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result<Capture> {
     install_signals()?;
+    let mut disposition: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut disposition) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("checking child ownership disposition");
+    }
+    anyhow::ensure!(
+        disposition.sa_sigaction == libc::SIG_DFL,
+        "capture requires exclusive child waiting with default SIGCHLD"
+    );
     anyhow::ensure!(!cancelled(), "capture interrupted before launch");
     let end = Instant::now() + timeout;
-    let mut owned = Owned(
+    let mut owned = Owned::new(
         command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?,
-        true,
     );
-    let pid = owned.0.id();
-    let mut stdout = owned.0.stdout.take();
-    let mut stderr = owned.0.stderr.take();
+    let pid = owned.child.id();
+    let mut stdout = owned.child.stdout.take();
+    let mut stderr = owned.child.stderr.take();
     nonblocking(stdout.as_ref().unwrap())?;
     nonblocking(stderr.as_ref().unwrap())?;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut exited = None;
-    let mut status = None;
+    let mut status = false;
     let problem = loop {
         if cancelled() {
             break Some("capture interrupted".into());
@@ -156,9 +253,9 @@ pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result
         {
             break Some(error.to_string());
         }
-        if status.is_none() {
-            status = owned.0.try_wait()?;
-            if status.is_some() {
+        if !status {
+            status = owned.exited()?;
+            if status {
                 exited = Some(Instant::now());
             }
         }
@@ -170,22 +267,23 @@ pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result
         if Instant::now() >= end {
             break Some("child exceeded capture deadline".into());
         }
-        if status.is_some() && stdout.is_none() && stderr.is_none() {
-            break group_present(pid).then(|| "owned descendants remained after child exit".into());
+        if status && stdout.is_none() && stderr.is_none() {
+            break None;
         }
         if exited.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1)) {
             break Some("child exited with output pipes still open".into());
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    if problem.is_some() {
-        owned.stop();
-    }
-    let status = owned.0.wait()?;
-    let absent = group_absent(pid);
-    let cleanup_error = (!absent).then(|| format!("owned process group {pid} remains after kill/reap window"));
-    owned.1 = !absent;
-    Ok(Capture { status, stdout: out, stderr: err, problem, cleanup_error, pid })
+    let cleanup_notes = if problem.is_some() { owned.stop() } else { Vec::new() };
+    let status = owned.finish()?;
+    // Observation only after reap: never signal a potentially recycled ID.
+    let cleanup_error = match group_absent(pid) {
+        Ok(true) => None,
+        Ok(false) => Some(format!("owned process group {pid} remains after reap window")),
+        Err(error) => Some(format!("process group {pid} absence unverified: {error}")),
+    };
+    Ok(Capture { status, stdout: out, stderr: err, problem, cleanup_error, cleanup_notes, pid })
 }
 
 #[cfg(test)]
@@ -197,7 +295,7 @@ mod tests {
     fn reaped(pid: u32) {
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1, "owned leader remains");
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
-        assert!(group_absent(pid), "owned group remains");
+        assert!(group_absent(pid).unwrap(), "owned group remains");
     }
     struct Temp(std::path::PathBuf);
     impl Drop for Temp {
@@ -226,7 +324,7 @@ mod tests {
             let root = Temp(std::env::temp_dir().join(format!("rusty-capture-signal-{}-{sig}", std::process::id())));
             std::fs::create_dir(&root.0).unwrap();
             let log = std::fs::File::create(root.0.join("log")).unwrap();
-            let mut helper = Owned(
+            let mut helper = Owned::new(
                 Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
@@ -242,29 +340,26 @@ mod tests {
                     .process_group(0)
                     .spawn()
                     .unwrap(),
-                true,
             );
             let end = Instant::now() + Duration::from_secs(60);
             while !root.0.join("ready").exists() {
-                assert!(matches!(helper.0.try_wait(), Ok(None)), "signal helper exited before readiness");
+                assert!(!helper.exited().unwrap(), "signal helper exited before readiness");
                 assert!(Instant::now() < end, "signal helper did not publish readiness");
                 std::thread::sleep(Duration::from_millis(5));
             }
             let captured_pid = std::fs::read_to_string(root.0.join("ready")).unwrap().parse().unwrap();
-            assert_eq!(unsafe { libc::kill(helper.0.id() as i32, sig) }, 0);
+            assert_eq!(unsafe { libc::kill(helper.child.id() as i32, sig) }, 0);
             let end = Instant::now() + Duration::from_secs(60);
-            let status = loop {
-                if let Some(status) = helper.0.try_wait().unwrap() {
-                    break status;
-                }
+            while !helper.exited().unwrap() {
                 assert!(Instant::now() < end, "signal helper did not finish cleanup");
                 std::thread::sleep(Duration::from_millis(5));
-            };
-            helper.1 = group_present(helper.0.id());
+            }
+            let helper_pid = helper.child.id();
+            let status = helper.finish().unwrap();
             let mut text = String::new();
             std::fs::File::open(root.0.join("log")).unwrap().take(64 * 1024).read_to_string(&mut text).unwrap();
             assert!(status.success(), "{text}");
-            assert!(!helper.1, "helper group remains after completion");
+            assert!(group_absent(helper_pid).unwrap(), "helper group remains after completion");
             reaped(captured_pid);
         }
     }
@@ -295,6 +390,20 @@ mod tests {
         let descendant = std::fs::read_to_string(root.0.join("pid")).unwrap().parse().unwrap();
         reaped(result.pid);
         reaped(descendant);
+    }
+    #[test]
+    fn exit_observation_preserves_ownership_until_consuming_finish() {
+        let mut owned = Owned::new(Command::new("/bin/true").process_group(0).spawn().unwrap());
+        let pid = owned.child.id();
+        let end = Instant::now() + Duration::from_secs(60);
+        while !owned.exited().unwrap() {
+            assert!(Instant::now() < end, "owned child did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(owned.exited().unwrap(), "repeat WNOWAIT observation must remain available");
+        assert!(owned.finish().unwrap().success());
+        // The consumed owner has no remaining method that can signal pid.
+        reaped(pid);
     }
     #[test]
     fn output_limit_kills_and_reaps_the_owned_writer() {

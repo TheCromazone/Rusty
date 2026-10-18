@@ -27,9 +27,10 @@ fn binaries() -> Result<Vec<Binary>> {
     eprint!("{}", String::from_utf8_lossy(&out.stderr));
     ensure!(
         out.success(),
-        "building tests failed: {:?}; cleanup: {:?}; group {}",
+        "building tests failed: {:?}; cleanup: {:?}; notes: {:?}; group {}",
         out.problem,
         out.cleanup_error,
+        out.cleanup_notes,
         out.pid
     );
     discovered(&out.stdout)
@@ -274,10 +275,11 @@ fn suite(bins: &[Binary], scale: u64) -> Result<Run> {
         }
         if !out.success() {
             run.failures.entry(format!("{} (harness)", bin.name)).or_default().push(format!(
-                "{}; {:?}; cleanup: {:?}; group {}\n{}\n{}",
+                "{}; {:?}; cleanup: {:?}; notes: {:?}; group {}\n{}\n{}",
                 out.status,
                 out.problem,
                 out.cleanup_error,
+                out.cleanup_notes,
                 out.pid,
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
@@ -338,9 +340,10 @@ pub fn tests(only_changed: bool) -> Result<bool> {
         eprint!("{}", String::from_utf8_lossy(&docs.stderr));
         ensure!(
             docs.success(),
-            "doctests failed: {:?}; cleanup: {:?}; group {}",
+            "doctests failed: {:?}; cleanup: {:?}; notes: {:?}; group {}",
             docs.problem,
             docs.cleanup_error,
+            docs.cleanup_notes,
             docs.pid
         );
     }
@@ -374,9 +377,10 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
         )?;
         if !docs.success() {
             run.failures.entry("doctests".into()).or_default().push(format!(
-                "{:?}; cleanup: {:?}; group {}\n{}\n{}",
+                "{:?}; cleanup: {:?}; notes: {:?}; group {}\n{}\n{}",
                 docs.problem,
                 docs.cleanup_error,
+                docs.cleanup_notes,
                 docs.pid,
                 String::from_utf8_lossy(&docs.stdout),
                 String::from_utf8_lossy(&docs.stderr)
