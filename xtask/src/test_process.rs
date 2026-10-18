@@ -130,6 +130,7 @@ fn drain<R: Read>(pipe: &mut Option<R>, bytes: &mut Vec<u8>, limit: usize) -> Re
 pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result<Capture> {
     install_signals()?;
     anyhow::ensure!(!cancelled(), "capture interrupted before launch");
+    let end = Instant::now() + timeout;
     let mut owned = Owned(
         command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0).spawn()?,
         true,
@@ -141,12 +142,14 @@ pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result
     nonblocking(stderr.as_ref().unwrap())?;
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let end = Instant::now() + timeout;
     let mut exited = None;
     let mut status = None;
     let problem = loop {
         if cancelled() {
             break Some("capture interrupted".into());
+        }
+        if Instant::now() >= end {
+            break Some("child exceeded capture deadline".into());
         }
         if let Err(error) = drain(&mut stdout, &mut out, limit.saturating_sub(err.len()))
             .and_then(|_| drain(&mut stderr, &mut err, limit.saturating_sub(out.len())))
@@ -159,11 +162,16 @@ pub fn capture(command: &mut Command, limit: usize, timeout: Duration) -> Result
                 exited = Some(Instant::now());
             }
         }
-        if status.is_some() && stdout.is_none() && stderr.is_none() {
-            break group_present(pid).then(|| "owned descendants remained after child exit".into());
+        // Completion observed after cancellation or deadline is incomplete,
+        // even if the child exited successfully while this thread was delayed.
+        if cancelled() {
+            break Some("capture interrupted".into());
         }
         if Instant::now() >= end {
             break Some("child exceeded capture deadline".into());
+        }
+        if status.is_some() && stdout.is_none() && stderr.is_none() {
+            break group_present(pid).then(|| "owned descendants remained after child exit".into());
         }
         if exited.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(1)) {
             break Some("child exited with output pipes still open".into());
@@ -294,6 +302,14 @@ mod tests {
         assert!(!result.success());
         assert!(result.problem.unwrap().contains("output exceeds"));
         assert!(result.stdout.len() + result.stderr.len() <= 4096);
+        reaped(result.pid);
+    }
+    #[test]
+    fn already_expired_deadline_cannot_accept_a_successful_command() {
+        let result = capture(&mut Command::new("/bin/true"), 4096, Duration::ZERO).unwrap();
+        assert!(!result.success());
+        assert_eq!(result.problem.as_deref(), Some("child exceeded capture deadline"));
+        assert!(result.cleanup_error.is_none());
         reaped(result.pid);
     }
     #[test]
