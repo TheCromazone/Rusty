@@ -43,13 +43,37 @@ enum Control {
         file: PathBuf,
     },
 }
+/// The service accepts no inherited descriptors except stdin/stdout/stderr.
+/// Run once before opening its database/socket or starting any service threads.
+/// Concurrent launcher probes can otherwise leave unrelated pipes alive here.
+fn close_inherited_descriptors() -> Result<()> {
+    let directory = std::fs::read_dir("/dev/fd").or_else(|_| std::fs::read_dir("/proc/self/fd"))?;
+    let mut descriptors = Vec::new();
+    for entry in directory {
+        let entry = entry?;
+        if let Some(fd) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()).filter(|fd| *fd > 2) {
+            descriptors.push(fd);
+        }
+    }
+    // The directory iterator has been dropped; open nothing before closing.
+    for fd in descriptors {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Cli::parse();
     let home = args
         .home
         .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config/rusty")))
         .ok_or_else(|| anyhow::anyhow!("set RUSTY_HOME or --home"))?;
-    let Some(command) = args.command else { return rusty::advisor::serve(&home) };
+    let Some(command) = args.command else {
+        close_inherited_descriptors()?;
+        return rusty::advisor::serve(&home);
+    };
     if matches!(command, Control::Stop) {
         let socket = home.join("memory/advisor.sock");
         if !socket.exists() {
