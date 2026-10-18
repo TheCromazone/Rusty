@@ -16,6 +16,8 @@ impl Drop for ExpireOnExit {
 }
 
 fn read_model_post(stream: &mut TcpStream) -> Result<()> {
+    // Accepted sockets may inherit O_NONBLOCK; timeouts do not clear it.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -51,6 +53,23 @@ fn read_model_post(stream: &mut TcpStream) -> Result<()> {
         bail!("expected a complete model POST");
     }
     Ok(())
+}
+
+#[test]
+fn request_reader_uses_blocking_io() {
+    use std::os::fd::AsRawFd;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut stream, _) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let witness = stream.try_clone().unwrap();
+    let body = r#"{"messages":[]}"#;
+    let request = format!("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+    client.write_all(request.as_bytes()).unwrap();
+    read_model_post(&mut stream).expect("request reader must clear inherited nonblocking before bounded reads");
+    let flags = unsafe { libc::fcntl(witness.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(flags & libc::O_NONBLOCK, 0, "request reader must clear inherited nonblocking");
 }
 
 #[test]
