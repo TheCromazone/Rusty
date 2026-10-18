@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "usage: cargo xtask bench [--check] [--binary PATH] [--json PATH] [--runs N] [--only GROUP,...]\n\
     Builds release rusty (unless --binary) and the perf example, then prints one table.\n\
-    Groups: startup, sessions, redact, recall, turn, tools, repl, stream, size.";
+    Groups: startup, sessions, redact, recall, turn, tools, repl, long, stream, size.";
 
 pub fn command(args: &[String]) -> Result<ExitCode> {
     let (mut binary, mut out, mut runs) = (None, super::target_dir().join("bench.json"), 11usize);
@@ -176,6 +176,9 @@ impl Bench {
         }
         if self.wants("repl") {
             self.repl(&home, &work)?;
+        }
+        if self.wants("long") {
+            self.long_session(&home, &work)?;
         }
         if self.wants("stream") {
             self.stream(&home, &work)?;
@@ -447,6 +450,84 @@ impl Bench {
         Ok(())
     }
 
+    fn long_session(&mut self, home: &Path, work: &Path) -> Result<()> {
+        const TURNS: usize = 200;
+        let mut rng = Rng(200);
+        for f in 0..20 {
+            let mut text = String::new();
+            while text.len() < 3000 {
+                text.push_str(&sentence(&mut rng, 12, f));
+                text.push('\n');
+            }
+            std::fs::write(work.join(format!("long{f}.txt")), text)?;
+        }
+        let mut bodies = Vec::with_capacity(2 * TURNS);
+        for i in 0..TURNS {
+            let args = json!({"path": format!("long{}.txt", i % 20)}).to_string();
+            let reply = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": format!("call{i}"),
+                "type": "function", "function": {"name": "read_file", "arguments": args}}]},
+                "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 1000, "completion_tokens": 5}});
+            bodies.push(format!("data: {reply}\n\ndata: [DONE]\n\n"));
+            bodies.push(say(&format!("Turn {i}: {}", sentence(&mut rng, 40, i))));
+        }
+        let bodies = Arc::new(bodies);
+        let input: String = (0..TURNS).map(|i| format!("turn {i}: read the next file and summarise it\n")).collect();
+        let counting = counting_library()?;
+        let dir = sessions_dir(home, work);
+        let mut samples = Vec::new();
+        let mut counts = Vec::new();
+        let mut gaps = Vec::new();
+        let mut transcript = 0;
+        let runs = self.runs.min(3);
+        for _ in 0..runs {
+            let _ = std::fs::remove_dir_all(&dir);
+            let mock = Mock::start(bodies.clone())?;
+            let mut cmd = self.command(home, work, &[], Some(&mock.url));
+            cmd.env("RUSTY_CONTEXT_TOKENS", "10000000").stdin(Stdio::piped());
+            let report = home.join("counters.json");
+            let _ = std::fs::remove_file(&report);
+            if let Some(lib) = &counting {
+                cmd.env("DYLD_INSERT_LIBRARIES", lib).env("RBENCH_COUNTERS", &report);
+            }
+            let s = measure_with_input(cmd, input.as_bytes())?;
+            let log = mock.stop();
+            if !s.ok || log.len() < 2 * TURNS {
+                bail!("the long session made {} requests (exit ok: {})", log.len(), s.ok);
+            }
+            gaps.push(log.windows(2).map(|w| (w[1].received - w[0].answered).as_secs_f64() * 1e3).sum());
+            transcript = std::fs::read_dir(&dir)?
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .map(|e| e.metadata().map_or(0, |m| m.len()))
+                .max()
+                .unwrap_or(0);
+            if let Ok(text) = std::fs::read_to_string(&report) {
+                counts.push(serde_json::from_str::<Value>(&text)?);
+            }
+            samples.push(s);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = medians(&samples);
+        let count = |k: &str| median(counts.iter().filter_map(|c| c[k].as_f64()).collect());
+        let mut data = json!({"turns": TURNS, "steps": 2 * TURNS, "between_requests_ms": median(gaps),
+            "transcript_bytes": transcript});
+        let mut extra = format!("{:.0} ms between requests", data["between_requests_ms"].as_f64().unwrap_or(0.0));
+        if !counts.is_empty() {
+            for k in ["allocs", "alloc_bytes", "fsyncs", "logical_writes", "disk_writes"] {
+                data[k] = json!(count(k));
+            }
+            extra.push_str(&format!(
+                ", {:.2}M allocs ({:.0} MB), {} fsyncs, {:.1} MB written",
+                count("allocs") / 1e6,
+                count("alloc_bytes") / 1e6,
+                count("fsyncs"),
+                count("logical_writes") / 1e6
+            ));
+        }
+        self.row(&format!("long session, {TURNS} turns"), &m, extra, data);
+        Ok(())
+    }
+
     /// One rusty process with an offline environment.
     fn rusty(&self, home: &Path, work: &Path, args: &[&str], url: Option<&str>) -> Result<Sample> {
         Ok(measure(self.command(home, work, args, url))?.0)
@@ -559,6 +640,83 @@ fn measure_with_input(mut cmd: Command, input: &[u8]) -> Result<Sample> {
     let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
     let ms = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
     Ok(Sample { wall_ms, cpu_ms: ms(usage.ru_utime) + ms(usage.ru_stime), rss, ok })
+}
+
+/// Counts a process's allocations, fsyncs and file writes from inside it,
+/// preloaded with `DYLD_INSERT_LIBRARIES`, and writes them as JSON to
+/// `$RBENCH_COUNTERS` at exit. The constructor takes both variables out of
+/// the environment, so the commands rusty runs are not counted with it.
+const COUNTING_C: &str = r#"
+#include <fcntl.h>
+#include <libproc.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+static _Atomic unsigned long long allocs, bytes, syncs;
+static char report[1024];
+
+static void *c_malloc(size_t n) { allocs++; bytes += n; return malloc(n); }
+static void *c_calloc(size_t k, size_t n) { allocs++; bytes += k * n; return calloc(k, n); }
+static void *c_realloc(void *p, size_t n) { allocs++; bytes += n; return realloc(p, n); }
+static int c_posix_memalign(void **p, size_t a, size_t n) { allocs++; bytes += n; return posix_memalign(p, a, n); }
+static int c_fsync(int fd) { syncs++; return fsync(fd); }
+static int c_fcntl(int fd, int cmd, ...) {
+    va_list ap;
+    va_start(ap, cmd);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    if (cmd == F_FULLFSYNC || cmd == F_BARRIERFSYNC) syncs++;
+    return fcntl(fd, cmd, arg);
+}
+
+#define SWAP(n) __attribute__((used)) static const struct { const void *with, *of; } swap_##n \
+    __attribute__((section("__DATA,__interpose"))) = { (const void *)c_##n, (const void *)n };
+SWAP(malloc) SWAP(calloc) SWAP(realloc) SWAP(posix_memalign) SWAP(fsync) SWAP(fcntl)
+
+__attribute__((constructor)) static void start(void) {
+    const char *path = getenv("RBENCH_COUNTERS");
+    if (path) strlcpy(report, path, sizeof report);
+    unsetenv("RBENCH_COUNTERS");
+    unsetenv("DYLD_INSERT_LIBRARIES");
+}
+
+__attribute__((destructor)) static void finish(void) {
+    if (!report[0]) return;
+    struct rusage_info_v4 ri = {0};
+    proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri);
+    FILE *f = fopen(report, "w");
+    if (!f) return;
+    fprintf(f, "{\"allocs\":%llu,\"alloc_bytes\":%llu,\"fsyncs\":%llu,\"logical_writes\":%llu,\"disk_writes\":%llu}\n",
+            (unsigned long long)allocs, (unsigned long long)bytes, (unsigned long long)syncs,
+            (unsigned long long)ri.ri_logical_writes, (unsigned long long)ri.ri_diskio_byteswritten);
+    fclose(f);
+}
+"#;
+
+/// Builds the counting library with the system C compiler; None off macOS.
+fn counting_library() -> Result<Option<PathBuf>> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
+    let dir = super::target_dir().join("bench");
+    std::fs::create_dir_all(&dir)?;
+    let (source, lib) = (dir.join("counting.c"), dir.join("counting.dylib"));
+    std::fs::write(&source, COUNTING_C)?;
+    let built = Command::new("cc")
+        .args(["-dynamiclib", "-O2", "-o"])
+        .arg(&lib)
+        .arg(&source)
+        .status()
+        .context("starting cc for the counting library")?;
+    if !built.success() {
+        bail!("cc could not build the counting library");
+    }
+    Ok(Some(lib))
 }
 
 /// A small project: 40 directories of 50 short source files, and six
