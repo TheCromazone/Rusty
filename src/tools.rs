@@ -970,6 +970,7 @@ os._exit(0)
             let flag = cancel.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             let run = std::thread::spawn(move || {
+                let _scope = signal::cancel_scope(flag.clone());
                 let timeout = if mode == "timeout" { Duration::from_secs(2) } else { Duration::from_secs(10) };
                 let _ = tx.send(run_owned(&command, timeout, Some(&flag)));
             });
@@ -984,6 +985,7 @@ os._exit(0)
                     Err(error) => panic!("accept fixture: {error}"),
                 }
             };
+            control.set_nonblocking(false).unwrap();
             control.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             control.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut ready = [0; 5];
