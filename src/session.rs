@@ -500,7 +500,11 @@ fn fresh_connection(dir: &Path) -> Result<Connection> {
         migrate_v2(&db)?;
     }
     db.execute_batch(SCHEMA)?;
-    db.pragma_update(None, "user_version", INDEX_VERSION)?;
+    // Setting it commits a write, journal and fsyncs included, even when
+    // the value is the same; a current index is opened on every save.
+    if version != INDEX_VERSION {
+        db.pragma_update(None, "user_version", INDEX_VERSION)?;
+    }
     db.prepare("SELECT n,id,title,started,updated,updated_ns,messages FROM sessions LIMIT 0")?;
     db.prepare("SELECT rowid FROM session_terms LIMIT 0")?;
     Ok(db)
@@ -1060,6 +1064,18 @@ mod tests {
             assert_eq!(read(&path).unwrap(), expected(&body));
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn opening_a_current_index_writes_nothing() {
+        let dir = temp_dir("index-open");
+        drop(fresh_connection(&dir).unwrap());
+        let before = std::fs::read(dir.join(INDEX)).unwrap();
+        let db = fresh_connection(&dir).unwrap();
+        assert_eq!(db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0)).unwrap(), INDEX_VERSION);
+        drop(db);
+        assert!(std::fs::read(dir.join(INDEX)).unwrap() == before, "the header's change counter moved");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
