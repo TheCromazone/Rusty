@@ -3,13 +3,13 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
     inputs:
       suite:
         description: 'Offline is free; live/cloud consume provider credits'
         type: choice
-        options: [offline, perf, live, cloud]
+        options: [offline, perf, live, cloud, demo]
         default: offline
       runner:
         description: 'Use macOS only when qualifying that platform'
@@ -28,6 +28,13 @@ on:
       repeats:
         description: 'Live eval repeats per configuration (1–5)'
         default: '1'
+      jobs:
+        description: 'Live eval tasks at once (1–8)'
+        type: number
+        default: 4
+      demo:
+        description: 'Demo suite: scene to record and commit as a README GIF (branch only)'
+        default: models
       cloud_snapshot:
         description: 'Cloud suite only: existing qualified Daytona snapshot'
       cloud_ref:
@@ -37,14 +44,17 @@ permissions:
   contents: read
 concurrency:
   # Explicit paid runs are never cancelled by a later push; cancelling a
-  # cloud controller can strand compute. Metadata edits do not trigger CI.
-  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'code' }}
+  # cloud controller can strand compute. Metadata edits cannot cancel code QA.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.action == 'edited' && 'edited' || 'code' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   check:
+    if: inputs.suite != 'demo'
     name: check
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    # Hosted run 39110575738 completed check in 309s; 15m leaves 591s headroom.
+    # Revisit against scale-1 timings and cache/toolchain changes.
     timeout-minutes: ${{ inputs.suite == 'live' && 45 || inputs.suite == 'cloud' && 30 || 15 }}
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +88,7 @@ jobs:
             git log -1 --format=%B "$sha" | target/debug/xtask check-message -
           done < <(git rev-list "$BASE..$HEAD")
       - name: Query test prerequisite
+        if: github.event.action != 'edited'
         shell: bash
         run: |
           if ! command -v rg >/dev/null 2>&1; then
@@ -89,22 +100,23 @@ jobs:
           fi
           rg --version
       - name: Offline quality
-        if: inputs.suite == '' || inputs.suite == 'offline'
+        if: github.event.action != 'edited' && (inputs.suite == '' || inputs.suite == 'offline')
         run: cargo xtask qa --full
       - name: Performance qualification
-        if: inputs.suite == 'perf'
+        if: github.event.action != 'edited' && inputs.suite == 'perf'
         run: cargo xtask qa --perf
       - name: Live model qualification
-        if: inputs.suite == 'live'
+        if: github.event.action != 'edited' && inputs.suite == 'live'
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           EVAL_MODELS: ${{ inputs.models }}
           EVAL_TASKS: ${{ inputs.tasks }}
           EVAL_MEMORY: ${{ inputs.memory }}
           EVAL_REPEATS: ${{ inputs.repeats }}
-          EVAL_JOBS: '1'
+          EVAL_JOBS: ${{ inputs.jobs }}
           EVAL_TIMEOUT: '300'
           RUSTY_MAX_REQUESTS: '50'
           RUSTY_MAX_BUDGET_TOKENS: '2000000'
@@ -112,9 +124,10 @@ jobs:
         shell: bash
         run: |
           case "$EVAL_REPEATS" in [1-5]) ;; *) echo 'repeats must be 1–5' >&2; exit 1 ;; esac
+          case "$EVAL_JOBS" in [1-8]) ;; *) echo 'jobs must be 1–8' >&2; exit 1 ;; esac
           cargo xtask qa --live
       - name: Hosted cloud qualification
-        if: inputs.suite == 'cloud'
+        if: github.event.action != 'edited' && inputs.suite == 'cloud'
         env:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
@@ -122,7 +135,7 @@ jobs:
           RUSTY_CLOUD_REF: ${{ inputs.cloud_ref }}
         run: cargo xtask qa --cloud
       - name: Summary
-        if: always()
+        if: always() && github.event.action != 'edited'
         shell: bash
         run: |
           if [[ -f target/qa/summary.md ]]; then
@@ -131,7 +144,7 @@ jobs:
             echo 'Quality gate did not finish; inspect the failed step.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Evidence
-        if: always()
+        if: always() && github.event.action != 'edited'
         uses: actions/upload-artifact@v4
         with:
           name: quality-${{ runner.os }}-${{ github.run_attempt }}
@@ -163,7 +176,7 @@ jobs:
 
   benchmark:
     name: benchmark
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.action != 'edited'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -181,7 +194,7 @@ jobs:
           if git -C after diff --quiet "$BASE...$HEAD" -- \
             src/tools.rs src/cloud/image.rs src/cloud/digest.rs src/cloud/api.rs \
             examples/cloud_perf.rs scripts/cloud-memory-bench.py \
-            .github/workflows/ci.yml .github/workflows/cloud-memory.yml; then
+            .github/workflows/ci.yml; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'No relevant changes; fixed-input memory comparison was not selected.' >> "$GITHUB_STEP_SUMMARY"
           else
@@ -235,7 +248,7 @@ jobs:
 
   openssh:
     name: openssh
-    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+    if: github.event_name == 'pull_request' && github.event.action != 'edited' && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -249,7 +262,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
-          if git diff --quiet "$BASE...$HEAD" -- 'src/cloud/' 'src/backend.rs' 'tests/cloud_hybrid.rs' '.github/workflows/ssh-network.yml' '.github/workflows/ci.yml'; then
+          if git diff --quiet "$BASE...$HEAD" -- 'src/cloud/' 'src/backend.rs' 'tests/cloud_hybrid.rs' '.github/workflows/ci.yml'; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
           else
@@ -320,7 +333,7 @@ jobs:
 
   build:
     name: build
-    if: github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'feat/ssh-execution-transport')
+    if: github.event_name == 'pull_request' && github.event.action != 'edited' && (github.event.pull_request.base.ref == 'main' || github.event.pull_request.base.ref == 'feat/ssh-execution-transport')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -334,7 +347,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
-          if git diff --quiet "$BASE...$HEAD" -- 'Dockerfile' 'Cargo.toml' 'Cargo.lock' 'src/' '.github/workflows/container.yml' '.github/workflows/ci.yml'; then
+          if git diff --quiet "$BASE...$HEAD" -- 'Dockerfile' 'Cargo.toml' 'Cargo.lock' 'src/' '.github/workflows/ci.yml'; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
           else
@@ -359,3 +372,48 @@ jobs:
           printf '\n// Container cache verification.\n' >> src/lib.rs
           docker buildx build --load -t rusty-ci .
           docker run --rm rusty-ci --version
+
+  # A real session for the README, recorded with the repository's keys. The GIF
+  # is committed to the branch the run was started on (never main) for review.
+  demo:
+    if: github.event_name == 'workflow_dispatch' && inputs.suite == 'demo' && inputs.demo != '' && github.ref_name != 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - run: cargo build --release --workspace && cargo install --locked --git https://github.com/asciinema/agg --rev aae34b01
+      - name: record
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          NVIDIA_API_KEY_2: ${{ secrets.NVIDIA_API_KEY_2 }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SCENE: ${{ inputs.demo }}
+        run: |
+          mkdir -p out
+          work=$(mktemp -d) && cp -R demo/shop/. "$work"
+          # The recorder runs from the copy, outside the workspace, so call it by path.
+          (cd "$work" && RUSTY_BIN="$GITHUB_WORKSPACE/target/release/rusty" RUSTY_HOME="$(mktemp -d)" \
+            "$GITHUB_WORKSPACE/target/release/xtask" record "$SCENE" "$GITHUB_WORKSPACE/out/$SCENE.cast" -- --yolo)
+          agg --theme monokai --speed 2 --idle-time-limit 2 "out/$SCENE.cast" "out/$SCENE.gif"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo
+          path: out/
+      - name: commit the GIF to the branch
+        env:
+          SCENE: ${{ inputs.demo }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          cp "out/$SCENE.gif" "docs/demo/$SCENE.gif"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "docs/demo/$SCENE.gif"
+          git commit -m "docs(demo): record the $SCENE scene"
+          git push origin "HEAD:$BRANCH"

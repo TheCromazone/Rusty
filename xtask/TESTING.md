@@ -19,7 +19,8 @@ for diagnosis; CI invokes the same QA command developers run locally.
 `.github/workflows/ci.yml` is the canonical workflow, including the scoped
 OpenSSH and container gates. Opened, reopened and synchronized PRs
 and main pushes run `check` and the full offline gate. Superseded code runs
-cancel; title/body edits do not trigger CI. The cache includes compiler
+cancel; title/body edits run conventions only in a separate concurrency group,
+without cancelling code QA or selecting the expensive jobs. The cache includes compiler
 identity and the lockfile. Main publishes caches; PRs restore them. Conventions
 run in `check`. A lightweight `messages` job mirrors that result to preserve
 existing branch-protection check names, with no duplicate compilation.
@@ -40,11 +41,12 @@ these gates through the workflow concurrency policy.
 Use Run workflow to select offline, perf, live or cloud. macOS is available
 explicitly for platform qualification; no automatic OS/model/memory matrix,
 nightly schedule, or paid call runs on a PR. The former eval and memory-live
-workflows are consolidated here. Demo recording stays a local `cargo xtask
-record` command; quality runs never commit demo assets or push changes.
+workflows are consolidated here. The manual `demo` suite preserves README GIF
+recording and commits its output only to the selected non-main branch; ordinary
+quality runs never record or push demo assets.
 
-The live lane defaults to three repair evals, one repeat and one concurrent
-task. Request/time/token limits bound each Rusty process; they are **not a
+The live lane defaults to three repair evals, one repeat and four concurrent
+tasks, with an explicit `jobs` input restricted to 1–8. Request/time/token limits bound each Rusty process; they are **not a
 whole-workflow dollar cap**. Empty tasks explicitly selects all current evals;
 repeat counts are limited to 1–5 in the UI workflow. Configure repository keys
 only for the selected live step. Cloud requires `DAYTONA_API_KEY`,
@@ -140,7 +142,7 @@ The explicit live lane runs the selected subset, not an implied full feature
 matrix. Provider, infrastructure and cloud rows with additional qualification
 remain open until their independent receipts exist.
 
-`cargo xtask qa --full` is the CI gate (also the default). `--changed` selects relevant test binaries; runtime/shared/unknown changes select every test binary. A partial run is labeled changed-only and does not qualify the whole application. `cargo xtask flaky --runs 10` retains per-run failures/timings in `target/flaky.json`.
+`cargo xtask qa --full` is the CI gate (also the default). Test time scale defaults to 1; another scale requires an explicit environment setting and is recorded in receipts. `--changed` selects relevant test binaries; runtime/shared/unknown changes select every test binary. A partial run is labeled changed-only and does not qualify the whole application. `cargo xtask flaky --runs 10` retains per-run failures/timings in `target/flaky.json`.
 
 
 ## Separate worktree targets
@@ -149,3 +151,8 @@ Use ordinary Git worktrees and keep each checkout's own `target/` directory.
 Run Cargo directly rather than a shared-target shell function. Do not point
 multiple worktrees at the same `CARGO_TARGET_DIR`; a previous checkout's
 binary must never stand in for the source being tested.
+
+The hosted `check` job on commit `191928c` (run 39110575738) completed in
+309 seconds. The 15-minute offline limit leaves 591 seconds of headroom for
+that observed run; it does not establish a cold-cache or scale-1 timing bound.
+Recheck the margin after the scale-1 revision and compiler/cache changes.
