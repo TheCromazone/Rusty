@@ -16,6 +16,19 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU8, Ordering};
 thread_local! { static ACTIVE_FOOTER: RefCell<Weak<RefCell<crate::footer::Footer>>> = const { RefCell::new(Weak::new()) }; }
 
+pub fn refresh_input() {
+    if !crate::ui::tty() {
+        return;
+    }
+    ACTIVE_FOOTER.with(|f| {
+        if let Some(footer) = f.borrow().upgrade() {
+            let mut out = std::io::stdout().lock();
+            footer.borrow_mut().refresh_input(&mut out);
+            let _ = out.flush();
+        }
+    });
+}
+
 /// Runtime side results use the terminal owner's footer rather than painting
 /// a second progress panel over the active turn.
 pub fn notice(text: &str) {

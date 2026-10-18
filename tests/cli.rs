@@ -575,8 +575,8 @@ fn a_partly_typed_command_runs_when_only_one_matches() {
     let s = Sandbox::new("slash-prefix");
     let out = s.repl(&["/cont", "/mode ca", "/co", "/hlep"]);
     // One command starts with /cont, one mode with ca: both run.
-    assert!(out.contains("→ /context") && out.contains("window"), "{out}");
-    assert!(out.contains("→ /mode careful") && out.contains("execution careful"), "{out}");
+    assert!(out.contains("window") && !out.contains("→ /context"), "{out}");
+    assert!(out.contains("execution careful") && !out.contains("→ /mode careful"), "{out}");
     // /co could be /compact or /context, and nothing was on screen to choose from.
     assert!(out.contains("unknown command /co. did you mean /compact, /context"), "{out}");
     assert!(out.contains("unknown command /hlep. did you mean /help?"), "{out}");

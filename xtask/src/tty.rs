@@ -272,6 +272,18 @@ fn shell_capture(binary: &Path, dest: &Path) -> Result<()> {
     s.send("\x03")?;
     s.wait_for(&[Lit("interrupted by the user")], "shell was not interrupted")?;
     ready(&mut s)?;
+    // An unfinished draft stays editable after work finishes and is not sent
+    // to the unavailable provider. Unicode backspace edits the draft itself.
+    s.send("!sleep 2\r")?;
+    s.drain(0.3)?;
+    s.send("draft 界\x7f!")?;
+    s.drain(0.3)?;
+    ready(&mut s)?;
+    if !s.text.contains("draft !") || s.text.contains("failed last request") {
+        bail!("unfinished Unicode draft was lost or submitted without Enter");
+    }
+    s.send("\x03")?;
+    ready(&mut s)?;
     s.send("/permissions read-only\r")?;
     ready(&mut s)?;
     s.send("!touch forbidden\r")?;

@@ -639,6 +639,19 @@ pub fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// Keep the composer at the bottom without erasing existing scrollback.
+pub fn dock_input() {
+    if tty() {
+        print!("\x1b[999B\r\n");
+    }
+}
+
+pub fn clear_input_hint() {
+    if tty() {
+        print!("\x1b[J");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

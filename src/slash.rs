@@ -409,6 +409,12 @@ fn distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// A slash command has one name; pasted absolute paths are ordinary messages.
+pub fn command_line(line: &str) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    first.starts_with('/') && !first[1..].contains('/')
+}
+
 /// `/help`, from the same registry as the menu.
 pub fn help(skills: &[(String, String)]) -> String {
     let mut out = String::new();

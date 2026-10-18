@@ -8,9 +8,18 @@ use crate::ui;
 #[derive(Default)]
 pub struct Footer {
     rows: usize,
+    input: Option<String>,
+    state: Option<(usize, String, String, u64)>,
 }
 
 impl Footer {
+    pub fn refresh_input(&mut self, out: &mut impl Write) {
+        if crate::signal::input_preview() != self.input {
+            let (frame, verb, status, secs) = self.state.clone().unwrap_or((0, "Working".into(), String::new(), 0));
+            self.draw(out, frame, &verb, &status, secs);
+        }
+    }
+
     /// Keep the cursor at the start of this transient row. Terminal reflow then
     /// preserves its anchor when the pane contracts; erase its wrapped tail too.
     pub fn clear(&mut self, out: &mut impl Write) {
@@ -21,13 +30,19 @@ impl Footer {
     }
 
     pub fn draw(&mut self, out: &mut impl Write, frame: usize, verb: &str, status: &str, secs: u64) {
+        self.state = Some((frame, verb.into(), status.into(), secs));
+        self.input = crate::signal::input_preview();
         self.clear(out);
-        let lines = panel(ui::width(), ui::height(), frame, verb, status, secs);
+        let _ = write!(out, "\x1b[999B\r");
+        let lines = match &self.input {
+            Some(input) => vec![fit(input, ui::width().saturating_sub(1))],
+            None => panel(ui::width(), ui::height(), frame, verb, status, secs),
+        };
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
                 let _ = write!(out, "\r\n");
             }
-            let _ = write!(out, "{}", ui::info(line));
+            let _ = write!(out, "{}", if self.input.is_some() { ui::user(line) } else { ui::info(line) });
         }
         let _ = write!(out, "\r");
         self.rows = lines.len();

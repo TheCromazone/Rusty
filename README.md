@@ -153,6 +153,9 @@ rusty --toolset shell "fix the build"         # offer only bash, for interface e
 
 Interactive resume (`rusty -c` or `/resume <id>`) shows recent requests and replies above the input. The preview is bounded to the terminal size; saved context is retained, with no model request or command replay.
 
+While a turn or side session runs, type the next message in the bottom draft row. Enter queues it; Backspace edits and Ctrl-U clears the draft. Unsent text returns to the normal editor when work finishes. After Ctrl-C, queued text is held for review instead of being sent immediately.
+
+
 Keys come from your shell, then `~/.config/rusty/.env`, then the `.env` next
 to rusty's `Cargo.toml`. Set any of `NVIDIA_API_KEY`, `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`; with several keys for one provider (`ANTHROPIC_API_KEY_2`,

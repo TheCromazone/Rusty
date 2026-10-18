@@ -594,6 +594,7 @@ fn expand_skill(cwd: &Path, input: &str) -> Option<String> {
 }
 
 fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Settings) -> Result<()> {
+    ui::dock_input();
     banner(agent, client, cwd);
     print_resume_preview(agent);
     // Typing / opens the command menu under the prompt (see slash.rs).
@@ -628,12 +629,16 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     }
     let prompt = "› ";
     let mut armed_quit = false;
+    let mut hold_queued = false;
 
     loop {
         let parent = agent.side_parent()?;
         side::poll(&parent);
         if side::running(&agent.side_book) {
+            let typing = signal::typing();
             side::wait(&parent);
+            drop(typing);
+            hold_queued |= signal::interrupted();
         }
         agent.accept_side_summaries()?;
         // Anything typed since the turn stopped reading keys, including an
@@ -643,17 +648,25 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         // Queued and freshly typed input go through the same slash router.
         println!("{}", ui::bold(&ui::fit(&client.connection_status(&agent.model), ui::width().saturating_sub(1))));
         ui::input_rule();
-        let mut input = if let Some(queued) = signal::take_queued() {
+        let queued = signal::take_queued();
+        let held = if hold_queued { queued.clone() } else { None };
+        let mut input = if let Some(queued) = queued.filter(|_| !hold_queued) {
             println!("{} {}", ui::user("›"), ui::user(&queued));
             println!("{}", ui::dim("  (typed while rusty was working)"));
             queued
         } else {
-            match rl.readline(prompt) {
+            let draft = held.unwrap_or_else(signal::take_draft);
+            hold_queued = hold_queued && signal::peek_queued().is_some();
+            match rl.readline_with_initial(prompt, (&draft, "")) {
                 Ok(l) => {
                     armed_quit = false;
                     l
                 }
                 Err(ReadlineError::Interrupted) => {
+                    if !draft.is_empty() {
+                        armed_quit = false;
+                        continue;
+                    }
                     if armed_quit {
                         break;
                     }
@@ -665,6 +678,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 Err(e) => return Err(e.into()),
             }
         };
+        ui::clear_input_hint();
         // A trailing backslash continues the message on the next line.
         while input.ends_with('\\') {
             input.pop();
@@ -679,8 +693,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         }
         // A partly typed command runs what the menu had highlighted, matched
         // against the line as typed (a trailing space opens a value menu).
-        if input.starts_with('/') {
-            let typed = input.trim_end().to_string();
+        if crate::slash::command_line(&input) {
             let resolved = match menu.lock() {
                 Ok(mut m) => {
                     let r = slash::resolve(&input, Some((&m.line, &m.rows, m.selected)), &skill_list);
@@ -689,9 +702,6 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 }
                 Err(_) => slash::resolve(&input, None, &skill_list),
             };
-            if resolved.trim_end() != typed {
-                println!("{}", ui::dim(&format!("  → {}", resolved.trim_end())));
-            }
             input = resolved;
         }
         let input = input.trim().to_string();
@@ -702,13 +712,14 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         signal::restore_terminal();
         signal::reset();
 
+        let typing = (!input.starts_with("/codex config")).then(signal::typing);
         let result = if let Some(shell) = input.strip_prefix('!') {
             if side::focused(&agent.side_book) {
                 Err(anyhow!("use /back before running a shell command"))
             } else {
                 agent.direct_shell(shell)
             }
-        } else if input.starts_with('/') {
+        } else if crate::slash::command_line(&input) {
             match command(agent, client, cwd, settings, &input) {
                 Ok(true) => break,
                 Ok(false) => Ok(()),
@@ -725,6 +736,8 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         } else {
             agent.run_turn(&input).map(|_| ())
         };
+        drop(typing);
+        hold_queued |= signal::interrupted();
         if let Err(e) = result {
             println!("{} {e:#}\n", ui::err("error:"));
         }
