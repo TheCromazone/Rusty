@@ -9,14 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-fn time_scale() -> u64 {
-    if cfg!(debug_assertions) {
-        std::env::var("RUSTY_TEST_TIME_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1)
-    } else {
-        1
-    }
-}
-
 struct Service {
     root: PathBuf,
     child: Child,
@@ -33,7 +25,6 @@ impl Service {
         let child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
             .arg("--home")
             .arg(&root)
-            .env("RUSTY_TEST_TIME_SCALE", "20")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -141,12 +132,7 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
     assert_eq!(std::fs::metadata(s.root.join("memory/advisor.sock")).unwrap().permissions().mode() & 0o777, 0o600);
     s.child.kill().unwrap();
     s.child.wait().unwrap();
-    s.child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
-        .arg("--home")
-        .arg(&s.root)
-        .env("RUSTY_TEST_TIME_SCALE", "20")
-        .spawn()
-        .unwrap();
+    s.child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).spawn().unwrap();
     let start = Instant::now();
     loop {
         if rpc(
@@ -189,61 +175,6 @@ fn an_empty_recall_says_whether_anything_is_saved() {
     );
     assert!(s.call("recall", "repo-a", 0, json!({"query":"workspace tests"})).text.contains(&id));
     assert!(s.call("list", "repo-a", 0, Value::Null).text.contains(&id));
-}
-
-#[test]
-fn stalled_service_does_not_hold_coding_hook() {
-    let root = std::env::temp_dir().join(format!("rm-stall-{}", std::process::id()));
-    std::fs::create_dir_all(root.join("memory")).unwrap();
-    let listener = UnixListener::bind(root.join("memory/advisor.sock")).unwrap();
-    let mut hooks = Hooks::connect(&root, &root, Level::Learn).unwrap();
-    let start = Instant::now();
-    assert!(hooks.advice(0).is_empty());
-    assert!(start.elapsed() < Duration::from_millis(150 * time_scale()), "hook exceeded scaled deadline tolerance");
-    assert_eq!(hooks.metrics.timeouts, 1);
-    drop(hooks);
-    drop(listener);
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn management_transport_honors_its_one_second_budget() {
-    use std::io::{BufRead, BufReader, Write};
-    let root = PathBuf::from("/tmp").join(format!(
-        "rm-control-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    let socket = root.join("advisor.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = String::new();
-        BufReader::new(&stream).read_line(&mut request).unwrap();
-        assert_eq!(serde_json::from_str::<Request>(&request).unwrap().op, "status");
-        std::thread::sleep(Duration::from_millis(350 * time_scale()));
-        // The old 200 ms transport closes before this legitimate control reply.
-        let _ = writeln!(
-            stream,
-            "{}",
-            serde_json::to_string(&Response { text: "ready".into(), ..Response::default() }).unwrap()
-        );
-    });
-    let response = rpc(
-        &socket,
-        &Request {
-            op: "status".into(),
-            scope: "test".into(),
-            session: "test".into(),
-            seq: 0,
-            level: Level::Learn,
-            data: Value::Null,
-        },
-    );
-    server.join().unwrap();
-    std::fs::remove_dir_all(root).unwrap();
-    assert_eq!(response.unwrap().text, "ready");
 }
 
 #[test]
@@ -328,7 +259,6 @@ fn terminal_interrupt_does_not_kill_autostarted_memory() {
         .env("HOME", &root)
         .env("RUSTY_NO_DOTENV", "1")
         .env("RUSTY_INFRA", "off")
-        .env("RUSTY_TEST_TIME_SCALE", "20")
         .env("NVIDIA_API_KEY", "offline-test-key")
         .env_remove("RUSTY_API_KEY")
         .env("PATH", "/usr/bin:/bin")

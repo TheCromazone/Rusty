@@ -90,9 +90,9 @@ fn root_budget_deadline_stops_a_silent_response() {
         read_model_post(&mut stream)?;
         // Only a complete real request advances provider time. Keep the
         // socket open until ask_model has returned, so EOF cannot pass it.
-        elapsed.store(600_000, Ordering::SeqCst);
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
         stream.flush()?;
+        elapsed.store(600_000, Ordering::SeqCst);
         released.recv_timeout(Duration::from_secs(60))?;
         Ok(())
     });
@@ -197,11 +197,11 @@ fn deadline_exit_closes_the_silent_transport() {
             }
         };
         read_model_post(&mut stream)?;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
+        stream.flush()?;
         let next = clock.with_extension("next");
         std::fs::write(&next, "600000")?;
         std::fs::rename(next, clock)?;
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")?;
-        stream.flush()?;
         let mut byte = [0];
         if stream.read(&mut byte)? != 0 {
             bail!("deadline exit must close the silent response");
