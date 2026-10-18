@@ -92,7 +92,7 @@ pub fn pick(request: &str) -> (ExecutionMode, String) {
     let stem = |s: &[&str]| words.iter().any(|x| s.iter().any(|p| x.starts_with(p)));
     let phrase = |p: &[&str]| p.iter().any(|p| lower.contains(p));
     let careful: [(&str, bool); 9] = [
-        ("production", word(&["prod", "production", "live"]) && !phrase(&["live reload", "live preview"])),
+        ("production", word(&["prod", "production"]) || live_means_production(&words)),
         ("a migration", stem(&["migrat", "schema", "backfill"])),
         ("a deploy", stem(&["deploy", "rollout"]) || word(&["release"])),
         (
@@ -136,6 +136,78 @@ pub fn pick(request: &str) -> (ExecutionMode, String) {
     (ExecutionMode::Standard, "nothing unusual".into())
 }
 
+/// "live" on its own is everyday wording: a live test, live typing, live
+/// reload. It means production next to something that runs for real (the
+/// live site, live traffic) or as where the work goes (go live, deploy to
+/// live).
+fn live_means_production(words: &[&str]) -> bool {
+    const TARGETS: &[&str] = &[
+        "site",
+        "website",
+        "server",
+        "servers",
+        "environment",
+        "env",
+        "system",
+        "systems",
+        "database",
+        "db",
+        "data",
+        "traffic",
+        "users",
+        "customers",
+        "api",
+        "app",
+        "service",
+        "services",
+        "cluster",
+        "instance",
+        "deployment",
+        "keys",
+        "key",
+        "mode",
+        "account",
+        "store",
+        "endpoint",
+        "payments",
+        "orders",
+        "infrastructure",
+        "infra",
+        "stack",
+        "version",
+    ];
+    const INTO: &[&str] = &["go", "goes", "going", "went", "push", "pushed", "pushing", "to", "on", "in", "against"];
+    const EVERYDAY: &[&str] = &[
+        "reload",
+        "preview",
+        "stream",
+        "streaming",
+        "test",
+        "tests",
+        "testing",
+        "login",
+        "typing",
+        "session",
+        "sessions",
+        "demo",
+        "coding",
+        "share",
+        "chat",
+        "update",
+        "updates",
+        "search",
+        "edit",
+        "editing",
+        "view",
+    ];
+    words.iter().enumerate().any(|(i, w)| {
+        let next = words.get(i + 1).copied();
+        *w == "live"
+            && (next.is_some_and(|n| TARGETS.contains(&n))
+                || i > 0 && INTO.contains(&words[i - 1]) && !next.is_some_and(|n| EVERYDAY.contains(&n)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +249,33 @@ mod tests {
         // Consequential beats quick: a quick prod fix is still prod.
         assert_eq!(p("quick hotfix in production"), ExecutionMode::Careful);
         assert_eq!(pick("deploy the db migration").1, "mentions a migration and a deploy");
+    }
+
+    #[test]
+    fn live_alone_is_not_production() {
+        let p = |s: &str| pick(s);
+        for everyday in [
+            "Live login and typing smoke test. Do not use tools or modify files.",
+            "run a live test of the parser",
+            "add live streaming to the chat view",
+            "the live preview is blank",
+            "set up a live coding session",
+            "how do I add a button to live stream?",
+        ] {
+            assert_eq!(p(everyday), (ExecutionMode::Standard, "nothing unusual".into()), "{everyday}");
+        }
+        for target in [
+            "check the live site after the change",
+            "why is live traffic dropping?",
+            "rotate the live api keys",
+            "the cart goes live tomorrow, fix the totals",
+            "push the hotfix to live",
+            "the bug only shows up on live",
+        ] {
+            assert_eq!(p(target).0, ExecutionMode::Careful, "{target}");
+            assert!(p(target).1.contains("production"), "{target}: {}", p(target).1);
+        }
+        // An explicit prod is production even beside an everyday "live".
+        assert_eq!(p("fix live reload on the prod server").1, "mentions production");
     }
 }

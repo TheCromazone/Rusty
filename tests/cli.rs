@@ -2066,6 +2066,13 @@ fn auto_mode_picks_per_request_and_an_explicit_mode_wins() {
     assert_eq!(requests.len(), 1, "a plan with no changes gets no checker");
     let (stdout, _, _) = scripted_run(&s, &["sketch a quick landing page"], vec![answer()]);
     assert!(stdout.contains("◇ vibe"), "{stdout}");
+    // An everyday "live" is not production; a live target is.
+    let everyday = "Live login and typing smoke test. Do not use tools or modify files.";
+    let (stdout, stderr, _) = scripted_run(&s, &["--stats", everyday], vec![answer()]);
+    assert!(stdout.contains("◇ standard") && !stdout.contains("production"), "{stdout}");
+    assert!(stderr.contains("\"mode_reason\":\"nothing unusual\""), "{stderr}");
+    let (stdout, _, _) = scripted_run(&s, &["check the live site after the change"], vec![answer()]);
+    assert!(stdout.contains("◇ careful") && stdout.contains("mentions production"), "{stdout}");
     let (stdout, _, _) = scripted_run(&s, &["--mode", "standard", "plan the database migration"], vec![answer()]);
     assert!(!stdout.contains("◇ careful") && !stdout.contains("auto ·"), "{stdout}");
     // Picking a mode never changes permissions.
