@@ -185,8 +185,10 @@ fn run_case(opts: &Smoke, binary: &Path, mode: &str, task: &str, endpoint: &str,
     );
     let daemon = &mut daemon.0;
     let (root, project, home) = (root.as_path(), project.as_path(), home.as_path());
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !home.join("memory/advisor.sock").exists() {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    // A socket pathname can appear between bind and listen. A successful
+    // status reply is the readiness signal, before any mutating RPC.
+    while rpc(home, "status", Value::Null, 0).is_err() {
         if daemon.try_wait()?.is_some() || Instant::now() > deadline {
             bail!("daemon did not start");
         }

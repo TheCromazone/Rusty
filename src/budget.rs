@@ -114,6 +114,14 @@ impl Budget {
         Ok(Arc::new(budget))
     }
     fn elapsed(&self) -> Duration {
+        // Integration fixtures advance provider time after observing a POST.
+        // Compiled out of release builds, including the environment lookup.
+        #[cfg(debug_assertions)]
+        if let Ok(path) = std::env::var("RUSTY_TEST_BUDGET_CLOCK") {
+            let ms =
+                std::fs::read_to_string(path).expect("test budget clock").trim().parse().expect("clock milliseconds");
+            return Duration::from_millis(ms);
+        }
         self.prior + self.started.elapsed()
     }
     /// Rewrites the ledger file, if any, whole: written beside it, then

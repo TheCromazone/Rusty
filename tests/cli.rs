@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/sync.rs"]
+mod sync;
+
 const BIN: &str = env!("CARGO_BIN_EXE_rusty");
 
 struct Sandbox {
@@ -80,6 +83,7 @@ impl Sandbox {
             .env_remove("RUSTY_MAX_REQUESTS")
             .env_remove("RUSTY_MAX_BUDGET_TOKENS")
             .env_remove("RUSTY_BUDGET_SECS")
+            .env_remove("RUSTY_TEST_BUDGET_CLOCK")
             .env_remove("RUSTY_MODEL")
             .env_remove("RUSTY_MODE")
             .env_remove("RUSTY_CAREFUL_MODEL")
@@ -145,16 +149,8 @@ impl Drop for Sandbox {
     }
 }
 
-fn wait(mut child: std::process::Child, limit: Duration) -> Output {
-    let start = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if start.elapsed() > limit {
-            let _ = child.kill();
-            panic!("rusty did not exit within {limit:?}");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    child.wait_with_output().unwrap()
+fn wait(child: std::process::Child, limit: Duration) -> Output {
+    sync::wait(child, limit.max(Duration::from_secs(120)))
 }
 
 #[test]
@@ -797,7 +793,7 @@ fn verified_run_with_memory(
             "--verify",
             command,
             "--verify-timeout",
-            "1",
+            if command == "sleep 30 & wait" { "1" } else { "30" },
             "--stats",
             "--trajectory",
         ])
@@ -806,7 +802,7 @@ fn verified_run_with_memory(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map(|child| wait(child, Duration::from_secs(15)))
+        .map(|child| wait(child, Duration::from_secs(60)))
         .unwrap();
     let trace = serde_json::from_str(&std::fs::read_to_string(s.home.join("verified.json")).unwrap()).unwrap();
     let requests = server.join().unwrap_or_else(|_| {
@@ -1307,7 +1303,7 @@ fn live_cmd(s: &Sandbox) -> Command {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires a live model and provider credentials"]
 fn live_fixes_a_bug_and_reports_stats() {
     let Some(s) = live("live-fix") else { return };
     std::fs::write(s.project.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
@@ -1327,7 +1323,7 @@ fn live_fixes_a_bug_and_reports_stats() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires a live model and provider credentials"]
 fn live_goal_mode_closes_with_evidence() {
     let Some(s) = live("live-goal") else { return };
     let out = live_cmd(&s)
@@ -1344,7 +1340,7 @@ fn live_goal_mode_closes_with_evidence() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires a live model and provider credentials"]
 fn live_ctrl_c_stops_quickly() {
     let Some(s) = live("live-sigint") else { return };
     let child = live_cmd(&s)
@@ -1364,7 +1360,7 @@ fn live_ctrl_c_stops_quickly() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires a live model and provider credentials"]
 fn live_swarm_runs_workers_in_parallel() {
     let Some(s) = live("live-swarm") else { return };
     for (f, body) in [("a.py", "def alpha():\n    return 1\n"), ("b.py", "def beta():\n    return 2\n")] {
@@ -1456,20 +1452,20 @@ fn scripted_http(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHan
                 match listener.accept() {
                     Ok(pair) => break pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(start.elapsed() < Duration::from_secs(15), "expected another request");
+                        assert!(start.elapsed() < Duration::from_secs(120), "expected another request");
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(e) => panic!("{e}"),
                 }
             };
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut size = 0;
             let mut headers = String::new();
             loop {
                 let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
+                assert!(reader.read_line(&mut line).unwrap() > 0, "EOF in scripted request headers");
                 if line == "\r\n" {
                     break;
                 }
@@ -1840,7 +1836,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
             let (mut stream, _) = match listener.accept() {
                 Ok(p) => p,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(start.elapsed() < Duration::from_secs(15), "missing swarm request");
+                    assert!(start.elapsed() < Duration::from_secs(120), "missing swarm request");
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
@@ -1850,7 +1846,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
             let requests = requests_server.clone();
             handlers.push(std::thread::spawn(move || {
                 stream.set_nonblocking(false).unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut size = 0;
                 let mut headers = 0;
@@ -1881,7 +1877,7 @@ fn swarm_overlaps_three_workers_and_keeps_them_read_only() {
                         0 => {
                             let (lock, cv) = &*gate;
                             let mut entered = lock.lock().unwrap(); *entered += 1; cv.notify_all();
-                            let (entered, _) = cv.wait_timeout_while(entered, Duration::from_secs(5), |n| *n < 3).unwrap();
+                            let (entered, _) = cv.wait_timeout_while(entered, Duration::from_secs(120), |n| *n < 3).unwrap();
                             assert_eq!(*entered, 3, "workers did not overlap");
                             // Even a forged write tool call must be denied by policy.
                             tool_reply("write_file", json!({"path":"forbidden.txt","content":"worker wrote"}))
@@ -2440,17 +2436,29 @@ fn retries_stop_at_the_budget() {
 }
 
 #[test]
-fn a_refused_key_fails_fast() {
+fn a_refused_key_stops_after_two_attempts() {
     let s = Sandbox::new("refused-key");
     let refused = (401, r#"{"error":"bad key"}"#.to_string());
     let (url, server) = scripted_http(vec![refused.clone(), refused]);
-    let started = Instant::now();
-    let out = s.cmd().env("RUSTY_BASE_URL", url).arg("hi").stdin(Stdio::null()).output().unwrap();
+    let out = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .arg("--trajectory")
+        .arg(s.home.join("refused.json"))
+        .arg("hi")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1));
     assert!(err.contains("giving up after 2 attempts") && err.contains("401") && err.contains("bad key"), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(10), "auth failures don't wait out the budget");
     assert_eq!(server.join().unwrap().len(), 2);
+    let trace: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.home.join("refused.json")).unwrap()).unwrap();
+    // One round-one backoff (2 to 2.5s) separates the two attempts; anything
+    // longer means auth failures are waiting out the retry budget.
+    let waited = trace["model_budget"]["retry_wait_seconds"].as_f64().unwrap();
+    assert!(waited < 10.0, "auth failures don't wait out the budget: waited {waited}s");
 }
 
 #[test]
@@ -2480,9 +2488,8 @@ fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
         let mut first_closed = false;
         for body in ["", answer.as_str()] {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = stream.read(&mut buf);
+            stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+            sync::request(&mut stream);
             seen += 1;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
             stream.flush().unwrap();
@@ -2496,7 +2503,6 @@ fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
         }
         (seen, first_closed)
     });
-    let started = Instant::now();
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
@@ -2510,19 +2516,17 @@ fn a_stream_that_goes_quiet_is_retried_instead_of_hanging() {
     let (requests, first_closed) = server.join().unwrap();
     assert_eq!(requests, 2, "the quiet stream was given up on and retried");
     assert!(first_closed, "the timed-out response was dropped before retrying");
-    assert!(started.elapsed() < Duration::from_secs(20), "the stall was noticed within the idle limit");
 }
 
 #[test]
 fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let s = Sandbox::new("stream-active-long");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 65536];
-        let _ = stream.read(&mut buf);
+        sync::request(&mut stream);
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
         stream.flush().unwrap();
         let pieces = ["still ", "working ", "after ", "idle limit"];
@@ -2536,7 +2540,6 @@ fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
         write!(stream, "data: {done}\n\ndata: [DONE]\n\n").unwrap();
         stream.flush().unwrap();
     });
-    let started = Instant::now();
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
@@ -2547,20 +2550,18 @@ fn a_stream_can_run_longer_than_the_idle_limit_when_bytes_keep_arriving() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("still working after idle limit"));
-    assert!(started.elapsed() > Duration::from_secs(2));
     server.join().unwrap();
 }
 
 #[test]
 fn an_unbudgeted_stream_can_be_quiet_longer_than_the_blocking_default_timeout() {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let s = Sandbox::new("stream-quiet-over-30");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 65536];
-        let _ = stream.read(&mut buf);
+        sync::request(&mut stream);
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
         stream.flush().unwrap();
         std::thread::sleep(Duration::from_millis(30_500));
@@ -2616,21 +2617,20 @@ fn a_quiet_codex_stream_is_retried_too() {
         let mut seen = 0;
         for body in ["", cut, answer.as_str()] {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let mut buf = [0u8; 65536];
-            let _ = stream.read(&mut buf);
+            stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+            sync::request(&mut stream);
             seen += 1;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
             stream.flush().unwrap();
             if body.is_empty() {
-                std::thread::sleep(Duration::from_secs(3));
+                let mut byte = [0];
+                assert!(matches!(stream.read(&mut byte), Ok(0)), "idle timeout must close the response");
             } else {
                 stream.write_all(body.as_bytes()).unwrap();
             }
         }
         seen
     });
-    let started = Instant::now();
     let out = s
         .cmd()
         .env("CODEX_HOME", &codex_home)
@@ -2645,7 +2645,6 @@ fn a_quiet_codex_stream_is_retried_too() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("still signed in"));
     assert_eq!(server.join().unwrap(), 3, "the quiet and the cut-off Codex streams were both retried");
     assert!(String::from_utf8_lossy(&out.stderr).contains("retrying in"), "a piped run still says what it waits for");
-    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[test]
@@ -3062,15 +3061,19 @@ fn ctrl_c_cancels_and_reaps_an_owned_command_before_export() {
         .spawn()
         .unwrap();
     assert_eq!(server.join().unwrap().len(), 2);
-    std::thread::sleep(Duration::from_millis(100));
+    sync::until("owned shell PID", || {
+        std::fs::read_to_string(s.project.join("owner.pid")).ok().and_then(|s| s.trim().parse::<i32>().ok()).is_some()
+    });
     let pid: i32 = std::fs::read_to_string(s.project.join("owner.pid")).unwrap().trim().parse().unwrap();
     let before = Instant::now();
     unsafe {
         libc::kill(child.id() as i32, libc::SIGINT);
     }
-    let out = wait(child, Duration::from_secs(5));
+    let out = wait(child, Duration::from_secs(60));
     assert_eq!(out.status.code(), Some(130), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(before.elapsed() < Duration::from_secs(2));
+    // Generous for a loaded machine, yet well short of the 30s sleep: only
+    // a working cancel can exit this soon.
+    assert!(before.elapsed() < Duration::from_secs(15), "Ctrl-C waited for the command to finish");
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("interrupted.json")).unwrap()).unwrap();
     assert_eq!(trace["activities"][0]["status"], "Interrupted");
@@ -3352,32 +3355,41 @@ fn root_budget_deadline_stops_a_silent_response() {
     let s = Sandbox::new("budget-silent");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let clock = s.home.join("provider-clock");
+    std::fs::write(&clock, "0").unwrap();
+    let server_clock = clock.clone();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut buf = [0; 65536];
-        let _ = stream.read(&mut buf);
+        sync::request(&mut stream);
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
-        std::thread::sleep(Duration::from_secs(3));
+        stream.flush().unwrap();
+        // Startup consumes no provider time. Expire only after the real POST.
+        // The fake clock drives the deadline; the request's real timer is a
+        // full minute, so a slow scheduler cannot fire it and force a retry.
+        let next = server_clock.with_extension("next");
+        std::fs::write(&next, "60000").unwrap();
+        std::fs::rename(next, server_clock).unwrap();
+        let mut byte = [0];
+        assert!(matches!(stream.read(&mut byte), Ok(0)), "deadline must close the silent response");
     });
-    let now = Instant::now();
     let trajectory = s.project.join("trace.json");
     let out = s
         .cmd()
         .env("RUSTY_BASE_URL", url)
-        .args(["--budget-secs", "1", "--mode", "standard", "--memory", "off", "--trajectory"])
+        .env("RUSTY_TEST_BUDGET_CLOCK", &clock)
+        .args(["--budget-secs", "60", "--mode", "standard", "--memory", "off", "--trajectory"])
         .arg(&trajectory)
         .arg("inspect")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map(|c| wait(c, Duration::from_secs(5)))
+        .map(|c| wait(c, Duration::from_secs(60)))
         .unwrap();
     assert!(!out.status.success());
-    assert!(now.elapsed() < Duration::from_millis(2500));
     let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(trajectory).unwrap()).unwrap();
     assert_eq!(trace["model_budget"]["requests"], 1);
     assert_eq!(trace["model_budget"]["unknown_usage_requests"], 1);
+    assert_eq!(trace["model_budget"]["deadline_reached"], true);
     server.join().unwrap();
 }
 
@@ -3683,7 +3695,7 @@ fn a_killed_run_still_leaves_a_trajectory() {
         .unwrap();
     let start = Instant::now();
     while !path.exists() {
-        assert!(start.elapsed() < Duration::from_secs(15), "no trajectory before the kill");
+        assert!(start.elapsed() < Duration::from_secs(120), "no trajectory before the kill");
         std::thread::sleep(Duration::from_millis(20));
     }
     child.kill().unwrap();

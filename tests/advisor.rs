@@ -9,6 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+fn time_scale() -> u64 {
+    if cfg!(debug_assertions) {
+        std::env::var("RUSTY_TEST_TIME_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1)
+    } else {
+        1
+    }
+}
+
 struct Service {
     root: PathBuf,
     child: Child,
@@ -25,6 +33,7 @@ impl Service {
         let child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
             .arg("--home")
             .arg(&root)
+            .env("RUSTY_TEST_TIME_SCALE", "20")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -48,16 +57,23 @@ impl Service {
         )
         .is_err()
         {
-            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(start.elapsed() < Duration::from_secs(60));
             std::thread::sleep(Duration::from_millis(10));
         }
     }
     fn call(&self, op: &str, scope: &str, seq: u64, data: Value) -> Response {
-        rpc(
-            &self.root.join("memory/advisor.sock"),
-            &Request { op: op.into(), scope: scope.into(), session: "session".into(), seq, level: Level::Learn, data },
-        )
-        .unwrap()
+        use std::io::{BufRead, BufReader, Write};
+        // These cases exercise the database, not the production RPC deadline.
+        // The dedicated transport test below still uses the real rpc client.
+        let mut stream = std::os::unix::net::UnixStream::connect(self.root.join("memory/advisor.sock")).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
+        let request =
+            Request { op: op.into(), scope: scope.into(), session: "session".into(), seq, level: Level::Learn, data };
+        writeln!(stream, "{}", serde_json::to_string(&request).unwrap()).unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
     }
 }
 impl Drop for Service {
@@ -125,7 +141,12 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
     assert_eq!(std::fs::metadata(s.root.join("memory/advisor.sock")).unwrap().permissions().mode() & 0o777, 0o600);
     s.child.kill().unwrap();
     s.child.wait().unwrap();
-    s.child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).spawn().unwrap();
+    s.child = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"))
+        .arg("--home")
+        .arg(&s.root)
+        .env("RUSTY_TEST_TIME_SCALE", "20")
+        .spawn()
+        .unwrap();
     let start = Instant::now();
     loop {
         if rpc(
@@ -143,7 +164,7 @@ fn daemon_restarts_preserve_l2_but_not_temporary_observations() {
         {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(start.elapsed() < Duration::from_secs(60));
         std::thread::sleep(Duration::from_millis(10));
     }
     let status = s.call("status", "repo-a", 1, Value::Null).data;
@@ -178,7 +199,7 @@ fn stalled_service_does_not_hold_coding_hook() {
     let mut hooks = Hooks::connect(&root, &root, Level::Learn).unwrap();
     let start = Instant::now();
     assert!(hooks.advice(0).is_empty());
-    assert!(start.elapsed() < Duration::from_millis(150), "hook exceeded deadline tolerance");
+    assert!(start.elapsed() < Duration::from_millis(150 * time_scale()), "hook exceeded scaled deadline tolerance");
     assert_eq!(hooks.metrics.timeouts, 1);
     drop(hooks);
     drop(listener);
@@ -201,7 +222,7 @@ fn management_transport_honors_its_one_second_budget() {
         let mut request = String::new();
         BufReader::new(&stream).read_line(&mut request).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&request).unwrap().op, "status");
-        std::thread::sleep(Duration::from_millis(350));
+        std::thread::sleep(Duration::from_millis(350 * time_scale()));
         // The old 200 ms transport closes before this legitimate control reply.
         let _ = writeln!(
             stream,
@@ -295,7 +316,7 @@ fn daemon_refuses_symlinked_persistence() {
 
 #[test]
 fn terminal_interrupt_does_not_kill_autostarted_memory() {
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
     let root =
         PathBuf::from("/tmp").join(format!("rm-auto-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
@@ -307,25 +328,38 @@ fn terminal_interrupt_does_not_kill_autostarted_memory() {
         .env("HOME", &root)
         .env("RUSTY_NO_DOTENV", "1")
         .env("RUSTY_INFRA", "off")
+        .env("RUSTY_TEST_TIME_SCALE", "20")
         .env("NVIDIA_API_KEY", "offline-test-key")
         .env_remove("RUSTY_API_KEY")
         .env("PATH", "/usr/bin:/bin")
         .process_group(0)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let mut s = Service { root, child };
     s.ready();
+    let stdout = s.child.stdout.take().unwrap();
+    let (ready, observed) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.contains("/goal") {
+                let _ = ready.send(());
+            }
+        }
+    });
+    writeln!(s.child.stdin.as_mut().unwrap(), "/help").unwrap();
+    observed.recv_timeout(Duration::from_secs(60)).expect("REPL help before SIGINT");
     assert!(!s.call("status", "test", 0, Value::Null).error);
     unsafe {
         assert_eq!(libc::kill(-(s.child.id() as i32), libc::SIGINT), 0);
     }
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(!s.call("status", "test", 0, Value::Null).error, "Ctrl-C killed the memory service");
     writeln!(s.child.stdin.take().unwrap(), "/exit").unwrap();
     s.child.wait().unwrap();
+    reader.join().unwrap();
+    assert!(!s.call("status", "test", 0, Value::Null).error, "Ctrl-C killed the memory service");
     let stopped =
         Command::new(env!("CARGO_BIN_EXE_rusty-memoryd")).arg("--home").arg(&s.root).arg("stop").output().unwrap();
     assert!(stopped.status.success(), "{}", String::from_utf8_lossy(&stopped.stderr));

@@ -65,6 +65,7 @@ impl Hybrid {
             .env("HOME", &self.home)
             .env("RUSTY_HOME", &self.home)
             .env("RUSTY_NO_DOTENV", "1")
+            .env("RUSTY_TEST_TIME_SCALE", "20")
             .env("NVIDIA_API_KEY", "offline-model-key")
             .env("NO_COLOR", "1");
         c
@@ -340,7 +341,7 @@ fn step(body: &Value, lock: &Mutex<ModelState>, cv: &Condvar) -> Result<(usize, 
                     let mut m = lock.lock().unwrap();
                     m.entered += 1;
                     cv.notify_all();
-                    let (_m, t) = cv.wait_timeout_while(m, Duration::from_secs(5), |m| m.entered < 3).unwrap();
+                    let (_m, t) = cv.wait_timeout_while(m, Duration::from_secs(60), |m| m.entered < 3).unwrap();
                     ensure(!t.timed_out(), "workers did not overlap")?;
                     act("write_file", json!({"path": "worker-forbidden.txt", "content": "forged"}))
                 }
@@ -476,17 +477,14 @@ fn three_modes_run_parallel_swarms_with_all_remote_tools_and_local_memory() {
         let _ = std::fs::remove_file(h.remote.join("result.txt"));
         h.machine().calls.lock().unwrap().clear();
         h.machine().peak.store(0, Ordering::SeqCst);
+        h.machine().expect_parallel_reads(3);
         let (server, shared) = model();
         let trajectory = h.tmp.path().join(format!("{mode}.json"));
         if memory == "learn" {
             let mut c = Command::new(MEMORYD);
             c.arg("--home").arg(&h.home).env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &h.home);
             h.daemon = Some(c.stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !h.home.join("memory/advisor.sock").exists() {
-                assert!(Instant::now() < deadline, "memory daemon did not start");
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            support::sync::until("memory daemon ready socket", || h.home.join("memory/advisor.sock").exists());
         }
         let bridge = h.bridge();
         let mut c = h.rusty();
