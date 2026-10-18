@@ -114,3 +114,5 @@ multi-turn pivots/undo/goals/compaction, and memory use/staleness/poisoning.
 The explicit live lane runs the selected subset, not an implied full feature
 matrix. Provider, infrastructure and cloud rows with additional qualification
 remain open until their independent receipts exist.
+
+`cargo xtask qa --full` is the CI gate (also the default). `--changed` selects relevant test binaries; runtime/shared/unknown changes expand to full QA. A partial run is labeled changed-only and does not qualify the whole application. `cargo xtask flaky --runs 10` retains per-run failures/timings in `target/flaky.json`. `cargo xtask worktree BRANCH` prints setup for a compiler-specific shared cache; the `scripts/cargo-shared` wrapper locks the whole command across worktrees.

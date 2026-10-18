@@ -11,6 +11,8 @@ struct Options {
     perf: bool,
     cloud: bool,
     list: bool,
+    changed: bool,
+    full: bool,
 }
 impl Options {
     fn parse(args: &[String]) -> Result<Self> {
@@ -18,12 +20,16 @@ impl Options {
         for a in args {
             match a.as_str() {
                 "--live" => o.live = true,
+                "--full" => o.full = true,
+                "--changed" => o.changed = true,
                 "--perf" => o.perf = true,
                 "--cloud" => o.cloud = true,
                 "--list" => o.list = true,
-                _ => bail!("unknown qa argument {a:?}; use --live, --perf, --cloud or --list"),
+                _ => bail!("unknown qa argument {a:?}; use --full, --changed, --live, --perf, --cloud or --list"),
             }
         }
+        ensure!(!(o.full && o.changed), "choose --full or --changed");
+        ensure!(!(o.changed && (o.live || o.perf || o.cloud)), "extensions require the full gate");
         Ok(o)
     }
     fn preflight(&self) -> Result<()> {
@@ -73,6 +79,9 @@ impl Step {
         if self.name == "evals" {
             command.env("EVAL_BINARY", super::target_dir().join("release/rusty"));
         }
+        if matches!(self.name, "tests" | "memory" | "terminal") {
+            command.env("RUSTY_TEST_TIME_SCALE", "20");
+        }
         let status = command
             .args(&self.args)
             .current_dir(super::root())
@@ -88,7 +97,10 @@ fn plan(o: &Options, out: &Path) -> Vec<Step> {
     let mut steps = vec![
         Step::cargo("format", &["fmt", "--all", "--check"]),
         Step::cargo("lint", &["clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]),
-        Step::cargo("tests", &["test", "--workspace", "--locked", "--", "--test-threads", "2"]),
+        Step::task(
+            "tests",
+            if o.changed { vec!["test-suite".into(), "--changed".into()] } else { vec!["test-suite".into()] },
+        ),
         Step::cargo("binaries", &["build", "--bins", "--locked"]),
         Step::task(
             "memory",
@@ -116,6 +128,9 @@ fn plan(o: &Options, out: &Path) -> Vec<Step> {
             vec!["tty-inspect".into(), out.join("terminal").display().to_string(), "--all".into()],
         ),
     ];
+    if o.changed {
+        steps.retain(|s| matches!(s.name, "format" | "lint" | "tests"));
+    }
     if o.live || o.perf || o.cloud {
         steps.push(Step::cargo("release", &["build", "--release", "--bins", "--locked"]));
     }
@@ -189,6 +204,7 @@ fn save(out: &Path, report: &Value) -> Result<()> {
             s["seconds"].as_f64().unwrap()
         ));
     }
+    md.push_str(&format!("\nScope: {}. A changed-only run is not full qualification.\n", report["scope"]));
     md.push_str(&format!("\nExtensions requested: live={}, performance={}, hosted cloud={}.\nUnrequested or unrun gates are not qualification evidence.\n", report["live"], report["perf"], report["cloud"]));
     std::fs::write(out.join("summary.md"), md)?;
     Ok(())
@@ -239,7 +255,7 @@ fn receipt(o: &Options, steps: &[Step]) -> Value {
     .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), Value::String(v))))
     .collect();
     json!({"revision": git(&["rev-parse", "HEAD"]), "dirty": git(&["status", "--porcelain"]).is_none_or(|s| !s.is_empty()),
-        "status": "running", "live": o.live, "perf": o.perf, "cloud": o.cloud,
+        "status": "running", "scope": if o.changed { "changed-only" } else { "full" }, "live": o.live, "perf": o.perf, "cloud": o.cloud,
         "configuration": configuration,
         "steps": steps.iter().map(|s| json!({"name": s.name, "status": "not-run", "seconds": 0.0})).collect::<Vec<_>>()})
 }
@@ -249,7 +265,11 @@ fn git(args: &[&str]) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 pub fn command(args: &[String]) -> Result<ExitCode> {
-    let o = Options::parse(args)?;
+    let mut o = Options::parse(args)?;
+    // Runtime/shared/unknown changes conservatively expand to the full gate.
+    if o.changed && super::testing::changed()?.is_none() {
+        o.changed = false;
+    }
     let out: PathBuf = super::target_dir().join("qa");
     let steps = plan(&o, &out);
     if o.list {
@@ -290,6 +310,10 @@ mod tests {
     #[test]
     fn unknown_flags_fail_and_offline_never_selects_paid_extensions() {
         assert!(Options::parse(&["--lve".into()]).is_err());
+        assert!(Options::parse(&["--full".into(), "--changed".into()]).is_err());
+        assert!(Options::parse(&["--changed".into(), "--live".into()]).is_err());
+        let changed = plan(&Options { changed: true, ..Options::default() }, Path::new("out"));
+        assert_eq!(changed.iter().map(|s| s.name).collect::<Vec<_>>(), ["format", "lint", "tests"]);
         let p = plan(&Options::default(), Path::new("out"));
         assert!(p
             .iter()
