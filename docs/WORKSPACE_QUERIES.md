@@ -24,7 +24,8 @@ observed by that scan. No snapshot identity or persisted freshness is claimed.
 Search invokes ripgrep on every request with smart case, stable path order,
 line numbers, and the existing optional glob/context arguments (context is
 clamped to ten lines). It retains ripgrep's default hidden, binary, and ignore
-rules, including explicit glob overrides. It disables ambient ripgrep config
+rules, including explicit glob overrides. Descendant symlinks are not followed
+by search; explicit file paths retain ripgrep's usual handling. It disables ambient ripgrep config
 so a user's config cannot silently change the tool's flags. Results now include
 filenames even when the scope is a single file. There is no per-file match or
 column limit; the first 28,000 output bytes are retained while both output and

@@ -70,11 +70,13 @@ fn fixed_regex_case_glob_context_and_visibility_match_reference() {
     f.put("docs/a.txt", "needle\n");
     f.put("ignored/no.rs", "needle\n");
     f.put(".hidden.rs", "needle\n");
+    f.put("src/binary.rs", "\0needle\n");
     for pattern in ["needle", "Needle", "retry|deadline", "^before$", "absent_literal", "\\bdeadline\\b"] {
         for glob in [None, Some("*.rs"), Some("src/**/*.rs"), Some("!*.txt")] {
             for context in [0, 2, 100] {
                 let result = f.query(pattern, glob, context);
                 assert!(result.scan_complete);
+                assert!(!result.output.text.contains("binary.rs"));
                 if glob.is_none() {
                     assert!(!result.output.text.contains("ignored/no.rs"));
                     assert!(!result.output.text.contains(".hidden.rs"));
@@ -170,10 +172,14 @@ fn skipped_paths_and_partial_matches_keep_error_evidence() {
     assert!(!partial.scan_complete);
     assert!(partial.output.text.contains("good.rs"));
     assert!(partial.render().contains("private.rs") && partial.render().contains("Permission denied"));
+    symlink(f.0.join("good.rs"), f.0.join("alias.rs")).unwrap();
+    let aliases = f.query("needle", None, 0);
+    assert!(!aliases.output.text.contains("alias.rs"), "rg does not follow descendant file symlinks");
     symlink(&f.0, f.0.join("loop")).unwrap();
     symlink(f.0.join("absent"), f.0.join("broken.rs")).unwrap();
     let scan = files_under(&f.0);
     assert!(scan.incomplete && scan.skipped == 2);
+    assert!(scan.files.contains(&f.0.join("alias.rs")), "glob/outline retain regular-file symlinks");
     let report = scan.render("files observed", false);
     assert!(report.contains("loop") && report.contains("broken.rs"));
     assert!(report.contains("scan_complete=false output_truncated=false"));
