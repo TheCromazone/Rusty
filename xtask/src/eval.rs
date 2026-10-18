@@ -1222,15 +1222,13 @@ mod tests {
             std::fs::write(taskdir.join("prompt.txt"), "repair the file").unwrap();
             std::fs::write(taskdir.join("check.sh"), "false").unwrap();
             let bin = root.join("fake-agent");
-            let script = format!(
-                "#!/bin/sh\nprintf '{{\"retry_wait_seconds\": {waited}}}' > \"$RUSTY_BUDGET_LEDGER\"\nexec sleep 30\n"
-            );
+            let script = "#!/bin/sh\nexec sleep 30\n";
             std::fs::write(&bin, script).unwrap();
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             let cfg = Config {
                 root: root.clone(),
                 bin,
-                limit: Duration::from_secs(1),
+                limit: Duration::ZERO,
                 out: root.join("results.jsonl"),
                 logs: root.join("logs"),
                 transcripts: false,
@@ -1240,6 +1238,9 @@ mod tests {
             let (work, home) = (root.join("work"), root.join("home"));
             std::fs::create_dir_all(&work).unwrap();
             std::fs::create_dir_all(&home).unwrap();
+            // A prior process already persisted provider wait. Expire at
+            // admission, so classification never races the shell's startup.
+            std::fs::write(home.join("budget.json"), format!("{{\"retry_wait_seconds\": {waited}}}")).unwrap();
             File::create(&cfg.out).unwrap();
             score(&cfg, &task, &Run { model: "scripted", memory: "", rep: 1 }, &work, &home, &Mutex::new(())).unwrap();
             let row: Value = serde_json::from_str(std::fs::read_to_string(&cfg.out).unwrap().trim()).unwrap();

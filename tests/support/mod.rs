@@ -3,6 +3,8 @@
 //! runs commands on this machine in a scratch home directory.
 #![allow(dead_code)]
 
+pub mod sync;
+
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -74,7 +76,12 @@ pub fn git_repo(dir: &Path, files: &[(&str, &str)]) {
     }
 }
 
-pub fn wait(mut child: Child, limit: Duration) -> Output {
+/// Outer process watchdogs are separate from the command deadline being tested.
+pub fn wait(child: Child, limit: Duration) -> Output {
+    wait_command(child, limit.max(Duration::from_secs(120)))
+}
+
+pub fn wait_command(mut child: Child, limit: Duration) -> Output {
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() > limit {
@@ -224,11 +231,18 @@ pub type Handler = Arc<dyn Fn(Request) -> Response + Send + Sync>;
 pub struct Server {
     pub url: String,
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let result = thread.join();
+            if !std::thread::panicking() {
+                result.expect("mock server panicked");
+            }
+        }
     }
 }
 
@@ -238,12 +252,13 @@ pub fn serve(handler: Handler) -> Server {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
+        let mut workers = Vec::new();
         while !flag.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let handler = handler.clone();
-                    std::thread::spawn(move || {
+                    workers.push(std::thread::spawn(move || {
                         stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -291,13 +306,16 @@ pub fn serve(handler: Handler) -> Server {
                             let _ = stream.write_all(&r.body);
                         }
                         let _ = stream.flush();
-                    });
+                    }));
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(5)),
             }
         }
+        for worker in workers {
+            worker.join().expect("mock request panicked");
+        }
     });
-    Server { url, stop }
+    Server { url, stop, thread: Some(thread) }
 }
 
 // --------------------------------------------------------------- machine
@@ -313,6 +331,7 @@ pub struct Machine {
     pub calls: Mutex<Vec<Value>>,
     active: AtomicUsize,
     pub peak: AtomicUsize,
+    reads: (Mutex<(usize, usize)>, std::sync::Condvar),
     children: Mutex<Vec<Child>>,
 }
 
@@ -327,8 +346,14 @@ impl Machine {
             calls: Mutex::new(Vec::new()),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            reads: (Mutex::new((0, 0)), std::sync::Condvar::new()),
             children: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Hold the first n reads until all are in flight; later reads run normally.
+    pub fn expect_parallel_reads(&self, n: usize) {
+        *self.reads.0.lock().unwrap() = (0, n);
     }
 
     fn command(&self, inner: &str) -> Command {
@@ -352,7 +377,7 @@ impl Machine {
     }
 
     /// Runs a command, recording `rusty --tool-rpc` requests; concurrent
-    /// `read_file` executions are held briefly so overlap is measurable.
+    /// `read_file` executions can wait on an explicit arrival barrier.
     pub fn exec(&self, command: &str, timeout: u64) -> (i32, String) {
         let inner = Self::unwrap(command);
         let words = split(&inner);
@@ -368,10 +393,17 @@ impl Machine {
         if overlap {
             let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(150));
+            let (lock, cv) = &self.reads;
+            let mut reads = lock.lock().unwrap();
+            if reads.0 < reads.1 {
+                reads.0 += 1;
+                cv.notify_all();
+                let (_reads, timeout) = cv.wait_timeout_while(reads, Duration::from_secs(120), |r| r.0 < r.1).unwrap();
+                assert!(!timeout.timed_out(), "remote reads did not overlap");
+            }
         }
         let child = self.command(&inner).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let out = wait(child, Duration::from_secs(timeout));
+        let out = wait_command(child, Duration::from_secs(timeout));
         if overlap {
             self.active.fetch_sub(1, Ordering::SeqCst);
         }
