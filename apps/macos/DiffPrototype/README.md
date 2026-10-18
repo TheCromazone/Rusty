@@ -111,3 +111,35 @@ remain required before C1 can close. No stage-1 gate is implied by building
 this measurement harness.
 
 Raw measurement logs, screenshots, traces and result bundles live in the ignored `evidence/` directory. They are local review artifacts; reproduce them with the commands above. An interrupted runner or trace is never a performance pass.
+
+## Document-owner lifecycle checks
+
+The standalone spike now gives its synthetic window to a small
+`NSWindowController` owner. Closing the window detaches the document, controls,
+selection callback and measurement objects, and removes the closed controller
+from the application owner. The application can remain alive without retaining
+that closed document. Command-Q still terminates the prototype. This introduces
+no worker wrapper, session supervisor, background execution or stage-1 UI.
+
+The programmatic SwiftPM lifecycle tests exercise the same owner used by the
+executable, rather than duplicating its hierarchy. After three warmed cycles,
+they perform twenty more construction/use/close cycles, hold AX children across
+close, drain autorelease pools and the main run loop with a five-second hard
+release deadline, and check weak owner/window/controls/view/status references.
+Post-warm-up fd counts must return within two of baseline. A second test retains
+the controller itself and checks that close still releases its document graph.
+No subprocess or worker exists in this target, so these tests do not qualify
+worker shutdown, socket cleanup or process reaping.
+
+```sh
+RUSTY_NATIVE_LIFECYCLE_RECEIPT=/absolute/path/lifecycle.json \
+  swift test --package-path apps/macos/DiffPrototype --jobs 2 -c release \
+  --filter DocumentLifetimeTests
+```
+
+The optional receipt and test log include per-cycle diagnostics. Physical
+footprint observations are diagnostic only; they do not assert RSS stability,
+a quiet-machine memory budget, or global leak freedom. Do not run this alongside
+scrolling performance measurements. Source content is fixed for each prototype
+view: its document setter is private, and document replacement/cache
+invalidation remains outside this synthetic spike.

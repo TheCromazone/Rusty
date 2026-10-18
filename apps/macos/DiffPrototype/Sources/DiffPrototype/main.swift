@@ -39,42 +39,17 @@ if CommandLine.arguments.contains("--benchmark") {
     MainActor.assumeIsolated {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
-        let count = CommandLine.arguments.contains("--100k") ? 100_000 : 20_000
-        let baseline = physicalFootprint()
-        let start = ContinuousClock.now
-        let rows = Fixtures.rows(count: count)
-        let fixtureMS = milliseconds(start)
-        let outputFlag = CommandLine.arguments.firstIndex(of: "--metrics-file")
-        let output = outputFlag.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
-        let measurement = OpenMeasurement(baseline: baseline, fixtureMS: fixtureMS, rows: count, output: output,
-                                          warmCache: CommandLine.arguments.contains("--measure-memory"))
-        let document = DiffDocument(rows: rows, collapsed: !CommandLine.arguments.contains("--expanded"))
-        let view = DiffRowView(document: document)
-        view.openMeasurement = measurement
-        if let flag = CommandLine.arguments.firstIndex(of: "--projection-diagnostics"), CommandLine.arguments.indices.contains(flag + 1) {
-            view.projectionDiagnostics = ProjectionDiagnostics(path: CommandLine.arguments[flag + 1])
+        let controller = PrototypeApplicationController()
+        app.delegate = controller
+        func argument(after flag: String) -> String? {
+            guard let index = CommandLine.arguments.firstIndex(of: flag), CommandLine.arguments.indices.contains(index + 1) else { return nil }
+            return CommandLine.arguments[index + 1]
         }
-        let window = NSWindow(contentRect: NSRect(x: 120, y: 140, width: 1180, height: 760),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "rusty · native diff prototype · \(count) rows"
-        window.setAccessibilityIdentifier("prototype.window")
-        let root = NSView(frame: window.contentView!.bounds)
-        root.autoresizingMask = [.width, .height]
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 38, width: root.bounds.width, height: root.bounds.height - 38))
-        scroll.autoresizingMask = [.width, .height]
-        scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = true
-        scroll.documentView = view; scroll.drawsBackground = true; scroll.backgroundColor = SpikePalette.background
-        let toggle = NSButton(title: "expand / collapse context", target: view, action: #selector(Controls.toggle(_:)))
-        let controls = Controls(view)
-        toggle.target = controls
-        toggle.frame = NSRect(x: 12, y: 5, width: 210, height: 28)
-        toggle.setAccessibilityIdentifier("prototype.toggleContext")
-        let status = NSTextField(labelWithString: "\(count) rows · synthetic fixture · ⌘C copies new side")
-        status.frame = NSRect(x: 236, y: 11, width: 900, height: 20)
-        status.autoresizingMask = [.width]
-        view.selectionChanged = { status.stringValue = $0 }
-        root.addSubview(scroll); root.addSubview(toggle); root.addSubview(status)
-        window.contentView = root
+        controller.openFixture(count: CommandLine.arguments.contains("--100k") ? 100_000 : 20_000,
+                               collapsed: !CommandLine.arguments.contains("--expanded"),
+                               metricsPath: argument(after: "--metrics-file"),
+                               warmCache: CommandLine.arguments.contains("--measure-memory"),
+                               diagnosticsPath: argument(after: "--projection-diagnostics"))
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
@@ -84,15 +59,8 @@ if CommandLine.arguments.contains("--benchmark") {
         edit.addItem(withTitle: "copy", action: #selector(DiffRowView.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "select all", action: #selector(DiffRowView.selectAll(_:)), keyEquivalent: "a")
         app.mainMenu = menu
-        window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(view)
+        controller.documentWindow?.present()
         app.activate(ignoringOtherApps: true)
-        withExtendedLifetime((window, controls)) { app.run() }
+        withExtendedLifetime(controller) { app.run() }
     }
-}
-
-@MainActor final class Controls: NSObject {
-    let view: DiffRowView
-    init(_ view: DiffRowView) { self.view = view }
-    @objc func toggle(_ sender: Any?) { view.toggleCollapse() }
 }

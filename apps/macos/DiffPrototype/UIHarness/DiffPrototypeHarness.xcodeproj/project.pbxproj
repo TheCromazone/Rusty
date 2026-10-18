@@ -1,5 +1,7 @@
 // !$*UTF8*$!
 { archiveVersion = 1; classes = {}; objectVersion = 56; objects = {
+A628D5B2CF3076B05313D790 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../Sources/DiffPrototype/PrototypeWindowController.swift"; sourceTree = "<group>"; };
+C9A38B7FDE6204A56FE584DA = {isa = PBXBuildFile; fileRef = A628D5B2CF3076B05313D790; };
 6183FC8A6F08C3142CA12345 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../Sources/DiffPrototype/main.swift"; sourceTree = "<group>"; };
 B47FDF587EADE4A203012CB3 = {isa = PBXBuildFile; fileRef = 6183FC8A6F08C3142CA12345; };
 2D9389255EDFB31B637AF386 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../Sources/DiffPrototype/DiffRowView.swift"; sourceTree = "<group>"; };
@@ -17,7 +19,7 @@ E05FCB614AB36FDEE72EE1F2 = {isa = PBXFileReference; lastKnownFileType = sourceco
 FDF98803FFAAFF1147692F15 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DiffPrototypeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 AF1F1D46639E68A0C4431C45 = {isa = PBXBuildFile; fileRef = 1F26FD886F861FA2A40B19D1; };
 BFE00B156DCFC34C4751A6E5 = {isa = PBXGroup; children = (0501268F392F183D22CC5FF6,1F26FD886F861FA2A40B19D1,FDF98803FFAAFF1147692F15); name = Products; sourceTree = "<group>"; };
-EDA6D6223944636B9C5B54AA = {isa = PBXGroup; children = (6183FC8A6F08C3142CA12345,2D9389255EDFB31B637AF386,578EA90BE24C0ECDF835BAC3,4D61C17A912053D8C7C04818,A0054E741F1E2ADD22DEF9DC,E05FCB614AB36FDEE72EE1F2,BFE00B156DCFC34C4751A6E5); sourceTree = "<group>"; };
+EDA6D6223944636B9C5B54AA = {isa = PBXGroup; children = (A628D5B2CF3076B05313D790,6183FC8A6F08C3142CA12345,2D9389255EDFB31B637AF386,578EA90BE24C0ECDF835BAC3,4D61C17A912053D8C7C04818,A0054E741F1E2ADD22DEF9DC,E05FCB614AB36FDEE72EE1F2,BFE00B156DCFC34C4751A6E5); sourceTree = "<group>"; };
 89E1FD6268CC0F221A2BE178 = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0; CODE_SIGNING_ALLOWED = YES; CODE_SIGN_IDENTITY = "-"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; CLANG_ENABLE_MODULES = YES; }; name = Debug; };
 E6DE6C99132752C914FEF632 = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0; CODE_SIGNING_ALLOWED = YES; CODE_SIGN_IDENTITY = "-"; SWIFT_OPTIMIZATION_LEVEL = "-O"; CLANG_ENABLE_MODULES = YES; }; name = Release; };
 BC7E287B75C6D3E574547D08 = {isa = XCConfigurationList; buildConfigurations = (89E1FD6268CC0F221A2BE178,E6DE6C99132752C914FEF632); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
@@ -30,7 +32,7 @@ EB0A6D3D91AC3C4B06DA920B = {isa = XCConfigurationList; buildConfigurations = (5A
 0F3D67935A4F199E058A017A = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0; CODE_SIGNING_ALLOWED = YES; CODE_SIGN_IDENTITY = "-"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; PRODUCT_BUNDLE_IDENTIFIER = dev.rusty.diff-prototype.uitests; PRODUCT_NAME = DiffPrototypeUITests; GENERATE_INFOPLIST_FILE = YES; TEST_TARGET_NAME = DiffPrototypeHarness; }; name = Debug; };
 20B70E15FDC36C625E57F658 = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0; CODE_SIGNING_ALLOWED = YES; CODE_SIGN_IDENTITY = "-"; SWIFT_OPTIMIZATION_LEVEL = "-O"; PRODUCT_BUNDLE_IDENTIFIER = dev.rusty.diff-prototype.uitests; PRODUCT_NAME = DiffPrototypeUITests; GENERATE_INFOPLIST_FILE = YES; TEST_TARGET_NAME = DiffPrototypeHarness; }; name = Release; };
 EC78861A60CD111A3D8A2421 = {isa = XCConfigurationList; buildConfigurations = (0F3D67935A4F199E058A017A,20B70E15FDC36C625E57F658); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
-905DB04043B7311D06A28734 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B47FDF587EADE4A203012CB3,E16D01DC9DF4FCA6249CDA8A,1E674E832DBE7C2AC747F713,1CF6ED7021F4F2E8CE642D8D); runOnlyForDeploymentPostprocessing = 0; };
+905DB04043B7311D06A28734 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (C9A38B7FDE6204A56FE584DA,B47FDF587EADE4A203012CB3,E16D01DC9DF4FCA6249CDA8A,1E674E832DBE7C2AC747F713,1CF6ED7021F4F2E8CE642D8D); runOnlyForDeploymentPostprocessing = 0; };
 4078E40435073C598BEDB353 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (1C25D3719CB905525B1D275B); runOnlyForDeploymentPostprocessing = 0; };
 7CB9C5DBBDFFE89694C24C30 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (80FAC02A0BD5812E2A00F339); runOnlyForDeploymentPostprocessing = 0; };
 128C3A5FCB266048836E78F6 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (AF1F1D46639E68A0C4431C45); runOnlyForDeploymentPostprocessing = 0; };

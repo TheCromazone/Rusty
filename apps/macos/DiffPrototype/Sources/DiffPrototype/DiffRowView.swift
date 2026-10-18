@@ -26,7 +26,7 @@ import DiffPrototypeCore
 
 /// One native drawing surface; it never creates one view per source row.
 @MainActor final class DiffRowView: NSView {
-    var document: DiffDocument
+    private(set) var document: DiffDocument
     let rowHeight: CGFloat = 22
     let gutter: CGFloat = 142
     private let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
