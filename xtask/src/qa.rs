@@ -128,6 +128,10 @@ fn plan(o: &Options, out: &Path) -> Vec<Step> {
             vec!["tty-inspect".into(), out.join("terminal").display().to_string(), "--all".into()],
         ),
     ];
+    // Clippy replaces the workspace wrapper; make its tracked arguments
+    // distinguish checkouts without changing compiler behavior.
+    let root = super::root().display().to_string();
+    steps[1].args.push(format!("--remap-path-prefix={root}={root}"));
     if o.changed {
         steps.retain(|s| matches!(s.name, "format" | "lint" | "tests"));
     }
