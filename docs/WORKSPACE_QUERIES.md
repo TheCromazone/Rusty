@@ -10,7 +10,7 @@ Every search, glob, listing, and outline reports two independent facts:
 
 - `scan_complete`: whether the requested scope was examined without known
   errors or enumeration/read limits. This does not certify an atomic snapshot.
-- `output_truncated`: whether computed results were omitted from the display.
+- `output_truncated`: whether results were omitted or an engine limit may have omitted them from the display.
   An entirely scanned workspace can have a truncated display. Unread files
   make an outline incomplete even if its displayed text fits.
 
@@ -21,15 +21,30 @@ observed by that scan. No snapshot identity or persisted freshness is claimed.
 
 ## Matching and visibility
 
-Search invokes ripgrep on every request with smart case, stable path order,
-line numbers, and the existing optional glob/context arguments (context is
-clamped to ten lines). It retains ripgrep's default hidden, binary, and ignore
-rules, including explicit glob overrides. Descendant symlinks are not followed
-by search; explicit file paths retain ripgrep's usual handling. It disables ambient ripgrep config
-so a user's config cannot silently change the tool's flags. Results now include
-filenames even when the scope is a single file. There is no per-file match or
-column limit; the first 28,000 output bytes are retained while both output and
-diagnostics are drained to EOF. All subprocess diagnostics survive partial
+Search invokes ripgrep on every request with smart case, line numbers, and
+optional glob/context arguments (context is clamped to ten lines). It retains
+ripgrep's default hidden, binary, and ignore rules, including explicit glob
+overrides. Descendant symlinks are not followed. Ambient config is disabled.
+
+Ripgrep keeps its parallel traversal: no `--sort path` is requested. Only the
+retained prefix is sorted by path and numeric line number. When the byte cap is
+reached, parallel arrival order can change which records fit; the truncated
+subset is not promised to be repeatable. Context separators are omitted, while
+matching and context line delimiters are preserved. NUL-delimited input paths
+keep colons/newlines in filenames from corrupting per-file limit accounting.
+
+Engine bounds are restored: `--max-count 30 --max-columns 300`. Reaching thirty
+matching lines in any observed file conservatively sets `match_limit_possible`,
+`scan_complete=false`, and `output_truncated=true`, even if a file happens to
+contain exactly thirty matches. Column omission markers set
+`column_limit_possible` and `output_truncated=true`; column clipping alone does
+not make the scan incomplete. A literal omission marker can conservatively
+trigger this flag too. If the bounded capture overflows or ends mid-record,
+cap accounting is incomplete, so scan completeness is not claimed. Empty
+complete results still require an error-free, uncapped no-match observation.
+
+The first 28,000 raw output bytes are retained while both pipes are drained;
+partial records are omitted from presentation. All subprocess diagnostics survive partial
 success, up to a separate 2,000-byte prefix with an omission marker. Lossy UTF-8
 conversion can temporarily expand invalid raw bytes up to threefold. The retained
 rendered prefixes are capped again at the same byte limits on a UTF-8 boundary,
@@ -89,8 +104,10 @@ cargo test --test workspace_query benchmark_query_reference_and_legacy -- --igno
 cargo xtask qa
 ```
 
-The fixtures compare exact search output with an independent unbounded direct
-ripgrep invocation. They exercise smart case, regex alternatives, glob/context
+Below all limits, fixtures compare canonical match/context records with an
+independent unbounded direct ripgrep invocation; engine traversal order is not
+part of that comparison. At limits, fixtures check bounded output and explicit
+incompleteness/omission metadata rather than unbounded-output equivalence. They exercise smart case, regex alternatives, glob/context
 combinations, ignore/hidden rules, more than thirty matches in one file, long
 lines, empty results followed by additions or edits, same-length overwrites,
 renames, deletion, ignore-file edits, failed shell commands that write, and
@@ -119,7 +136,7 @@ after an empty result. Repeating a cached retrieval must never create fresh
 acceptance evidence. Any future cache must preserve these fixtures and add
 explicit hit/miss, validation, eviction and fallback receipts.
 
-### Initial same-machine receipt (before subprocess cleanup)
+### Historical same-machine receipt (before subprocess cleanup and bounded parallel presentation)
 
 On October 17, 2026, the exact query source passed the standalone module and
 reference fixtures on a 10-core, 16 GiB macOS machine while other builds were

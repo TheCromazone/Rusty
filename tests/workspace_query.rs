@@ -26,7 +26,15 @@ impl Fixture {
         let result = search(pattern, self.0.to_str().unwrap(), glob, context).unwrap();
         assert_eq!(result.engine, "rg", "correctness fixtures require installed ripgrep");
         let mut reference = Command::new("rg");
-        reference.args(["--no-config", "--sort", "path", "-nH", "--no-heading", "--color", "never", "--smart-case"]);
+        reference.args([
+            "--no-config",
+            "--no-context-separator",
+            "-nH",
+            "--no-heading",
+            "--color",
+            "never",
+            "--smart-case",
+        ]);
         reference.args(["-C", &context.min(10).to_string()]);
         if let Some(g) = glob {
             reference.args(["-g", g]);
@@ -34,11 +42,17 @@ impl Fixture {
         let raw = reference.args(["-e", pattern, "--"]).arg(&self.0).output().unwrap();
         assert_eq!(result.exit_code, raw.status.code());
         if !result.output.truncated {
-            assert_eq!(result.output.text, String::from_utf8_lossy(&raw.stdout));
-        } else {
-            assert!(String::from_utf8_lossy(&raw.stdout).starts_with(result.output.text.trim_end_matches('\u{fffd}')));
+            let canonical = |text: &str| {
+                let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+                lines.sort_unstable();
+                lines
+            };
+            assert_eq!(canonical(&result.output.text), canonical(&String::from_utf8_lossy(&raw.stdout)));
         }
-        assert_eq!(result.scan_complete, matches!(raw.status.code(), Some(0 | 1)) && raw.stderr.is_empty());
+        assert_eq!(
+            result.scan_complete,
+            matches!(raw.status.code(), Some(0 | 1)) && raw.stderr.is_empty() && !result.match_limit_possible
+        );
         result
     }
 }
@@ -143,20 +157,63 @@ fn output_truncation_is_distinct_from_incomplete_scans() {
     let f = Fixture::new();
     f.put("a.txt", &"needle\n".repeat(2_000));
     let full = f.query("needle", None, 0);
-    assert!(full.scan_complete && full.output.truncated);
-    assert!(full.render().contains("scan_complete=true output_truncated=true"));
-    // Regression: the old max-count=30 hid all later matches in each file.
+    assert!(!full.scan_complete && full.output.truncated && full.match_limit_possible);
+    assert!(full.render().contains("scan_complete=false output_truncated=true"));
+    // Keep the engine's cheap per-file limit and disclose possible omissions.
     f.put("a.txt", &"needle\n".repeat(40));
     let forty = f.query("needle", None, 0);
-    assert_eq!(forty.output.text.lines().count(), 40);
-    assert!(!forty.output.truncated);
+    assert_eq!(forty.output.text.lines().count(), 30);
+    assert!(forty.output.truncated && forty.match_limit_possible && !forty.scan_complete);
+    f.put("a.txt", &"needle\n".repeat(29));
+    let below = f.query("needle", None, 0);
+    assert!(below.scan_complete && !below.output.truncated);
+    f.put("a.txt", &"needle\n".repeat(30));
+    let boundary = f.query("needle", None, 0);
+    assert!(boundary.match_limit_possible, "exactly 30 is conservatively incomplete");
     f.put("a.txt", &format!("{}needle\n", "x".repeat(400)));
-    assert!(f.query("needle", None, 0).output.text.contains(&"x".repeat(400)));
+    let wide = f.query("needle", None, 0);
+    assert!(wide.scan_complete && wide.output.truncated && wide.column_limit_possible);
+    assert!(!wide.output.text.contains(&"x".repeat(400)));
+    assert!(wide.output.text.contains("[Omitted "));
     let invalid = f.query("[", None, 0);
     assert!(!invalid.scan_complete && !invalid.diagnostics.text.is_empty());
     let missing = search("needle", f.0.join("missing").to_str().unwrap(), None, 0).unwrap();
     assert!(!missing.scan_complete && missing.render().contains("search incomplete"));
     assert!(missing.render().contains("missing"));
+}
+
+#[test]
+fn dense_and_wide_files_do_not_expand_engine_output() {
+    let f = Fixture::new();
+    f.put("dense.txt", &"needle\n".repeat(100_000));
+    let dense = f.query("needle", None, 0);
+    assert_eq!(dense.output.text.lines().count(), 30);
+    assert!(dense.match_limit_possible && dense.output.truncated && !dense.scan_complete);
+    fs::remove_file(f.0.join("dense.txt")).unwrap();
+    f.put("wide.txt", &format!("{}needle\n", "x".repeat(1_000_000)));
+    let wide = f.query("needle", None, 0);
+    assert!(wide.scan_complete && wide.column_limit_possible && wide.output.truncated);
+    assert!(wide.output.text.len() < 1_000);
+}
+
+#[test]
+fn bounded_parallel_output_is_sorted_without_claiming_a_stable_subset() {
+    let f = Fixture::new();
+    for i in (0..80).rev() {
+        f.put(&format!("src/{i:03}.txt"), &"needle\n".repeat(20));
+    }
+    let result = f.query("needle", None, 0);
+    assert!(result.output.truncated && result.match_limit_possible && !result.scan_complete);
+    assert!(result.output.text.len() <= rusty::workspace_query::OUTPUT_BYTES);
+    let mut previous = None;
+    for line in result.output.text.lines() {
+        let (file, tail) = line.split_once(':').unwrap();
+        let number = tail.split_once(':').unwrap().0.parse::<u64>().unwrap();
+        if let Some(prior) = previous {
+            assert!(prior <= (file, number));
+        }
+        previous = Some((file, number));
+    }
 }
 
 #[test]

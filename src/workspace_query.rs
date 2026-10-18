@@ -1,4 +1,4 @@
-//! Live, deterministic retrieval. No query results or filesystem metadata are cached.
+//! Live retrieval with bounded, sorted presentation. No query results or filesystem metadata are cached.
 //! Completeness is relative to the reported visibility policy, never an atomic snapshot.
 
 use anyhow::{Context, Result};
@@ -13,6 +13,8 @@ pub const SKIP_DIRS: &[&str] =
     &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
 pub const OUTPUT_BYTES: usize = 28_000;
 const DIAGNOSTIC_BYTES: usize = 2_000;
+const MATCHES_PER_FILE: usize = 30;
+const MAX_COLUMNS: usize = 300;
 const ENTRY_LIMIT: usize = 20_000;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -199,6 +201,8 @@ fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, O
 pub struct SearchResult {
     pub engine: &'static str,
     pub scan_complete: bool,
+    pub match_limit_possible: bool,
+    pub column_limit_possible: bool,
     pub output: Capture,
     pub diagnostics: Capture,
     pub exit_code: Option<i32>,
@@ -212,7 +216,7 @@ impl SearchResult {
             self.engine, self.scan_complete, self.output.truncated, self.exit_code, self.termination
         );
         if self.engine == "rg" {
-            out.push_str("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; not an atomic snapshot]\n");
+            let _ = writeln!(out, "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]", self.match_limit_possible, self.column_limit_possible);
         } else {
             out.push_str("[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n");
         }
@@ -260,6 +264,8 @@ fn search_with(
         return Ok(SearchResult {
             engine: "rg",
             scan_complete: false,
+            match_limit_possible: false,
+            column_limit_possible: false,
             output: BoundedPipe::new(0).finish(),
             diagnostics: BoundedPipe::new(0).finish(),
             exit_code: None,
@@ -276,8 +282,12 @@ fn search_with(
         "--color",
         "never",
         "--smart-case",
-        "--sort",
-        "path",
+        "--null",
+        "--no-context-separator",
+        "--max-count",
+        "30",
+        "--max-columns",
+        "300",
         "-C",
         &context,
     ]);
@@ -303,9 +313,69 @@ fn search_with(
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
     let (output, diagnostics, exit_code, termination) = collect_query_cancellable(child, QUERY_TIMEOUT, cancelled)?;
-    let scan_complete =
-        engine == "rg" && termination == "exited" && matches!(exit_code, Some(0 | 1)) && diagnostics.text.is_empty();
-    Ok(SearchResult { engine, scan_complete, output, diagnostics, exit_code, termination })
+    let (output, match_limit_possible, column_limit_possible) =
+        if engine == "rg" { present_rg(output) } else { (output, false, false) };
+    let scan_complete = engine == "rg"
+        && termination == "exited"
+        && matches!(exit_code, Some(0 | 1))
+        && diagnostics.text.is_empty()
+        && !match_limit_possible;
+    Ok(SearchResult {
+        engine,
+        scan_complete,
+        match_limit_possible,
+        column_limit_possible,
+        output,
+        diagnostics,
+        exit_code,
+        termination,
+    })
+}
+
+/// Sort only the captured prefix. NUL-delimited paths keep colons/newlines in
+/// filenames from corrupting per-file counts. The engine remains free to scan
+/// in parallel, so an overflowing prefix is deliberately not a stable subset.
+fn present_rg(raw: Capture) -> (Capture, bool, bool) {
+    let mut records = Vec::new();
+    let mut counts = std::collections::BTreeMap::new();
+    let mut match_limit_possible = raw.truncated;
+    let mut column_limit_possible = false;
+    let mut rest = raw.text.as_str();
+    while !rest.is_empty() {
+        let Some((path, body)) = rest.split_once('\0') else {
+            match_limit_possible = true;
+            break;
+        };
+        let Some((line, tail)) = body.split_once('\n') else {
+            match_limit_possible = true;
+            break;
+        };
+        let Some(separator) = line.find([':', '-']) else {
+            match_limit_possible = true;
+            break;
+        };
+        let Ok(number) = line[..separator].parse::<u64>() else {
+            match_limit_possible = true;
+            break;
+        };
+        let matching = line.as_bytes()[separator] == b':';
+        if matching {
+            let count = counts.entry(path).or_insert(0usize);
+            *count += 1;
+            match_limit_possible |= *count >= MATCHES_PER_FILE;
+        }
+        // A literal marker in source can conservatively trigger this too.
+        column_limit_possible |= line[separator + 1..].starts_with("[Omitted ");
+        records.push((path, number, matching, line));
+        rest = tail;
+    }
+    records.sort_unstable_by_key(|&(path, number, matching, line)| (path, number, matching, line));
+    let mut text = String::with_capacity(raw.text.len());
+    for (path, _, matching, line) in records {
+        let _ = writeln!(text, "{path}{}{line}", if matching { ':' } else { '-' });
+    }
+    let truncated = raw.truncated || match_limit_possible || column_limit_possible;
+    (Capture { text, truncated }, match_limit_possible, column_limit_possible)
 }
 
 #[derive(Default, Debug)]
@@ -422,6 +492,8 @@ mod tests {
         let result = SearchResult {
             engine: "rg",
             scan_complete: true,
+            match_limit_possible: false,
+            column_limit_possible: false,
             output,
             diagnostics: Capture { text: String::new(), truncated: false },
             exit_code: Some(0),
@@ -429,6 +501,46 @@ mod tests {
         };
         let rendered = result.render();
         assert!(rendered.contains("scan_complete=true output_truncated=true"));
+    }
+
+    #[test]
+    fn presentation_frames_paths_and_sorts_numeric_lines_with_context() {
+        let raw = Capture {
+            text: "z:part\nname\0".to_owned() + "10:needle\n" + "a.rs\0" + "11-context\n" + "a.rs\0" + "2:needle\n",
+            truncated: false,
+        };
+        let (shown, matches, columns) = present_rg(raw);
+        assert_eq!(shown.text, "a.rs:2:needle\na.rs-11-context\nz:part\nname:10:needle\n");
+        assert!(!shown.truncated && !matches && !columns);
+        let (partial, limited, _) = present_rg(Capture { text: "partial-path".into(), truncated: false });
+        assert!(partial.truncated && limited && partial.text.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_keeps_parallel_traversal_and_engine_output_bounds() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rusty-query-argv-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("rg-fixture");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case " $* " in *" --sort "*) exit 64;; esac
+case " $* " in *" --max-count 30 "*) :;; *) exit 65;; esac
+case " $* " in *" --max-columns 300 "*) :;; *) exit 66;; esac
+case " $* " in *" --null "*) :;; *) exit 67;; esac
+printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = search_with(script.to_str().unwrap(), "needle", ".", None, 0, &|| false);
+        fs::remove_dir_all(dir).unwrap();
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.scan_complete && !result.output.truncated);
+        assert_eq!(result.output.text, "a.rs:2:needle\nz.rs:10:needle\n");
     }
 
     #[test]
@@ -455,6 +567,8 @@ mod tests {
         let result = SearchResult {
             engine: "rg",
             scan_complete: false,
+            match_limit_possible: false,
+            column_limit_possible: false,
             output: Capture { text: "good.rs:1:needle".into(), truncated: false },
             diagnostics: Capture { text: "private.rs: Permission denied".into(), truncated: true },
             exit_code: Some(2),
@@ -495,6 +609,8 @@ mod tests {
         let result = SearchResult {
             engine: "rg",
             scan_complete: false,
+            match_limit_possible: false,
+            column_limit_possible: false,
             output: out,
             diagnostics: err,
             exit_code: None,
