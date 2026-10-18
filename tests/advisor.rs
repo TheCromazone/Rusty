@@ -379,3 +379,41 @@ fn failed_database_initialization_never_publishes_ready_socket() {
     assert!(!root.join("memory/advisor.sock").exists(), "failed initialization published a readiness socket");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn daemon_does_not_retain_unrelated_inherited_pipe_writers() {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    for fd in fds {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+    }
+    let root =
+        PathBuf::from("/tmp").join(format!("rm-fd-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&root).unwrap();
+    let fd = writer.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rusty-memoryd"));
+    command.arg("--home").arg(&root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+    unsafe {
+        command.pre_exec(move || {
+            // Model an unrelated launcher pipe without close-on-exec.
+            if libc::fcntl(fd, libc::F_DUPFD, 200) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let service = Service { root, child: command.spawn().unwrap() };
+    drop(writer);
+    service.ready();
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+    let mut byte = [0];
+    assert_eq!(reader.read(&mut byte).unwrap(), 0, "daemon retained a foreign writer after startup");
+    assert!(!service.call("status", "fd-test", 0, Value::Null).error);
+}
