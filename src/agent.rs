@@ -319,6 +319,7 @@ pub struct Agent {
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
+    past_sessions: crate::archive::Archive,
     /// Where the saved session starts in `archived`: what `/clear` or
     /// `/resume` archived belongs to the session before it.
     session_from: usize,
@@ -429,6 +430,7 @@ impl Agent {
             side_meta: None,
             side_receipts: Default::default(),
             archived: Vec::new(),
+            past_sessions: Default::default(),
             session_from: 0,
             trajectory_path: None,
             trajectory_saved: None,
@@ -596,18 +598,26 @@ impl Agent {
         Ok(())
     }
 
-    pub fn clear(&mut self) {
+    fn archive_finished_session(&mut self) -> Result<()> {
+        self.past_sessions.append(&self.archived, &self.history)?;
+        self.archived = Vec::new();
+        self.history = Vec::new();
+        self.session_from = 0;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.archive_finished_session()?;
         self.side_receipts.clear();
         crate::side::shutdown(&self.side_book);
         self.side_book = Default::default();
         self.aside_memory = Default::default();
-        self.archived.append(&mut self.history);
-        self.session_from = self.archived.len();
         self.plan.clear();
         self.goal = None;
         self.verification_records.clear();
         self.last_prompt_tokens = 0;
         self.meter.forget_last();
+        Ok(())
     }
 
     // ---------------------------------------------------------------- prompt
@@ -2687,8 +2697,8 @@ impl Agent {
             tokens_after: self.meter.fill(&self.history, fixed),
             calls_since_last: self.tool_calls_run - self.compactions.last().map_or(0, |c| c.calls_at),
             calls_at: self.tool_calls_run,
-            boundary: self.archived.len(),
-            resumes_at: self.archived.len() + self.history.len(),
+            boundary: self.past_sessions.len() + self.archived.len(),
+            resumes_at: self.past_sessions.len() + self.archived.len() + self.history.len(),
             reverted,
             model: writer,
         });
@@ -2718,11 +2728,12 @@ impl Agent {
 
     /// The whole run for benchmark harnesses and reviewers: every message in
     /// order, including the ones compaction summarised away.
-    pub fn trajectory(&self) -> Value {
+    pub fn trajectory(&self) -> Result<Value> {
         let t = &self.totals;
-        let mut messages = self.archived.clone();
+        let mut messages = self.past_sessions.messages()?;
+        messages.extend(self.archived.iter().cloned());
         messages.extend(self.history.iter().cloned());
-        json!({
+        Ok(json!({
             "agent": "rusty",
             "version": env!("CARGO_PKG_VERSION"),
             "model": self.model,
@@ -2735,7 +2746,7 @@ impl Agent {
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),
             "messages": messages,
-            "archived_messages": self.archived.len(),
+            "archived_messages": self.past_sessions.len() + self.archived.len(),
             "goal": self.goal,
             "goal_end": self.goal_end,
             "goal_outcome": self.goal_outcome(),
@@ -2745,7 +2756,7 @@ impl Agent {
             "activities": self.activities.records(),
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
-        })
+        }))
     }
 
     pub fn write_trajectory(&self) -> Result<()> {
@@ -2755,7 +2766,7 @@ impl Agent {
         }
         // Write beside it and rename, so a run killed mid-write keeps the last good copy.
         let tmp = path.with_extension("partial");
-        rusty::privacy::write_json(&tmp, self.trajectory())?;
+        rusty::privacy::write_json(&tmp, self.trajectory()?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -2857,10 +2868,9 @@ impl Agent {
             .map_err(|e| anyhow::anyhow!("can't read session file {}: {e}", path.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("session file {} is damaged and can't be resumed ({e})", path.display()))?;
+        self.archive_finished_session()?;
         self.side_meta = serde_json::from_value(v["side"].clone()).ok();
         self.side_receipts = serde_json::from_value(v["side_receipts"].clone()).unwrap_or_default();
-        self.archived.append(&mut self.history);
-        self.session_from = self.archived.len();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
@@ -3010,6 +3020,28 @@ mod stable_prompt_tests {
     }
 
     #[test]
+    fn clearing_sessions_releases_messages_without_losing_trajectory() {
+        let mut agent = agent();
+        for n in 0..20 {
+            agent.history.push(json!({"role":"user","content":format!("session {n}: {}", "x".repeat(64 * 1024))}));
+            agent.clear().unwrap();
+            assert!(agent.history.is_empty() && agent.archived.is_empty());
+            assert_eq!(agent.history.capacity(), 0);
+            assert_eq!(agent.archived.capacity(), 0);
+            assert_eq!(agent.session_from, 0);
+        }
+        agent.history.push(json!({"role":"user","content":"current"}));
+        let trajectory = agent.trajectory().unwrap();
+        let messages = trajectory["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 21);
+        assert_eq!(trajectory["archived_messages"], 20);
+        for (n, message) in messages.iter().take(20).enumerate() {
+            assert!(message["content"].as_str().unwrap().starts_with(&format!("session {n}:")));
+        }
+        assert_eq!(messages[20]["content"], "current");
+    }
+
+    #[test]
     fn plan_and_running_commands_are_ephemeral_and_included_in_estimate() {
         let mut agent = agent();
         let system = agent.system_prompt();
@@ -3030,7 +3062,7 @@ mod stable_prompt_tests {
         assert!(activity_estimate > plan_estimate, "a running activity must be counted in the fixed context estimate");
         assert_eq!(agent.system_prompt(), system, "changing activities must not change the system prompt");
 
-        let persisted = agent.trajectory()["messages"].to_string();
+        let persisted = agent.trajectory().unwrap()["messages"].to_string();
         assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
         let aside = agent.aside_context();
         let aside_state = aside.last().unwrap()["content"].as_str().unwrap();
