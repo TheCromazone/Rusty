@@ -45,3 +45,6 @@
   text passes such as redaction are single-pass with no allocation per token;
   streaming work per delta is proportional to the delta, never to the answer
   so far.
+
+- Keep one Cargo `target/` directory per worktree.
+- Run Cargo directly; do not share `CARGO_TARGET_DIR` or a shared-target wrapper.
