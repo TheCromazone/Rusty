@@ -308,6 +308,7 @@ checks; a goal works toward a finish line. The loop stops with the process.
 | Feature | What happens |
 |---|---|
 | `search`, `glob`, `outline` | Find a file or definition before reading lots of code. |
+| `locate` | Find code from a description when you don't know its names: files ranked by the words they share with it, with their best lines. [How it was measured](docs/SEARCH.md) |
 | `read_file` | Read the relevant part of a file. |
 | `write_file`, `edit_file` | Create a file or replace an exact, unambiguous string. Supported syntax checks can refuse a broken edit. |
 | `bash` | Run a command under the permission policy, with bounded output and a timeout. |
@@ -729,7 +730,8 @@ src/
   agent.rs        the loop: model ⇄ tools, goal, loop, subagents and swarms, compaction
   display.rs      grouped tool lines, status line, recaps, views
   llm.rs          streaming client on a background thread, tool-call assembly, key rotation
-  tools.rs        read, write, edit, list, search, glob, outline, bash
+  tools.rs        read, write, edit, list, search, locate, glob, outline, bash
+  locate.rs       ranked code search: BM25 over chunks and files, rebuilt on every call
   permissions.rs  the command classifier
   advisor.rs      memory levels and the advisor: lessons, confidence, file anchors, credit (rusty-memoryd)
   recall.rs       identifier-aware tokenizer and BM25 inverted index

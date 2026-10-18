@@ -314,6 +314,7 @@ that a deployment is safe. [Infrastructure details](INFRA.md)
 | Tool or feature | Simple explanation |
 |---|---|
 | `search`, `glob`, `outline` | Find the right file or definition before reading lots of code. |
+| `locate` | Find code from a description when you don't know what it is called. [Finding code](SEARCH.md) |
 | `read_file` | Read the part of a file needed for the task. |
 | `write_file`, `edit_file` | Create a file or replace an exact, unambiguous piece of text. |
 | `bash` | Run a shell command such as a build or test, subject to permissions. |

@@ -59,7 +59,9 @@ answering the question.
 1. **Locate before you read.** `search` (ripgrep, smart case, bounded display,
    optional context lines and globs) answers "where", `glob` answers "which
    files", and `outline` answers "what's in here" with signatures and line
-   numbers. Only then `read_file`, for a range.
+   numbers. `locate` answers "where is the code that does this" when the
+   names are unknown, ranking files by the words they share with a
+   description ([SEARCH.md](SEARCH.md)). Only then `read_file`, for a range.
 2. **Exact edits.** `edit_file` replaces one unique string. It fails loudly
    when the match is ambiguous and never guesses.
 3. **The shell for everything else.** `bash` runs builds, tests, git and

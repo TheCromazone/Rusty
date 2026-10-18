@@ -91,6 +91,15 @@ a pattern with `/` matches relative paths. No approximate candidate filter is
 used. Descendant directory symlinks are reported as skipped rather than
 followed into cycles. Regular-file symlinks are read normally.
 
+Locate lists the files a search would read with `rg --files` (ripgrep's
+hidden and ignore rules, the same deadline and process ownership), keeping at
+most 20,000 paths; a longer listing is reported incomplete. It then reads and
+indexes every listed file for that call only and drops the index, so it has
+no cache either. Files it cannot read make its scan incomplete; secrets, lock
+files, binaries, minified text and files over 1 MB are left out by policy.
+Without ripgrep it falls back to the glob/outline enumeration and reports
+that as a skipped scope. [SEARCH.md](SEARCH.md) has its ranking and costs.
+
 Enumeration is bounded to 20,000 visited entries and 128 directory levels.
 The global budget is charged during directory enumeration, bounding retained
 pending entries across nested traversal as well as returned paths.
