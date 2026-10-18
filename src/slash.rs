@@ -161,6 +161,13 @@ pub const COMMANDS: &[Command] = &[
         ],
     ),
     cmd("/models", "", "list models from every provider", "setup"),
+    cmd(
+        "/integrations",
+        "[status|setup|configure|check|prs]",
+        "GitHub, GitLab and Bitbucket setup and repository access",
+        "setup",
+    ),
+    cmd("/git", "[status|diff|log]", "native Git views; writes use permission-checked tools", "work"),
     cmd("/doctor", "", "which providers are set up and answering", "setup"),
     with(
         "/view",

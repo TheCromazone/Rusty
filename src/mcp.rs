@@ -502,6 +502,96 @@ fn verb_class(tool: &str) -> Class {
     Class::Risky(format!("MCP tool {tool} may change something"))
 }
 
+/// Manage the existing MCP manifest without starting anything on add/list.
+/// Preserve unknown fields and existing env values; never echo credentials.
+pub fn manage(cwd: &Path, policy: &crate::permissions::Policy, args: &[String]) -> Result<String> {
+    use std::io::Write;
+    let path =
+        std::env::var_os("RUSTY_MCP_CONFIG").map(std::path::PathBuf::from).unwrap_or_else(|| cwd.join(".mcp.json"));
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    if action == "help" {
+        return Ok("MCP: /integrations mcp list | add NAME COMMAND [ARGS...] | remove NAME | check. Add saves a required stdio server; it starts only on check or the next session. Use the CLI form for arguments containing spaces. Existing .mcp.json / RUSTY_MCP_CONFIG remains the source of truth. Configure authentication in the server's own native flow or environment; do not put tokens in command arguments. Direct HTTP transport is not supported; an explicitly configured stdio bridge can supply it.".into());
+    }
+    if action == "check" {
+        anyhow::ensure!(args.len() == 1, "usage: /integrations mcp check");
+        let (_, reports) = Mcp::connect(cwd)?;
+        let all_connected = reports.iter().all(|r| r.status == "ok" && r.missing.is_empty());
+        let output =
+            rusty::privacy::redact(&serde_json::json!({"all_connected":all_connected,"servers":reports}).to_string()).0;
+        anyhow::ensure!(all_connected, "MCP health check failed: {output}");
+        return Ok(output);
+    }
+    let mut value: Value = if path.exists() {
+        serde_json::from_slice(&std::fs::read(&path)?).context("invalid MCP configuration; left unchanged")?
+    } else {
+        serde_json::json!({"mcpServers":{}})
+    };
+    anyhow::ensure!(value.is_object(), "MCP configuration must be an object");
+    if value.get("mcpServers").is_none() {
+        value["mcpServers"] = serde_json::json!({});
+    }
+    let servers = value["mcpServers"].as_object_mut().context("mcpServers must be an object")?;
+    if action == "list" {
+        anyhow::ensure!(args.len() <= 1, "usage: /integrations mcp list");
+        let rows: Vec<Value> = servers
+            .iter()
+            .map(|(name, cfg)| {
+                serde_json::json!({"name":name,
+            "transport": if cfg.get("url").is_some() { "unsupported HTTP" } else { "stdio" },
+            "required":cfg["required"].as_bool().unwrap_or(false),
+            "required_tools":cfg["requiredTools"].as_array().map(Vec::len).unwrap_or(0),
+            "authentication":"not checked"})
+            })
+            .collect();
+        return Ok(serde_json::json!({"servers":rows}).to_string());
+    }
+    anyhow::ensure!(matches!(action, "add" | "remove"), "unknown MCP action; use list, add, remove, check or help");
+    let name = args.get(1).context("MCP server name required")?;
+    anyhow::ensure!(
+        !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+        "server name must contain only letters, digits, _ or -"
+    );
+    match action {
+        "add" => {
+            anyhow::ensure!(args.len() >= 3, "usage: /integrations mcp add NAME COMMAND [ARGS...]");
+            anyhow::ensure!(
+                !servers.contains_key(name),
+                "MCP server already exists; remove it explicitly before replacing it"
+            );
+            let start = if args.get(2).is_some_and(|a| a == "--") { 3 } else { 2 };
+            let command = args.get(start).context("MCP server command required")?;
+            anyhow::ensure!(!command.trim().is_empty(), "MCP server command required");
+            servers.insert(name.clone(), serde_json::json!({"command":command,"args":args[start+1..],"required":true}));
+        }
+        _ => {
+            anyhow::ensure!(args.len() == 2, "usage: /integrations mcp remove NAME");
+            anyhow::ensure!(servers.remove(name).is_some(), "MCP server not configured");
+        }
+    }
+    let verdict = policy.decide("write_file", &serde_json::json!({"path":path}), cwd);
+    anyhow::ensure!(
+        matches!(verdict, crate::permissions::Verdict::Allow),
+        "MCP config change refused by permissions: {verdict:?}"
+    );
+    if path.exists() {
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&path)?.file_type().is_file(),
+            "MCP config must be a regular file, not a symlink"
+        );
+    }
+    let parent = path.parent().context("MCP config directory missing")?;
+    std::fs::create_dir_all(parent)?;
+    let pending = path.with_extension("json.pending");
+    let mut file = rusty::privacy::private_file(&pending, false)?;
+    // Unlike transcript persistence, a config edit must not scrub an existing
+    // server's secret value into a nonfunctional placeholder.
+    serde_json::to_writer_pretty(&mut file, &value)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    std::fs::rename(&pending, &path)?;
+    Ok(format!("MCP server {name} {action} saved; existing sessions keep their current connections"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

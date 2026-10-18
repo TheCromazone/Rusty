@@ -13,6 +13,7 @@ mod execution;
 mod footer;
 mod inbox;
 mod infra;
+mod integrations;
 mod llm;
 mod markdown;
 mod mcp;
@@ -47,6 +48,10 @@ use permissions::{Mode, Policy, Verdict};
 #[derive(Parser)]
 #[command(name = "rusty", version)]
 struct Cli {
+    /// Git/forge setup and status without a model key; see docs/INTEGRATIONS.md
+    #[arg(long)]
+    integrations: bool,
+
     /// Tool location: local or daytona (reasoning and memory stay in this process)
     #[arg(long, env = "RUSTY_TOOLS")]
     tools: Option<String>,
@@ -216,6 +221,17 @@ fn run() -> Result<i32> {
 
     let mut settings = Settings::load();
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
+    if cli.integrations {
+        signal::install();
+        let project = project_dir(&PathBuf::from(backend.identity(&cwd)));
+        let mode = Mode::parse(&cli.permissions).ok_or_else(|| anyhow!("invalid permissions mode"))?;
+        let policy = Policy::load(project.join("permissions.json"), mode);
+        println!(
+            "{}",
+            integrations::command(&backend, &policy, &cwd, &project.join("integrations.json"), &cli.prompt)?
+        );
+        return Ok(0);
+    }
     if let Some(query) = &cli.sessions {
         // Unquoted words all belong to the search: `rusty --sessions fix parser`.
         let query = std::iter::once(query).chain(&cli.prompt).map(String::as_str).collect::<Vec<_>>().join(" ");
@@ -550,6 +566,7 @@ fn capabilities() -> serde_json::Value {
         "tools": ["local", "daytona"],
         "toolset": ["full", "shell"],
         "verify": {"supported": true, "timeout_secs": [1, 600]},
+        "integrations": {"flag": true, "hosts": ["github", "gitlab", "bitbucket-cloud"], "git_views": ["status", "diff", "log"], "mcp_management": ["list", "add", "remove", "check"]},
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
@@ -1030,6 +1047,18 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             settings.tips = agent.tips;
             settings.save();
             println!("  tips {}", on_off(agent.tips));
+        }
+        "/integrations" | "/git" => {
+            let args: Vec<String> = if cmd == "/git" {
+                std::iter::once("git").chain(rest.split_whitespace()).map(String::from).collect()
+            } else {
+                rest.split_whitespace().map(String::from).collect()
+            };
+            let project = project_dir(&PathBuf::from(agent.backend.identity(cwd)));
+            println!(
+                "{}",
+                integrations::command(&agent.backend, &agent.policy, cwd, &project.join("integrations.json"), &args)?
+            );
         }
         "/target" => {
             agent.infra.target = if agent.backend.name() == "local" {

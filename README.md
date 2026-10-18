@@ -814,3 +814,8 @@ The inbox survives restart. Delivery receipts are saved with the parent before
 queued notes are removed, so replay does not duplicate a summary. Repeating
 `/send main` without further side discussion does not spend another model call.
 Sending findings does not apply a patch, merge a branch or close the main goal.
+
+GitHub, GitLab and Bitbucket setup lives in `/integrations` (or keyless
+`rusty --integrations`). `/git` provides native repository views. See
+[repository integrations](docs/INTEGRATIONS.md) for authentication, enterprise
+hosts, fork targeting and evidence boundaries.
