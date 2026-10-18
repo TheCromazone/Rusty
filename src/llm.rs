@@ -966,6 +966,10 @@ mod tests {
                     Err(e) => panic!("{e}"),
                 }
             };
+            // On macOS the accepted socket inherits the listener's non-blocking
+            // flag, so a read before the request lands fails with WouldBlock.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             loop {
