@@ -267,7 +267,7 @@ impl Default for Settings {
         Self {
             tools: "local".into(),
             theme: "rust".into(),
-            font: "rust".into(),
+            font: "compact".into(),
             view: "default".into(),
             tips: true,
             agents: AgentsConfig::default(),

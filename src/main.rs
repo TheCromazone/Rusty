@@ -640,6 +640,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         // and sit there unsent, joins the queue first.
         signal::poll_keys();
         // Queued and freshly typed input go through the same slash router.
+        ui::input_rule();
         let mut input = if let Some(queued) = signal::take_queued() {
             println!("{} {}", ui::user("›"), ui::user(&queued));
             println!("{}", ui::dim("  (typed while rusty was working)"));

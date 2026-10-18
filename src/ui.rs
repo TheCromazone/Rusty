@@ -12,6 +12,9 @@ type Rgb = (u8, u8, u8);
 pub struct Theme {
     pub name: &'static str,
     pub primary: Rgb,
+    pub input: Rgb,
+    pub success: Rgb,
+    pub error: Rgb,
     pub accent: Rgb,
     pub info: Rgb,
     pub warn: Rgb,
@@ -24,16 +27,22 @@ pub struct Theme {
 pub const THEMES: &[Theme] = &[
     Theme {
         name: "rust",
-        primary: (236, 122, 52),
-        accent: (222, 64, 42),
-        info: (176, 188, 200),
-        warn: (240, 192, 92),
-        muted: (158, 154, 150),
+        input: (138, 190, 255),
+        success: (145, 215, 162),
+        error: (255, 157, 152),
+        primary: (245, 166, 109),
+        accent: (225, 182, 145),
+        info: (211, 218, 226),
+        warn: (244, 205, 124),
+        muted: (173, 179, 186),
         from: (236, 122, 52),
         to: (160, 168, 178),
     },
     Theme {
         name: "neon",
+        input: (138, 190, 255),
+        success: (145, 215, 162),
+        error: (255, 157, 152),
         primary: (57, 255, 136),
         accent: (255, 46, 99),
         info: (0, 229, 255),
@@ -44,6 +53,9 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         name: "matrix",
+        input: (138, 190, 255),
+        success: (145, 215, 162),
+        error: (255, 157, 152),
         primary: (0, 255, 65),
         accent: (255, 59, 48),
         info: (140, 255, 170),
@@ -54,6 +66,9 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         name: "amber",
+        input: (138, 190, 255),
+        success: (145, 215, 162),
+        error: (255, 157, 152),
         primary: (255, 176, 0),
         accent: (255, 69, 58),
         info: (255, 214, 140),
@@ -64,6 +79,9 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         name: "ice",
+        input: (138, 190, 255),
+        success: (145, 215, 162),
+        error: (255, 157, 152),
         primary: (110, 231, 255),
         accent: (255, 85, 170),
         info: (180, 160, 255),
@@ -74,6 +92,9 @@ pub const THEMES: &[Theme] = &[
     },
     Theme {
         name: "mono",
+        input: (235, 235, 235),
+        success: (235, 235, 235),
+        error: (255, 255, 255),
         primary: (235, 235, 235),
         accent: (255, 255, 255),
         info: (200, 200, 200),
@@ -81,6 +102,19 @@ pub const THEMES: &[Theme] = &[
         muted: (164, 164, 164),
         from: (120, 120, 120),
         to: (255, 255, 255),
+    },
+    Theme {
+        name: "paper",
+        primary: (140, 65, 15),
+        input: (31, 85, 153),
+        success: (35, 99, 59),
+        error: (160, 45, 50),
+        accent: (110, 55, 135),
+        info: (36, 40, 45),
+        warn: (104, 85, 0),
+        muted: (88, 94, 101),
+        from: (140, 65, 15),
+        to: (88, 94, 101),
     },
 ];
 
@@ -163,7 +197,7 @@ pub fn user(s: &str) -> String {
     if level() == 0 {
         s.to_string()
     } else {
-        format!("\x1b[0m{}", fg((64, 124, 208), s, true))
+        format!("\x1b[0m{}", fg(theme().input, s, true))
     }
 }
 
@@ -171,10 +205,10 @@ pub fn primary(s: &str) -> String {
     fg(theme().primary, s, false)
 }
 pub fn ok(s: &str) -> String {
-    fg(theme().primary, s, false)
+    fg(theme().success, s, false)
 }
 pub fn err(s: &str) -> String {
-    fg(theme().accent, s, false)
+    fg(theme().error, s, false)
 }
 pub fn accent(s: &str) -> String {
     fg(theme().accent, s, true)
@@ -227,7 +261,7 @@ pub fn height() -> usize {
 
 // ------------------------------------------------------------------ banner
 
-pub const FONTS: &[&str] = &["rust", "block", "thin", "classic"];
+pub const FONTS: &[&str] = &["compact", "rust", "block", "thin", "classic"];
 
 pub fn set_font(name: &str) -> bool {
     match FONTS.iter().position(|f| *f == name) {
@@ -469,7 +503,54 @@ pub struct BannerInfo<'a> {
     pub target: &'a str,
 }
 
+/// Clip UI chrome by display cells; never fill the terminal wrap column.
+pub fn fit(s: &str, cells: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= cells
+        })
+        .collect()
+}
+
+/// A short separator survives reflow down to 24 columns without becoming a
+/// stack of rules. It stays outside the native multiline line editor.
+pub fn input_rule() {
+    if tty() {
+        println!("{}", dim(&"─".repeat(width().saturating_sub(1).min(20))));
+    }
+}
+
 pub fn banner(b: &BannerInfo) {
+    if font() == "compact" {
+        let cells = width().saturating_sub(1);
+        println!(
+            "{}",
+            primary(&fit(
+                &format!(
+                    "rusty / {}",
+                    std::path::Path::new(b.cwd).file_name().and_then(|s| s.to_str()).unwrap_or(b.cwd)
+                ),
+                cells
+            ))
+        );
+        println!("{}", info(&fit(&format!("model {}", b.model), cells)));
+        // Permissions remain visible even in narrow splits.
+        let mode = fit(&format!("permissions {} · {}", b.perms, b.exec), cells);
+        println!("{}", if b.perms == "yolo" { warn(&mode) } else { info(&mode) });
+        if width() >= 60 {
+            println!("{}", dim(&fit(&format!("agents {} · view {} · /help", b.agents, b.view), cells)));
+        }
+        if !b.target.is_empty() {
+            // Infrastructure targets must not disappear behind truncation.
+            println!("{}", warn(&format!("target {}", b.target)));
+        }
+        println!();
+        return;
+    }
     let pause = |ms| {
         if animate() {
             std::thread::sleep(Duration::from_millis(ms));
@@ -515,42 +596,6 @@ pub fn banner(b: &BannerInfo) {
 }
 
 // ----------------------------------------------------------------- spinner
-
-pub const VERBS: &[&str] = &[
-    "Thinking",
-    "Churning",
-    "Cooking",
-    "Locking in",
-    "Reasoning",
-    "Sampling",
-    "Grokking",
-    "Speedrunning",
-    "Spinning up",
-    "Bootstrapping",
-    "Compounding",
-    "Distilling",
-    "Inferencing",
-    "Untangling",
-    "Spelunking",
-    "Tinkering",
-    "Scheming",
-    "Synthesizing",
-    "Wiring it up",
-    "Overclocking",
-    "Jacking in",
-    "Tracing",
-    "Rerouting",
-    "Hot-swapping",
-    "Plotting a course",
-    "Entering orbit",
-    "Orbiting",
-    "Docking",
-    "Triangulating",
-    "Achieving liftoff",
-    "Warping",
-    "Running the evals",
-    "Shipping",
-];
 
 /// Small xorshift seeded from the clock; good enough for picking a verb.
 pub fn rand(n: usize) -> usize {
@@ -612,6 +657,52 @@ mod tests {
             for (i, a) in roles.iter().enumerate() {
                 assert!(roles[i + 1..].iter().all(|b| b != a), "{}: {roles:?}", t.name);
             }
+        }
+    }
+
+    #[test]
+    fn baseline_skins_have_readable_text_in_truecolor_and_indexed_terminals() {
+        fn luminance(rgb: Rgb) -> f64 {
+            let [r, g, b] = [rgb.0, rgb.1, rgb.2].map(|v| {
+                let v = f64::from(v) / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        }
+        fn indexed(rgb: Rgb) -> Rgb {
+            let i = ansi256(rgb);
+            if i >= 232 {
+                let v = 8 + (i - 232) * 10;
+                (v, v, v)
+            } else {
+                let i = i - 16;
+                let step = |v| if v == 0 { 0 } else { 55 + 40 * v };
+                (step(i / 36), step(i / 6 % 6), step(i % 6))
+            }
+        }
+        for t in THEMES.iter().filter(|t| matches!(t.name, "rust" | "paper" | "mono")) {
+            let bg = luminance(if t.name == "paper" { (250, 247, 240) } else { (22, 25, 29) });
+            for role in [t.primary, t.input, t.success, t.error, t.info, t.warn, t.muted] {
+                for rgb in [role, indexed(role)] {
+                    let fg = luminance(rgb);
+                    let contrast = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
+                    assert!(contrast >= 4.5, "{} {rgb:?}: {contrast}", t.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chrome_clips_wide_unicode_and_removes_controls() {
+        use unicode_width::UnicodeWidthStr;
+        for width in 0..80 {
+            let clipped = fit("repo/文件/🦀/e\u{301}\n\r\x1b", width);
+            assert!(clipped.width() <= width);
+            assert!(!clipped.chars().any(char::is_control));
         }
     }
 

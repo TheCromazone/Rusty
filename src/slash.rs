@@ -163,9 +163,15 @@ pub const COMMANDS: &[Command] = &[
         "[theme]",
         "colours",
         "setup",
-        &[("rust", ""), ("neon", ""), ("matrix", ""), ("amber", ""), ("ice", ""), ("mono", "")],
+        &[("rust", ""), ("neon", ""), ("matrix", ""), ("amber", ""), ("ice", ""), ("mono", ""), ("paper", "")],
     ),
-    with("/font", "[font]", "banner font", "setup", &[("rust", ""), ("block", ""), ("thin", ""), ("classic", "")]),
+    with(
+        "/font",
+        "[font]",
+        "banner font",
+        "setup",
+        &[("compact", ""), ("rust", ""), ("block", ""), ("thin", ""), ("classic", "")],
+    ),
     with("/tips", "[on|off]", "show or hide tips", "setup", &[("on", ""), ("off", "")]),
     cmd("/settings", "", "everything saved for next time", "setup"),
     cmd("/skills", "", "built-in and your own skills", "setup"),
@@ -443,6 +449,12 @@ impl SlashHelper {
     /// The menu text for `line`, and the rest of the highlighted row's line
     /// that → would insert.
     fn render(&self, line: &str, menu: &mut Menu) -> Option<MenuHint> {
+        self.render_at(line, menu, ui::width(), ui::height())
+    }
+
+    fn render_at(&self, line: &str, menu: &mut Menu, cols: usize, height: usize) -> Option<MenuHint> {
+        use unicode_width::UnicodeWidthStr;
+
         if menu.line != line {
             menu.line = line.to_string();
             menu.rows = items(line, &self.skills);
@@ -457,7 +469,7 @@ impl SlashHelper {
                     Some(MenuHint { display: ui::dim(c.args), completion: None })
                 }
                 None if !line.contains(' ') && line.len() > 1 => Some(MenuHint {
-                    display: format!("\n  {}", ui::dim("no command matches · /help lists them")),
+                    display: format!("\n   {}", ui::dim(&ui::fit("no match · /help", cols.saturating_sub(4)))),
                     completion: None,
                 }),
                 _ => None,
@@ -474,29 +486,48 @@ impl SlashHelper {
             (None, Some(c)) => ui::dim(c.args),
             (None, None) => String::new(),
         };
-        let width = ui::width().saturating_sub(4).max(40);
-        let start = menu.selected.unwrap_or(0).saturating_sub(SHOWN - 1);
-        for (i, row) in menu.rows.iter().enumerate().skip(start).take(SHOWN) {
-            let label = format!("{:<26}", row.label);
-            let about = ui::truncate(&row.about, width.saturating_sub(30)).to_string();
-            if Some(i) == menu.selected {
-                display.push_str(&format!("\n {} {} {}", ui::primary("›"), ui::info(&label), ui::dim(&about)));
+        let width = cols.saturating_sub(4);
+        let input_rows = (line.width() + 2).div_ceil(cols.max(1));
+        let shown = height.saturating_sub(input_rows + 2).min(SHOWN);
+        if shown == 0 || width < 4 {
+            return Some(MenuHint { display, completion: rest.filter(|r| !r.is_empty()) });
+        }
+        let start = menu.selected.unwrap_or(0).saturating_sub(shown - 1);
+        for (i, row) in menu.rows.iter().enumerate().skip(start).take(shown) {
+            let label_width = if width >= 44 { 26 } else { width };
+            let mut label = ui::fit(&row.label, label_width);
+            let about = if width >= 44 {
+                label.push_str(&" ".repeat(label_width.saturating_sub(label.width())));
+                ui::fit(&row.about, width.saturating_sub(label_width + 1))
             } else {
-                display.push_str(&format!("\n   {} {}", label, ui::dim(&about)));
+                String::new()
+            };
+            if Some(i) == menu.selected {
+                display.push_str(&format!("\n {} {}", ui::primary("›"), ui::info(&label)));
+            } else {
+                display.push_str(&format!("\n   {}", ui::info(&label)));
+            }
+            if !about.is_empty() {
+                display.push_str(&format!(" {}", ui::dim(&about)));
             }
         }
-        let more = menu.rows.len().saturating_sub(start + SHOWN);
+        let more = menu.rows.len().saturating_sub(start + shown);
         let action = match selected {
             Some(row) if row.needs_args => "enter fills it in".to_string(),
             Some(_) => "enter runs".to_string(),
             None => format!("enter runs {}", line.trim_end()),
         };
-        let footer = if more > 0 {
+        let footer = if width < 44 {
+            match selected {
+                Some(row) if row.needs_args => "↑↓ · enter fills".to_string(),
+                _ => "↑↓ · enter runs".to_string(),
+            }
+        } else if more > 0 {
             format!("{more} more · ↑↓ choose · tab completes · {action}")
         } else {
             format!("↑↓ choose · tab completes · {action}")
         };
-        display.push_str(&format!("\n   {}", ui::dim(&footer)));
+        display.push_str(&format!("\n   {}", ui::dim(&ui::fit(&footer, width))));
         Some(MenuHint { display, completion: rest.filter(|r| !r.is_empty()) })
     }
 }
@@ -675,6 +706,27 @@ mod tests {
     }
 
     #[test]
+    fn menus_fit_narrow_and_short_panes_without_losing_selection() {
+        use unicode_width::UnicodeWidthStr;
+        let helper = SlashHelper { menu: Shared::default(), skills: Skills::new() };
+        for cols in [24, 40, 80, 120] {
+            for height in [5, 8, 24] {
+                for input in ["/", "/theme ", "/permissions ", "/co"] {
+                    let mut menu = Menu::default();
+                    helper.render_at(input, &mut menu, cols, height);
+                    menu.selected = Some(menu.rows.len() - 1);
+                    let hint = helper.render_at(input, &mut menu, cols, height).unwrap();
+                    let plain = strip(hint.display());
+                    let rows: Vec<_> = plain.lines().skip(1).collect();
+                    assert!(rows.len() < height - 1, "{cols}x{height}: {plain}");
+                    assert!(rows.iter().all(|row| row.width() < cols), "{cols}x{height}: {plain}");
+                    assert!(plain.contains('›'), "selection must remain visible: {plain}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_hint_shows_the_rest_and_the_menu() {
         let helper = SlashHelper { menu: Shared::default(), skills: Skills::new() };
         let mut menu = Menu::default();
@@ -697,7 +749,7 @@ mod tests {
         let hint = helper.render("/compact ", &mut menu).unwrap();
         assert_eq!(hint.completion(), Some("settings"));
         assert!(helper.render("/clear", &mut menu).is_none());
-        assert!(strip(helper.render("/zzz", &mut menu).unwrap().display()).contains("no command matches"));
+        assert!(strip(helper.render("/zzz", &mut menu).unwrap().display()).contains("no match · /help"));
     }
 
     #[test]

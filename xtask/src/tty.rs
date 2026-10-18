@@ -135,9 +135,9 @@ fn inspect_input(text: &str, cols: u16, plain: bool, indexed: bool) -> Result<()
     let wanted = if plain {
         Color::Default
     } else if indexed {
-        Color::Indexed(68)
+        Color::Indexed(111)
     } else {
-        Color::Rgb(64, 124, 208)
+        Color::Rgb(138, 190, 255)
     };
     for row in first..=last {
         for col in 0..cols as usize {
@@ -179,6 +179,55 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     s.send("/quit\r")?;
     s.finish()?;
     println!("PASS: input keeps its colour across wraps, Ctrl-J and submission at {cols} columns (NO_COLOR={plain}, indexed={indexed})");
+    Ok(())
+}
+
+/// Keep selection and the exact pending input through repeated real SIGWINCHs.
+fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
+    let home = dest.join("home");
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &home);
+    cmd.env("COLORTERM", "truecolor").env("RUSTY_CONTEXT_TOKENS", "128000");
+    let log = File::create(dest.join("menu-resize.ansi"))?;
+    let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(20))?;
+    let ready = |s: &mut Session| -> Result<()> {
+        s.wait_for(&[Lit("?2004h")], "input prompt missing after resize")?;
+        s.drain(0.3)
+    };
+    ready(&mut s)?;
+    s.send("/theme ")?;
+    s.drain(0.3)?;
+    for cols in [24, 120, 40, 80] {
+        s.pty.set_size(ROWS, cols)?;
+        s.drain(0.3)?;
+    }
+    // Value menus begin with no selection. Seven Down keys select Paper.
+    s.send(&"\x1b[B".repeat(7))?;
+    s.send("\r")?;
+    ready(&mut s)?;
+    let settings: serde_json::Value = serde_json::from_slice(&std::fs::read(home.join("settings.json"))?)?;
+    if settings["theme"] != "paper" {
+        bail!("resized menu did not apply the selected Paper skin: {settings}");
+    }
+    s.send("/theme rust\r")?;
+    ready(&mut s)?;
+    let pending = format!("resize sentinel 文件 {}pong", "keep this input ".repeat(10));
+    s.send(&pending)?;
+    s.drain(0.3)?;
+    for cols in [40, 24, 120, 80] {
+        s.pty.set_size(ROWS, cols)?;
+        s.drain(0.3)?;
+    }
+    s.send("\r")?;
+    s.wait_for(&[Lit("pong"), Space], "resized input did not run")?;
+    ready(&mut s)?;
+    s.send("/quit\r")?;
+    s.finish()?;
+    if !std::fs::read_to_string(home.join("history"))?.contains(&pending) {
+        bail!("resize changed the submitted input");
+    }
+    println!("PASS: menu selection and exact Unicode input survive 24/40/80/120-column contraction and expansion");
     Ok(())
 }
 
@@ -421,6 +470,7 @@ enum Check {
     Steady,
     Owned,
     Input,
+    Menu,
     Aside,
     Side,
     Summary,
@@ -470,6 +520,11 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
         std::fs::create_dir_all(&dest)?;
         input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
     }
+    if checks.contains(&Check::Menu) {
+        let dest = out.join("menu-resize");
+        std::fs::create_dir_all(&dest)?;
+        menu_resize_capture(&binary, &provider.endpoint, &dest)?;
+    }
     if checks.contains(&Check::Approval) {
         let dest = out.join("approval");
         std::fs::create_dir_all(&dest)?;
@@ -509,6 +564,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "steady" => checks.push(Check::Steady),
             "owned" => checks.push(Check::Owned),
             "input" => checks.push(Check::Input),
+            "menu" => checks.push(Check::Menu),
             "aside" => checks.push(Check::Aside),
             "side" => checks.push(Check::Side),
             "summary" => checks.push(Check::Summary),
@@ -551,7 +607,7 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     } else {
         Check::Steady
     };
-    if !run(&binary, &output, &[width, Check::Input, Check::Approval, Check::CtrlC], false)? {
+    if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Approval, Check::CtrlC], false)? {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)
@@ -584,7 +640,10 @@ fn inspect_capture(path: &Path, cols: usize) -> Result<Inspection> {
         let r = s.row();
         match event {
             // The compact one-line footer of a narrow terminal.
-            Event::Reset if cols < 31 && s.line(r).starts_with("◇ rusty") => {
+            Event::Reset
+                if s.line(r).starts_with("◇ ")
+                    && (s.line(r).trim_end().ends_with("ctrl-c to stop") || s.line(r).trim_end().ends_with('s')) =>
+            {
                 if s.cell(r, cols - 1).ch != ' ' {
                     problem = Some("compact footer used wrap column".into());
                 } else if !coloured(s.cell(r, 0).pen) {
@@ -615,13 +674,16 @@ fn inspect_capture(path: &Path, cols: usize) -> Result<Inspection> {
         bail!("{cols} columns: {p}");
     }
     let last = screen.lines();
-    if last.iter().any(|l| l.contains('╭') || l.contains('╯')) {
+    if last.iter().any(|l| l.contains('╭') || l.contains('╯') || l.starts_with("◇ ")) {
         bail!("{cols} columns: transient panel left at exit");
     }
     if !text.contains("CAPTURE_COMPLETE") {
         bail!("{cols} columns: the capture never completed");
     }
-    if !frames.is_empty() {
+    if frames.is_empty() {
+        bail!("{cols} columns: no progress frames were captured");
+    }
+    {
         if screen.scrolled == 0 {
             bail!("{cols} columns: output never scrolled");
         }
@@ -705,6 +767,16 @@ mod tests {
         let i = check("clean", &capture(37, true, true)).unwrap();
         assert_eq!((i.frames.len(), i.scrolls), (1, 9));
         assert!(i.last.iter().any(|l| l.starts_with("CAPTURE_COMPLETE")));
+    }
+
+    #[test]
+    fn inspection_checks_compact_footer_and_cleanup() {
+        let prefix: String = (0..30).map(|i| format!("line {i}\r\n")).collect();
+        let frame = "\x1b[38;5;252m◇ Thinking · 2s · ctrl-c to stop\x1b[0m";
+        let clean = format!("{prefix}{frame}\r\x1b[2KCAPTURE_COMPLETE\r\n");
+        assert_eq!(check("compact-clean", &clean).unwrap().frames.len(), 1);
+        let dirty = format!("{prefix}{frame}\r\nCAPTURE_COMPLETE\r\n");
+        assert!(check("compact-dirty", &dirty).err().unwrap().to_string().contains("left at exit"));
     }
 
     #[test]
