@@ -9,6 +9,7 @@
 //! outside the project) needs a person every single time, in every mode,
 //! `yolo` included, and an "always allow" rule can't wave it through.
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -97,31 +98,59 @@ pub struct Policy {
     path: Option<PathBuf>,
 }
 
+/// The rules on disk: `None` when there is no file yet.
+fn read_rules(path: &Path) -> Result<Option<Policy>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("{} is not a valid permissions file; fix or delete it", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 impl Policy {
     pub fn new(mode: Mode) -> Self {
         Self { mode, allow: Vec::new(), deny: Vec::new(), path: None }
     }
 
-    /// Loads saved rules (not the mode) from `path`, keeping `mode`.
-    pub fn load(path: PathBuf, mode: Mode) -> Self {
-        let mut p = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Policy>(&s).ok())
-            .unwrap_or_else(|| Policy::new(mode));
+    /// Loads saved rules (not the mode) from `path`, keeping `mode`. A missing
+    /// file means no rules. A file that is there but cannot be read or parsed
+    /// is an error: a corrupt file must never silently drop a deny rule.
+    pub fn load(path: PathBuf, mode: Mode) -> Result<Self> {
+        let mut p = read_rules(&path)?.unwrap_or_else(|| Policy::new(mode));
         p.mode = mode;
         p.path = Some(path);
-        p
+        Ok(p)
     }
 
-    pub fn save(&self) {
-        if let Some(path) = &self.path {
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Ok(value) = serde_json::to_value(self) {
-                let _ = rusty::privacy::write_json(path, value);
-            }
+    /// Changes the saved rules: takes the file lock, reloads what is on disk,
+    /// applies `change` to that, writes the result in one rename and adopts
+    /// it. Two sessions sharing a project therefore keep each other's rules
+    /// instead of the last writer overwriting the first.
+    pub fn update(&mut self, change: impl FnOnce(&mut Policy)) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            change(self);
+            return Ok(());
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
         }
+        // Closing the lock file releases the lock, whichever way we leave.
+        let lock = rusty::privacy::private_file(&path.with_extension("lock"), true)?;
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("locking the permissions file");
+        }
+        let mut fresh = read_rules(&path)?.unwrap_or_else(|| Policy::new(self.mode));
+        fresh.mode = self.mode;
+        fresh.path = Some(path.clone());
+        change(&mut fresh);
+        let pending = path.with_extension("pending");
+        rusty::privacy::write_json(&pending, serde_json::to_value(&fresh)?)?;
+        std::fs::rename(&pending, &path).with_context(|| format!("publishing {}", path.display()))?;
+        *self = fresh;
+        Ok(())
     }
 
     pub fn decide(&self, tool: &str, args: &Value, cwd: &Path) -> Verdict {
@@ -2653,6 +2682,45 @@ mod tests {
         assert!(matches!(classify("write_file", &json!({"path": "../x"}), cwd), Class::Risky(_)));
         assert!(matches!(classify("write_file", &json!({"path": ".env"}), cwd), Class::Risky(_)));
         assert_eq!(classify("read_file", &json!({"path": "/etc/passwd"}), cwd), Class::ReadOnly);
+    }
+
+    #[test]
+    fn a_corrupt_rules_file_is_an_error_not_an_empty_policy() {
+        let dir = std::env::temp_dir().join(format!("rusty-perm-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("permissions.json");
+        assert!(Policy::load(path.clone(), Mode::Auto).unwrap().deny.is_empty(), "no file: no rules");
+        std::fs::write(&path, "{\"deny\": [\"git pu").unwrap();
+        let err = Policy::load(path.clone(), Mode::Auto).unwrap_err().to_string();
+        assert!(err.contains("not a valid permissions file"), "{err}");
+        // A corrupt file is never overwritten by a later edit either.
+        let mut p = Policy::new(Mode::Auto);
+        p.path = Some(path.clone());
+        assert!(p.update(|p| p.allow.push("ls".into())).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"deny\": [\"git pu");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_sessions_editing_the_rules_keep_each_others_changes() {
+        let dir = std::env::temp_dir().join(format!("rusty-perm-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("permissions.json");
+        let mut a = Policy::load(path.clone(), Mode::Auto).unwrap();
+        let mut b = Policy::load(path.clone(), Mode::Yolo).unwrap();
+        a.update(|p| p.allow.push("cargo test".into())).unwrap();
+        b.update(|p| p.deny.push("git push".into())).unwrap();
+        // b adopted a's rule when it saved, and kept its own mode.
+        assert_eq!(b.allow, vec!["cargo test".to_string()]);
+        assert_eq!(b.mode, Mode::Yolo);
+        let again = Policy::load(path.clone(), Mode::Auto).unwrap();
+        assert_eq!(again.allow, vec!["cargo test".to_string()]);
+        assert_eq!(again.deny, vec!["git push".to_string()]);
+        // Removing and clearing act on what is on disk, not on a stale copy.
+        a.update(|p| p.deny.retain(|r| r != "git push")).unwrap();
+        assert!(Policy::load(path.clone(), Mode::Auto).unwrap().deny.is_empty());
+        assert!(!path.with_extension("pending").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -47,18 +47,29 @@ pub fn pending(parent: &Path) -> Result<Vec<(PathBuf, Transfer)>> {
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     paths.sort();
-    paths
-        .into_iter()
-        .take(4)
-        .map(|path| {
-            // Written by session::save, which gzips large bodies under the same name.
-            let transfer: Transfer = serde_json::from_str(&crate::session::read(&path)?)?;
-            if transfer.parent_id != id(parent) || transfer.id != id(&path) {
-                bail!("side-summary identity mismatch: {}", path.display());
+    let mut notes = Vec::new();
+    for path in paths.into_iter().take(4) {
+        match read_note(parent, &path) {
+            Ok(note) => notes.push((path, note)),
+            // One unreadable or foreign file must not stop every later turn
+            // of the parent: set it aside under a name pending() skips.
+            Err(e) => {
+                let aside = path.with_extension("bad");
+                let _ = std::fs::rename(&path, &aside);
+                crate::display::notice(&format!("set aside unreadable side summary {} ({e:#})", aside.display()));
             }
-            Ok((path, transfer))
-        })
-        .collect()
+        }
+    }
+    Ok(notes)
+}
+
+fn read_note(parent: &Path, path: &Path) -> Result<Transfer> {
+    // Written by session::save, which gzips large bodies under the same name.
+    let transfer: Transfer = serde_json::from_str(&crate::session::read(path)?)?;
+    if transfer.parent_id != id(parent) || transfer.id != id(path) {
+        bail!("side-summary identity mismatch");
+    }
+    Ok(transfer)
 }
 pub fn file_version(cwd: &Path, path: &str) -> Option<(String, String)> {
     let root = cwd.canonicalize().ok()?;
@@ -102,6 +113,41 @@ mod tests {
         let queued = pending(&parent).unwrap();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].1.summary, note.summary);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_queued_file_is_set_aside_and_the_good_note_still_arrives() {
+        let root = std::env::temp_dir().join(format!("rusty-inbox-bad-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = sessions.join("cd".repeat(16) + ".json");
+        std::fs::write(&parent, "{}").unwrap();
+        let note = Transfer {
+            id: "ff".repeat(32),
+            parent_id: id(&parent),
+            source_id: "side".into(),
+            source_head: "head".into(),
+            title: "good review".into(),
+            summary: "one finding".into(),
+            observations: BTreeMap::new(),
+        };
+        enqueue(&parent, &note).unwrap();
+        // Sorts before the good note: truncated JSON, and a note for another parent.
+        let corrupt = dir(&parent).join(format!("{}.json", "00".repeat(32)));
+        std::fs::write(&corrupt, "{\"id\": \"00").unwrap();
+        let foreign = dir(&parent).join(format!("{}.json", "11".repeat(32)));
+        let mut other = note.clone();
+        other.id = "11".repeat(32);
+        other.parent_id = "ee".repeat(16);
+        crate::session::save(&foreign, serde_json::to_value(&other).unwrap()).unwrap();
+        for _ in 0..2 {
+            let queued = pending(&parent).unwrap();
+            assert_eq!(queued.len(), 1, "only the readable note is delivered");
+            assert_eq!(queued[0].1.id, note.id);
+        }
+        assert!(!corrupt.exists() && corrupt.with_extension("bad").exists());
+        assert!(!foreign.exists() && foreign.with_extension("bad").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
