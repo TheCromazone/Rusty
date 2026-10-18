@@ -378,7 +378,7 @@ fn search_with(
         Ok(child) => (child, "rg"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut grep = Command::new("grep");
-            grep.args(["-rnEIH", "-C", &context]);
+            grep.args(["-rnEiIH", "-C", &context]);
             for d in SKIP_DIRS {
                 grep.arg(format!("--exclude-dir={d}"));
             }
@@ -825,7 +825,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
         let result =
-            search_with("/rusty/nonexistent-rg", "pub fn search", file!(), None, 0, &|| false).unwrap();
+            search_with("/rusty/nonexistent-rg", &"pub fn search".to_uppercase(), file!(), None, 0, &|| false).unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
         assert!(!result.output.text.is_empty());
