@@ -40,7 +40,7 @@ pub fn rows(client: Option<&Client>, model: &str, live: bool) -> Vec<Row> {
             let base = ep.map(|e| e.base_url.clone()).unwrap_or_else(|| p.base_url());
             let mut lists_model = None;
             let probe = match (client, ep) {
-                (Some(c), Some(ep)) if live => {
+                (Some(c), Some(ep)) if live && p != Provider::Codex => {
                     let started = Instant::now();
                     Some(match c.models_of(ep, crate::llm::Retry::Once) {
                         Ok(ids) => {

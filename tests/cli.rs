@@ -282,6 +282,19 @@ fn sessions_get_ids_titles_listing_search_and_resume() {
     assert!(repl.contains(id) && repl.contains("picks one up"), "{repl}");
 }
 
+#[test]
+fn resume_shows_saved_conversation_without_a_model_request() {
+    let s = Sandbox::new("resume-preview");
+    scripted_run(&s, &["--memory", "off", "fix the parser"], vec![text_reply("Parser fixed; tests pass.")]);
+    let out = s.cmd().args(["--memory", "off", "-c"]).stdin(Stdio::null()).output().unwrap();
+    assert!(out.status.success());
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert!(out.contains("Earlier in this task") && out.contains("Parser fixed; tests pass."), "{out}");
+    let id = sessions_listed(&s, &[])[0].0.clone();
+    let out = s.repl_off(&[&format!("/resume {id}")]);
+    assert!(out.contains("Earlier in this task") && out.contains("Parser fixed; tests pass."), "{out}");
+}
+
 /// `rusty --sessions [words]` as (id, "age  n msgs  title") pairs.
 fn sessions_listed(s: &Sandbox, words: &[&str]) -> Vec<(String, String)> {
     let out = s.cmd().arg("--sessions").args(words).stdin(Stdio::null()).output().unwrap();
@@ -562,8 +575,8 @@ fn a_partly_typed_command_runs_when_only_one_matches() {
     let s = Sandbox::new("slash-prefix");
     let out = s.repl(&["/cont", "/mode ca", "/co", "/hlep"]);
     // One command starts with /cont, one mode with ca: both run.
-    assert!(out.contains("→ /context") && out.contains("window"), "{out}");
-    assert!(out.contains("→ /mode careful") && out.contains("execution careful"), "{out}");
+    assert!(out.contains("window") && !out.contains("→ /context"), "{out}");
+    assert!(out.contains("execution careful") && !out.contains("→ /mode careful"), "{out}");
     // /co could be /compact or /context, and nothing was on screen to choose from.
     assert!(out.contains("unknown command /co. did you mean /compact, /context"), "{out}");
     assert!(out.contains("unknown command /hlep. did you mean /help?"), "{out}");
@@ -2348,7 +2361,8 @@ fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     std::fs::write(codex_home.join("config.toml"), "# comment\nmodel = \"gpt-5-codex-test\"\n").unwrap();
     let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("✓ codex") && text.contains("chatgpt sign-in"), "{text}");
+    assert!(text.contains("• codex") && text.contains("chatgpt sign-in") && text.contains("not checked"), "{text}");
+    assert!(!text.contains("✓ codex"), "saved credentials are not a live connection check: {text}");
     assert!(text.contains("model gpt-5-codex-test → codex"), "Codex's own model is the default: {text}");
     assert!(text.contains("not set up · add NVIDIA_API_KEY"), "{text}");
     assert!(!text.contains("acct_9"), "{text}");
@@ -2368,7 +2382,7 @@ fn codex_sign_in_is_the_default_when_nothing_else_is_set_up() {
     .unwrap();
     let out = s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("model gpt-6-alpha → codex") && text.contains("2 models"), "{text}");
+    assert!(text.contains("model gpt-6-alpha → codex") && text.contains("not checked"), "{text}");
     let out =
         s.cmd().env("CODEX_HOME", &codex_home).env_remove("NVIDIA_API_KEY").arg("--list-models").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

@@ -44,6 +44,7 @@ fn on_press() {
         return;
     }
     if INTERRUPTED.swap(true, Ordering::SeqCst) {
+        restore_terminal();
         eprintln!("\nbye");
         std::process::exit(130);
     }
@@ -117,43 +118,164 @@ pub fn trip() {
 
 static QUEUED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+#[derive(Default)]
+struct Draft {
+    bytes: Vec<u8>,
+    escape: Vec<u8>,
+    paste: bool,
+}
+impl Draft {
+    fn feed(&mut self, bytes: &[u8], queue: &mut String) {
+        for &b in bytes {
+            if !self.escape.is_empty() {
+                self.escape.push(b);
+                if self.escape == b"\x1b[200~" {
+                    self.paste = true;
+                    self.escape.clear();
+                } else if self.escape == b"\x1b[201~" {
+                    self.paste = false;
+                    self.escape.clear();
+                } else if self.escape.len() > 16 || (self.escape.len() > 2 && (b.is_ascii_alphabetic() || b == b'~')) {
+                    self.escape.clear();
+                }
+                continue;
+            }
+            match b {
+                27 => self.escape.push(27),
+                b'\n' | b'\r' if self.paste => self.bytes.push(b'\n'),
+                b'\n' | b'\r' => {
+                    if !self.bytes.is_empty() {
+                        queue.push_str(&String::from_utf8_lossy(&self.bytes));
+                        queue.push('\n');
+                        self.bytes.clear();
+                    }
+                }
+                8 | 127 => while self.bytes.pop().is_some_and(|b| b & 0xc0 == 0x80) {},
+                21 => self.bytes.clear(),
+                b if b >= 32 => self.bytes.push(b),
+                _ => {}
+            }
+        }
+    }
+}
+static DRAFT: std::sync::Mutex<Draft> =
+    std::sync::Mutex::new(Draft { bytes: Vec::new(), escape: Vec::new(), paste: false });
+static TYPING: AtomicBool = AtomicBool::new(false);
+
+fn typing_terminal() {
+    if let Some(Some(t)) = COOKED.get() {
+        let mut mode = *t;
+        mode.c_lflag &= !(libc::ICANON | libc::ECHO);
+        mode.c_lflag |= libc::NOFLSH;
+        mode.c_cc[libc::VMIN] = 1;
+        mode.c_cc[libc::VTIME] = 0;
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &mode);
+        }
+        use std::io::Write;
+        print!("\x1b[?2004h");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+pub struct Typing;
+pub fn typing() -> Typing {
+    TYPING.store(true, Ordering::SeqCst);
+    typing_terminal();
+    Typing
+}
+impl Drop for Typing {
+    fn drop(&mut self) {
+        for _ in 0..128 {
+            if !read_keys() {
+                break;
+            }
+        }
+        TYPING.store(false, Ordering::SeqCst);
+        restore_terminal();
+    }
+}
+
+pub fn take_draft() -> String {
+    let mut draft = DRAFT.lock().unwrap();
+    draft.escape.clear();
+    draft.paste = false;
+    String::from_utf8_lossy(&std::mem::take(&mut draft.bytes)).into_owned()
+}
+
+pub fn input_preview() -> Option<String> {
+    if !TYPING.load(Ordering::SeqCst) {
+        return None;
+    }
+    let count = QUEUED.lock().ok()?.lines().filter(|l| !l.trim().is_empty()).count();
+    let draft = DRAFT.lock().ok()?;
+    let text = rusty::privacy::redact(&String::from_utf8_lossy(&draft.bytes)).0.replace('\n', " ↵ ");
+    use unicode_width::UnicodeWidthChar;
+    let mut cells = 0;
+    let tail: String = text
+        .chars()
+        .rev()
+        .take_while(|c| {
+            cells += c.width().unwrap_or(0);
+            cells <= crate::ui::width().saturating_sub(20).max(1)
+        })
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let text = if tail.len() < text.len() { format!("…{tail}") } else { text };
+    Some(if text.is_empty() {
+        if count == 0 {
+            return None;
+        } else {
+            format!("› {count} queued · type to add more")
+        }
+    } else {
+        format!("› {text} · Enter queues")
+    })
+}
+
 /// Called while a turn runs. Ctrl-C normally arrives as SIGINT, but if the
 /// terminal ever hands it over as a raw byte this catches it too. Anything
 /// else typed during a turn is queued and becomes the next message.
 pub fn poll_keys() {
     read_keys();
+    crate::display::refresh_input();
     crate::aside::poll();
 }
 
-fn read_keys() {
+fn read_keys() -> bool {
     unsafe {
         if libc::isatty(0) != 1 {
-            return;
+            return false;
         }
         let mut p = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
         if libc::poll(&mut p, 1, 0) <= 0 || p.revents & libc::POLLIN == 0 {
-            return;
+            return false;
         }
         let mut buf = [0u8; 512];
         let n = libc::read(0, buf.as_mut_ptr().cast(), buf.len());
         if n <= 0 {
-            return;
+            return false;
         }
         let bytes = &buf[..n as usize];
-        if bytes.contains(&3) {
-            if cancel_focused() {
-                return;
-            }
-            if INTERRUPTED.swap(true, Ordering::SeqCst) {
-                eprintln!("\nbye");
-                std::process::exit(130);
-            }
-            return;
-        }
+        let interrupted = bytes.contains(&3);
+        let filtered: Vec<u8> = bytes.iter().copied().filter(|b| *b != 3).collect();
+        let bytes = filtered.as_slice();
         if let Ok(mut q) = QUEUED.lock() {
-            q.push_str(&String::from_utf8_lossy(bytes));
+            if TYPING.load(Ordering::SeqCst) {
+                if let Ok(mut draft) = DRAFT.lock() {
+                    draft.feed(bytes, &mut q);
+                }
+            } else {
+                q.push_str(&String::from_utf8_lossy(bytes));
+            }
+        }
+        if interrupted {
+            on_press();
         }
     }
+    true
 }
 
 /// A message typed while the last turn was running, if any.
@@ -202,7 +324,7 @@ fn next_queued(q: &str) -> Option<(String, usize)> {
     let mut end = 0;
     for line in q.split_inclusive('\n') {
         let text = line.trim();
-        if text.starts_with('/') {
+        if crate::slash::command_line(text) {
             if lines.is_empty() {
                 return Some((text.to_string(), end + line.len()));
             }
@@ -235,6 +357,9 @@ pub fn restore_terminal() {
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, t);
         }
+        use std::io::Write;
+        print!("\x1b[?2004l");
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -245,6 +370,15 @@ pub fn restore_terminal() {
 /// mode) comes back as `ErrorKind::Interrupted`.
 pub fn approval_line(prompt: &str) -> std::io::Result<String> {
     use std::io::{BufRead, Write};
+    struct ResumeTyping;
+    impl Drop for ResumeTyping {
+        fn drop(&mut self) {
+            if TYPING.load(Ordering::SeqCst) {
+                typing_terminal();
+            }
+        }
+    }
+    let _resume = ResumeTyping;
     restore_terminal();
     print!("{prompt}");
     std::io::stdout().flush()?;
@@ -274,6 +408,37 @@ pub fn approval_line(prompt: &str) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod queue_tests {
+    #[test]
+    fn bracketed_multiline_paste_is_one_unsent_draft() {
+        let mut draft = super::Draft::default();
+        let mut queued = String::new();
+        let text = "/var/folders/Screenshot.png please inspect\n\nsecond line café 🌲";
+        for byte in format!("\x1b[200~{text}\x1b[201~").bytes() {
+            draft.feed(&[byte], &mut queued);
+        }
+        assert!(queued.is_empty());
+        assert_eq!(String::from_utf8(draft.bytes.clone()).unwrap(), text);
+        draft.feed(b"\r", &mut queued);
+        assert_eq!(super::pop_queued(&mut queued).as_deref(), Some(text));
+        assert!(!crate::slash::command_line(text));
+        assert!(crate::slash::command_line("/compact focus"));
+    }
+
+    #[test]
+    fn busy_draft_needs_enter_and_edits_utf8_without_escape_leaks() {
+        let mut draft = super::Draft::default();
+        let mut queued = String::new();
+        draft.feed("next 界".as_bytes(), &mut queued);
+        assert!(queued.is_empty());
+        draft.feed(b"\x7f!\x1b[D\x1b[C", &mut queued);
+        assert_eq!(String::from_utf8_lossy(&draft.bytes), "next !");
+        draft.feed(b"\r", &mut queued);
+        assert_eq!(queued, "next !\n");
+        assert!(draft.bytes.is_empty());
+        draft.feed(b"discard\x15keep", &mut queued);
+        assert_eq!(String::from_utf8_lossy(&draft.bytes), "keep");
+    }
+
     #[test]
     fn queued_commands_keep_their_message_boundaries() {
         let mut q = "\n/context\n/permissions read-only\nnext question\n".to_string();

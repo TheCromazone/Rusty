@@ -149,6 +149,17 @@ pub const COMMANDS: &[Command] = &[
     cmd("/target", "", "the kube context, cloud account, workspace and branch commands will hit", "setup"),
     cmd("/changes", "", "what this session changed in infrastructure", "setup"),
     cmd("/audit", "[n]", "the infrastructure audit log", "setup"),
+    with(
+        "/codex",
+        "[model <id>|config]",
+        "Codex model default and config editor",
+        "setup",
+        &[
+            ("model", "show or save the default model"),
+            ("models", "cached Codex model names"),
+            ("config", "edit all Codex settings"),
+        ],
+    ),
     cmd("/models", "", "list models from every provider", "setup"),
     cmd("/doctor", "", "which providers are set up and answering", "setup"),
     with(
@@ -249,6 +260,21 @@ pub type Skills = Vec<(String, String)>;
 pub fn items(line: &str, skills: &Skills) -> Vec<Item> {
     let Some(body) = line.strip_prefix('/') else { return Vec::new() };
     let words: Vec<&str> = body.split(' ').collect();
+    if words.len() == 3 && words[0] == "codex" && words[1] == "model" {
+        return crate::codex::listed_models()
+            .into_iter()
+            .filter_map(|model| {
+                rank(words[2], &model)?;
+                Some(Item {
+                    line: format!("/codex model {model}"),
+                    label: model,
+                    about: "save shared Codex default".into(),
+                    needs_args: false,
+                    loose: false,
+                })
+            })
+            .collect();
+    }
     if words.len() == 1 {
         let mut ranked: Vec<(u8, usize, Item)> = Vec::new();
         for (i, c) in COMMANDS.iter().enumerate() {
@@ -381,6 +407,12 @@ fn distance(a: &str, b: &str) -> usize {
         }
     }
     row[b.len()]
+}
+
+/// A slash command has one name; pasted absolute paths are ordinary messages.
+pub fn command_line(line: &str) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    first.starts_with('/') && !first[1..].contains('/')
 }
 
 /// `/help`, from the same registry as the menu.
@@ -536,12 +568,18 @@ impl Hinter for SlashHelper {
     type Hint = MenuHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<MenuHint> {
-        if pos != line.len() || !line.starts_with('/') {
+        if pos != line.len() || !(line.starts_with('/') || line.starts_with('!')) {
             return None;
         }
         let mut menu = self.menu.lock().ok()?;
         if menu.paused {
             return None;
+        }
+        if line.starts_with('!') {
+            return Some(MenuHint {
+                display: ui::warn(&format!("\n  {}", ui::fit("shell · no model call", ui::width().saturating_sub(3)))),
+                completion: None,
+            });
         }
         self.render(line, &mut menu)
     }
@@ -549,7 +587,7 @@ impl Hinter for SlashHelper {
 
 impl Highlighter for SlashHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        Cow::Owned(ui::user(line))
+        Cow::Owned(if line.starts_with('!') { ui::warn(line) } else { ui::user(line) })
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
@@ -702,7 +740,7 @@ mod tests {
         assert_eq!(suggest("/compcat", &none).as_deref(), Some("/compact"));
         assert_eq!(suggest("/hlep", &none).as_deref(), Some("/help"));
         assert_eq!(suggest("/frobnicate", &none), None);
-        assert_eq!(suggest("/co", &none).as_deref(), Some("/compact, /context"));
+        assert_eq!(suggest("/co", &none).as_deref(), Some("/compact, /context, /codex"));
     }
 
     #[test]

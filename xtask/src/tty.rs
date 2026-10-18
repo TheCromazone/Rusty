@@ -163,17 +163,18 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     }
     let log = File::create(dest.join("input.ansi"))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(20))?;
-    s.wait_for(&[Lit("?2004h")], "input prompt missing")?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "input prompt missing")?;
     s.drain(0.2)?;
     let wrapped = format!("USER_PROMPT_START {}pong", "wrapped input ".repeat(16));
     s.send(&wrapped)?;
     s.send("\x0aUSER_PROMPT_END")?;
-    s.drain(0.3)?;
+    s.wait_for(&[Lit("USER_PROMPT_END")], "typed input did not finish redrawing")?;
+    s.drain(0.1)?;
     inspect_input(&s.text, cols, plain, indexed)?;
     std::fs::write(dest.join("input-live.ansi"), &s.text)?;
     s.send("\r")?;
     s.wait_for(&[Lit("pong"), Space], "submitted input did not run")?;
-    s.wait_for(&[Lit("?2004h")], "next prompt missing")?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "next prompt missing")?;
     s.drain(0.2)?;
     inspect_input(&s.text, cols, plain, indexed)?;
     s.send("/quit\r")?;
@@ -192,7 +193,10 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
     let log = File::create(dest.join("menu-resize.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(20))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "input prompt missing after resize")?;
+        s.wait_for(
+            &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+            "input prompt missing after resize",
+        )?;
         s.drain(0.3)
     };
     ready(&mut s)?;
@@ -221,6 +225,7 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
     }
     s.send("\r")?;
     s.wait_for(&[Lit("pong"), Space], "resized input did not run")?;
+    s.wait_for(&[Lit("response OK")], "completed response did not update connection status")?;
     ready(&mut s)?;
     s.send("/quit\r")?;
     s.finish()?;
@@ -228,6 +233,90 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
         bail!("resize changed the submitted input");
     }
     println!("PASS: menu selection and exact Unicode input survive 24/40/80/120-column contraction and expansion");
+    Ok(())
+}
+
+/// These controls must work even when no model server is listening.
+fn shell_capture(binary: &Path, dest: &Path) -> Result<()> {
+    let home = dest.join("home");
+    let codex = dest.join("codex");
+    std::fs::create_dir_all(&codex)?;
+    std::fs::write(codex.join("config.toml"), "# preserved\nmodel = \"old\"\n[profiles.work]\nmodel = \"keep\"\n")?;
+    std::fs::write(
+        codex.join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-test","visibility":"list","priority":0}]}"#,
+    )?;
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off", "--permissions", "yolo"]);
+    cmd.args(["--max-requests", "1", "--budget-secs", "30"]);
+    offline(&mut cmd, "http://127.0.0.1:1/v1", &home);
+    cmd.env("RUSTY_PROVIDER", "compatible").env("RUSTY_CONTEXT_TOKENS", "128000").env("CODEX_HOME", &codex);
+    std::fs::write(dest.join("editor.sh"), "printf '\\n# editor visited\\n' >> \"$1\"\n")?;
+    cmd.env("VISUAL", "sh ./editor.sh");
+    let log = File::create(dest.join("direct-shell.ansi"))?;
+    let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(10))?;
+    let ready = |s: &mut Session| -> Result<()> {
+        s.wait_for(
+            &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+            "input did not return after direct shell",
+        )?;
+        s.drain(0.15)
+    };
+    ready(&mut s)?;
+    s.send("!pwd\r")?;
+    s.wait_for(&[Lit("stdout:")], "!pwd produced no stdout")?;
+    ready(&mut s)?;
+    if !s.text.contains(dest.to_str().context("non-UTF8 cwd")?) {
+        bail!("!pwd did not use session cwd");
+    }
+    s.send("!printf 'direct-%s' shell; exit 7\r")?;
+    s.wait_for(&[Lit("exit code: 7")], "shell exit code missing")?;
+    s.wait_for(&[Lit("direct-shell")], "shell output missing")?;
+    ready(&mut s)?;
+    s.send("!sleep 20\r")?;
+    s.drain(0.5)?;
+    s.send("\x03")?;
+    s.wait_for(&[Lit("interrupted by the user")], "shell was not interrupted")?;
+    ready(&mut s)?;
+    // An unfinished draft stays editable after work finishes and is not sent
+    // to the unavailable provider. Unicode backspace edits the draft itself.
+    s.send("!sleep 2\r")?;
+    s.drain(0.3)?;
+    s.send("draft 界\x7f!")?;
+    s.drain(0.3)?;
+    ready(&mut s)?;
+    if !s.text.contains("draft !") || s.text.contains("failed last request") {
+        bail!("unfinished Unicode draft was lost or submitted without Enter");
+    }
+    s.send("\x03")?;
+    ready(&mut s)?;
+    s.send("/permissions read-only\r")?;
+    ready(&mut s)?;
+    s.send("!touch forbidden\r")?;
+    s.wait_for(&[Lit("denied by permissions")], "direct shell bypassed read-only")?;
+    ready(&mut s)?;
+    if dest.join("forbidden").exists() {
+        bail!("denied command changed the workspace");
+    }
+    s.send("/codex model ")?;
+    s.drain(0.2)?;
+    s.send("\x1b[B\r")?;
+    ready(&mut s)?;
+    s.send("/codex config\r")?;
+    ready(&mut s)?;
+    let text = std::fs::read_to_string(codex.join("config.toml"))?;
+    if !text.contains("# editor visited") {
+        bail!("config editor did not receive the Codex path");
+    }
+    if !text.contains("model = \"gpt-test\"") || !text.contains("model = \"keep\"") {
+        bail!("Codex config edit lost settings");
+    }
+    s.send("hello\r")?;
+    s.wait_for(&[Lit("failed last request")], "failed request did not update connection status")?;
+    ready(&mut s)?;
+    s.send("/quit\r")?;
+    s.finish()?;
+    println!("PASS: direct shell cwd, output, exit status, interrupt, permissions and Codex config work without a model server");
     Ok(())
 }
 
@@ -320,7 +409,7 @@ pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     let log = File::create(dest.join("terminal.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(15))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "no prompt")?;
+        s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "no prompt")?;
         s.drain(0.4)
     };
     ready(&mut s)?;
@@ -346,6 +435,86 @@ pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Exercise the visible busy draft and typeahead reader, not just rustyline.
+fn typeahead_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: bool) -> Result<()> {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &dest.join("home"));
+    cmd.env("RUSTY_PROVIDER", "compatible");
+    if plain {
+        cmd.env("NO_COLOR", "1");
+    }
+    let log = File::create(dest.join("typeahead.ansi"))?;
+    let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "input prompt missing")?;
+    s.drain(0.2)?;
+    s.send("Unix\r")?;
+    s.wait_for(&[Lit("A long streamed reply")], "stream did not start")?;
+    // The emoji begins at byte 511, crossing read_keys' 512-byte buffer.
+    let input = crate::provider::typeahead_input();
+    s.send("\x1b[200~")?;
+    s.drain(0.1)?;
+    s.pty.send(&input.as_bytes()[..512])?;
+    s.drain(0.15)?;
+    s.pty.send(&input.as_bytes()[512..])?;
+    s.send("\x1b[201~\r")?;
+    match s.expect(&[&[Lit("TYPEAHEAD_EXACT_MATCH")], &[Lit("TYPEAHEAD_MISMATCH")]], s.timeout)? {
+        Some(0) => {}
+        Some(_) => bail!("provider did not receive exact multiline Unicode typeahead"),
+        None => bail!("queued Unicode input did not reach the provider"),
+    }
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "prompt did not recover after typeahead",
+    )?;
+    s.drain(0.3)?;
+    // A pasted absolute path plus unfinished second line stays one editable
+    // draft after stopping, and is never routed as a slash command.
+    s.send("Unix\r")?;
+    s.wait_for(&[Lit("A long streamed reply")], "second stream did not start")?;
+    let path = crate::provider::typeahead_path_input();
+    s.send(&format!("\x1b[200~{path}\x1b[201~"))?;
+    if plain {
+        // No terminal echo is enabled while busy: this text must come from
+        // the visible draft renderer, even when color styling is disabled.
+        s.wait_for(&[Lit("PATH_END")], "NO_COLOR busy draft was invisible")?;
+        s.wait_for(&[Lit("A long streamed reply")], "stream did not continue after drafting")?;
+        s.drain(0.3)?;
+        let mut screen = Screen::new(ROWS as usize, cols as usize);
+        screen.feed(&s.text, |_, _| {});
+        if !screen.lines().iter().any(|line| line.contains("PATH_END")) {
+            bail!("NO_COLOR draft disappeared after streamed output");
+        }
+    }
+    s.drain(0.3)?;
+    s.send("\x03")?;
+    s.wait_for(&[Lit("stopped")], "turn did not stop with a pasted draft")?;
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "stopped draft editor did not recover",
+    )?;
+    let mark = s.text.len();
+    s.drain(0.3)?;
+    if s.text[mark..].contains("TYPEAHEAD_PATH_") {
+        bail!("unfinished pasted draft was sent without Enter");
+    }
+    s.send(" EDITED\r")?;
+    match s.expect(&[&[Lit("TYPEAHEAD_PATH_EXACT_MATCH")], &[Lit("TYPEAHEAD_PATH_MISMATCH")]], s.timeout)? {
+        Some(0) => {}
+        Some(_) => bail!("provider did not receive exact edited path and multiline draft"),
+        None => bail!("pasted path draft was lost, split or routed as a command"),
+    }
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "prompt did not recover after pasted draft",
+    )?;
+    s.drain(0.3)?;
+    s.send("/exit\r")?;
+    s.finish()?;
+    println!("PASS: exact multiline Unicode typeahead at {cols} columns (NO_COLOR={plain})");
+    Ok(())
+}
+
 pub enum Interrupt {
     Stopped(u128),
     /// The model finished before the keypress.
@@ -364,7 +533,7 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     }
     let mut s = Session::spawn(cmd, 80, log, Duration::from_secs(90))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "no prompt")?;
+        s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "no prompt")?;
         s.drain(0.4)
     };
     ready(&mut s)?;
@@ -409,7 +578,7 @@ fn side_ctrl_c(binary: &Path, cwd: &Path, endpoint: &str, home: &Path) -> Result
         offline(&mut cmd, endpoint, &home.join(name));
         cmd
     };
-    let prompt = &[Lit("?2004h")];
+    let prompt = &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")];
 
     let mut idle = Session::spawn(command("side-idle-home"), 80, Box::new(std::io::sink()), Duration::from_secs(4))?;
     idle.wait_for(prompt, "idle-side check had no prompt")?;
@@ -470,7 +639,10 @@ enum Check {
     Steady,
     Owned,
     Input,
+    Typeahead,
+    TypeaheadPlain,
     Menu,
+    Shell,
     Aside,
     Side,
     Summary,
@@ -520,6 +692,41 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
         std::fs::create_dir_all(&dest)?;
         input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
     }
+    if checks.contains(&Check::Shell) {
+        let dest = out.join("direct-shell");
+        std::fs::create_dir_all(&dest)?;
+        shell_capture(&binary, &dest)?;
+    }
+    if checks.contains(&Check::Typeahead) {
+        for cols in WIDTHS {
+            let dest = out.join(format!("typeahead-{cols}"));
+            std::fs::create_dir_all(&dest)?;
+            typeahead_capture(&binary, &provider.endpoint, cols, &dest, false)?;
+        }
+    }
+    if checks.contains(&Check::Typeahead) || checks.contains(&Check::TypeaheadPlain) {
+        let dest = out.join("typeahead-plain");
+        std::fs::create_dir_all(&dest)?;
+        typeahead_capture(&binary, &provider.endpoint, 80, &dest, true)?;
+    }
+    if checks.contains(&Check::Input) {
+        for cols in WIDTHS {
+            let dest = out.join(format!("input-{cols}"));
+            std::fs::create_dir_all(&dest)?;
+            input_capture(&binary, &provider.endpoint, cols, &dest, false, false)?;
+        }
+        let dest = out.join("input-plain");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, true, false)?;
+        let dest = out.join("input-indexed");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
+    }
+    if checks.contains(&Check::Shell) {
+        let dest = out.join("direct-shell");
+        std::fs::create_dir_all(&dest)?;
+        shell_capture(&binary, &dest)?;
+    }
     if checks.contains(&Check::Menu) {
         let dest = out.join("menu-resize");
         std::fs::create_dir_all(&dest)?;
@@ -564,7 +771,10 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "steady" => checks.push(Check::Steady),
             "owned" => checks.push(Check::Owned),
             "input" => checks.push(Check::Input),
+            "typeahead" => checks.push(Check::Typeahead),
+            "typeahead-plain" => checks.push(Check::TypeaheadPlain),
             "menu" => checks.push(Check::Menu),
+            "shell" => checks.push(Check::Shell),
             "aside" => checks.push(Check::Aside),
             "side" => checks.push(Check::Side),
             "summary" => checks.push(Check::Summary),
@@ -607,7 +817,12 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     } else {
         Check::Steady
     };
-    if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Approval, Check::CtrlC], false)? {
+    if !run(
+        &binary,
+        &output,
+        &[width, Check::Input, Check::Menu, Check::Typeahead, Check::Shell, Check::Approval, Check::CtrlC],
+        false,
+    )? {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)

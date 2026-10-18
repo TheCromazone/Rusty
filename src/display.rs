@@ -16,6 +16,19 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU8, Ordering};
 thread_local! { static ACTIVE_FOOTER: RefCell<Weak<RefCell<crate::footer::Footer>>> = const { RefCell::new(Weak::new()) }; }
 
+pub fn refresh_input() {
+    if !crate::ui::interactive() {
+        return;
+    }
+    ACTIVE_FOOTER.with(|f| {
+        if let Some(footer) = f.borrow().upgrade() {
+            let mut out = std::io::stdout().lock();
+            footer.borrow_mut().refresh_input(&mut out);
+            let _ = out.flush();
+        }
+    });
+}
+
 /// Runtime side results use the terminal owner's footer rather than painting
 /// a second progress panel over the active turn.
 pub fn notice(text: &str) {
@@ -139,7 +152,7 @@ impl Display {
 
     /// Refreshes elapsed time; completed output stays in scrollback.
     pub fn tick(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::interactive() || self.in_reasoning {
             return;
         }
         let cadence = 1000;
@@ -154,7 +167,7 @@ impl Display {
     }
 
     fn paint(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::interactive() || self.in_reasoning {
             return;
         }
         let extra = if !self.status.is_empty() {
@@ -183,7 +196,7 @@ impl Display {
         let mut buf = Vec::new();
         self.footer.borrow_mut().clear(&mut buf);
         let _ = writeln!(buf, "{s}");
-        if ui::tty() && !self.in_reasoning {
+        if ui::interactive() && !self.in_reasoning {
             let extra = if self.status.is_empty() { String::new() } else { self.status.clone() };
             let verb = if self.in_content { "Responding" } else { self.verb };
             self.footer.borrow_mut().draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());

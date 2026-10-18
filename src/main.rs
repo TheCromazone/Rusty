@@ -594,7 +594,9 @@ fn expand_skill(cwd: &Path, input: &str) -> Option<String> {
 }
 
 fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Settings) -> Result<()> {
+    ui::dock_input();
     banner(agent, client, cwd);
+    print_resume_preview(agent);
     // Typing / opens the command menu under the prompt (see slash.rs).
     let menu = slash::Shared::default();
     let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
@@ -627,12 +629,16 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
     }
     let prompt = "› ";
     let mut armed_quit = false;
+    let mut hold_queued = false;
 
     loop {
         let parent = agent.side_parent()?;
         side::poll(&parent);
         if side::running(&agent.side_book) {
+            let typing = signal::typing();
             side::wait(&parent);
+            drop(typing);
+            hold_queued |= signal::interrupted();
         }
         agent.accept_side_summaries()?;
         // Anything typed since the turn stopped reading keys, including an
@@ -640,18 +646,27 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         // and sit there unsent, joins the queue first.
         signal::poll_keys();
         // Queued and freshly typed input go through the same slash router.
+        println!("{}", ui::bold(&ui::fit(&client.connection_status(&agent.model), ui::width().saturating_sub(1))));
         ui::input_rule();
-        let mut input = if let Some(queued) = signal::take_queued() {
+        let queued = signal::take_queued();
+        let held = if hold_queued { queued.clone() } else { None };
+        let mut input = if let Some(queued) = queued.filter(|_| !hold_queued) {
             println!("{} {}", ui::user("›"), ui::user(&queued));
             println!("{}", ui::dim("  (typed while rusty was working)"));
             queued
         } else {
-            match rl.readline(prompt) {
+            let draft = held.unwrap_or_else(signal::take_draft);
+            hold_queued = hold_queued && signal::peek_queued().is_some();
+            match rl.readline_with_initial(prompt, (&draft, "")) {
                 Ok(l) => {
                     armed_quit = false;
                     l
                 }
                 Err(ReadlineError::Interrupted) => {
+                    if !draft.is_empty() {
+                        armed_quit = false;
+                        continue;
+                    }
                     if armed_quit {
                         break;
                     }
@@ -663,6 +678,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 Err(e) => return Err(e.into()),
             }
         };
+        ui::clear_input_hint();
         // A trailing backslash continues the message on the next line.
         while input.ends_with('\\') {
             input.pop();
@@ -677,8 +693,7 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         }
         // A partly typed command runs what the menu had highlighted, matched
         // against the line as typed (a trailing space opens a value menu).
-        if input.starts_with('/') {
-            let typed = input.trim_end().to_string();
+        if crate::slash::command_line(&input) {
             let resolved = match menu.lock() {
                 Ok(mut m) => {
                     let r = slash::resolve(&input, Some((&m.line, &m.rows, m.selected)), &skill_list);
@@ -687,9 +702,6 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 }
                 Err(_) => slash::resolve(&input, None, &skill_list),
             };
-            if resolved.trim_end() != typed {
-                println!("{}", ui::dim(&format!("  → {}", resolved.trim_end())));
-            }
             input = resolved;
         }
         let input = input.trim().to_string();
@@ -700,7 +712,14 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         signal::restore_terminal();
         signal::reset();
 
-        let result = if input.starts_with('/') {
+        let typing = (!input.starts_with("/codex config")).then(signal::typing);
+        let result = if let Some(shell) = input.strip_prefix('!') {
+            if side::focused(&agent.side_book) {
+                Err(anyhow!("use /back before running a shell command"))
+            } else {
+                agent.direct_shell(shell)
+            }
+        } else if crate::slash::command_line(&input) {
             match command(agent, client, cwd, settings, &input) {
                 Ok(true) => break,
                 Ok(false) => Ok(()),
@@ -717,6 +736,8 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
         } else {
             agent.run_turn(&input).map(|_| ())
         };
+        drop(typing);
+        hold_queued |= signal::interrupted();
         if let Err(e) = result {
             println!("{} {e:#}\n", ui::err("error:"));
         }
@@ -810,6 +831,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 [entry] => {
                     agent.end_session()?;
                     resume_session(agent, &dir, entry)?;
+                    print_resume_preview(agent);
                 }
                 [] => {
                     let hits = session::search(&dir, rest)?;
@@ -826,6 +848,44 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
         }
         "/btw" => agent.ask_aside(rest)?,
+        "/codex" => {
+            let (action, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            match action {
+                "model" if !value.trim().is_empty() => {
+                    codex::save_model(value.trim())?;
+                    println!("  saved Codex model {} · applies to future Codex sessions", ui::info(value.trim()));
+                    if client.endpoint_for(value.trim()).is_ok_and(|ep| ep.provider == config::Provider::Codex) {
+                        agent.model = value.trim().into();
+                        agent.model_override = Some(agent.model.clone());
+                        println!("  applied to this session · {}", client.connection_status(&agent.model));
+                    } else {
+                        println!("  current session unchanged; start RUSTY_PROVIDER=codex rusty to use the saved Codex model");
+                    }
+                }
+                "models" => {
+                    let models = codex::listed_models();
+                    if models.is_empty() {
+                        println!("  no cached catalog · default {}", codex::default_model());
+                    }
+                    for model in models {
+                        println!("  {model}");
+                    }
+                    println!("  cached Codex catalog; availability is checked by the next request");
+                }
+                "config" => {
+                    codex::edit_config()?;
+                    println!("  config editor closed · /codex model <id> applies a model here; other settings apply on restart");
+                }
+                "" | "model" => {
+                    println!("  Codex default {}", ui::info(&codex::default_model()));
+                    println!("  /codex model <id> · save shared default");
+                    println!("  /codex config · edit full config");
+                    println!("  /model <id> · this session only");
+                    println!("  /codex models · cached model names");
+                }
+                _ => anyhow::bail!("use /codex model <id>, /codex models, or /codex config"),
+            }
+        }
         "/model" => {
             if !rest.is_empty() {
                 agent.model = rest.to_string();
@@ -1400,6 +1460,7 @@ fn parse_duration(s: &str) -> Option<u64> {
 fn print_help(cwd: &Path) {
     let skill_list: slash::Skills = skills::all(cwd).into_iter().map(|s| (s.name, s.description)).collect();
     print!("{}", slash::help(&skill_list));
+    println!("  !command · direct shell, no model request · ctrl-c stops");
 }
 
 /// `/Users/me/code/x` → `~/code/x`.
@@ -1427,9 +1488,114 @@ fn resume_session(agent: &mut Agent, dir: &Path, entry: &session::Entry) -> Resu
     Ok(())
 }
 
+/// Display saved conversation only; never feed the preview back into history.
+fn print_resume_preview(agent: &Agent) {
+    let rows = resume_preview(&agent.history, ui::width(), ui::height());
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n{}", ui::bold(&ui::fit("  Earlier in this task", ui::width().saturating_sub(1))));
+    for (role, lines) in rows {
+        println!("{}", if role == "user" { ui::user("  You") } else { ui::accent("  Rusty") });
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+    println!("{}", ui::dim(&ui::fit("  Recent excerpts · context restored", ui::width().saturating_sub(1))));
+}
+
+fn resume_preview(history: &[serde_json::Value], width: usize, height: usize) -> Vec<(&str, Vec<String>)> {
+    let cells = width.saturating_sub(3).max(1);
+    let count = (height.saturating_sub(12) / 3).clamp(1, 4);
+    let mut recent: Vec<_> = history
+        .iter()
+        .rev()
+        .filter_map(|message| {
+            let role = message["role"].as_str()?;
+            if !matches!(role, "user" | "assistant") {
+                return None;
+            }
+            let text = match &message["content"] {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Array(parts) => parts
+                    .iter()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => return None,
+            };
+            let text = text.trim();
+            if text.is_empty()
+                || text.starts_with(context::NOTE)
+                || text.starts_with("[Summary of the conversation so far]")
+            {
+                return None;
+            }
+            let safe = rusty::privacy::redact(text).0;
+            let safe: String = safe.chars().filter(|c| !c.is_control() || c.is_whitespace()).collect();
+            let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut first = ui::fit(&safe, cells);
+            if first.len() < safe.len() && !safe[first.len()..].starts_with(' ') {
+                if let Some(space) = first.rfind(' ') {
+                    if space > 0 {
+                        first.truncate(space);
+                    }
+                }
+            }
+            let rest = &safe[first.len()..];
+            let mut lines = vec![first];
+            if !rest.is_empty() {
+                let second = ui::fit(rest.trim_start(), cells);
+                if second.len() < rest.trim_start().len() {
+                    lines.push(format!("{}…", ui::fit(&second, cells.saturating_sub(1))));
+                } else {
+                    lines.push(second);
+                }
+            }
+            Some((role, lines))
+        })
+        .take(count)
+        .collect();
+    recent.reverse();
+    recent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_preview_is_recent_bounded_and_only_visible_conversation() {
+        use serde_json::json;
+        use unicode_width::UnicodeWidthStr;
+        let history = vec![
+            json!({"role":"user","content":"old request"}),
+            json!({"role":"assistant","content":"old answer"}),
+            json!({"role":"system","content":"private system"}),
+            json!({"role":"user","content":"fix the parser"}),
+            json!({"role":"tool","content":"private tool output"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Parser fixed; tests pass."}]}),
+            json!({"role":"user","content":format!("{}internal note", context::NOTE)}),
+            json!({"role":"assistant","content":null,"tool_calls":[{}]}),
+        ];
+        let original = history.clone();
+        let rows = resume_preview(&history, 80, 24);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2], ("user", vec!["fix the parser".into()]));
+        assert_eq!(rows[3], ("assistant", vec!["Parser fixed; tests pass.".into()]));
+        assert_eq!(history, original);
+        let long = vec![json!({"role":"assistant","content":"界\n\u{1b}\r".repeat(100)})];
+        for width in [4, 24, 40, 80, 120] {
+            let rows = resume_preview(&long, width, 24);
+            assert!(rows[0].1.last().unwrap().ends_with('…'));
+            for line in &rows[0].1 {
+                assert!(line.width() <= width - 3);
+                assert!(!line.chars().any(char::is_control));
+            }
+        }
+        assert!(resume_preview(&[], 80, 24).is_empty());
+    }
 
     #[test]
     fn the_goodbye_says_how_to_resume_and_fits_the_terminal() {

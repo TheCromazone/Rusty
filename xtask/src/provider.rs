@@ -48,6 +48,15 @@ impl Drop for Provider {
     }
 }
 
+pub fn typeahead_input() -> String {
+    let prefix = "TYPEAHEAD_RECEIPT ";
+    format!("{prefix}{}🙂漢é e\u{301}\nsecond line 🌲 END_UNICODE", "x".repeat(511 - prefix.len()))
+}
+
+pub fn typeahead_path_input() -> &'static str {
+    "/tmp/rusty-shot/screen.png first café\nsecond line 🌲 PATH_END"
+}
+
 fn pause(secs: f64) {
     thread::sleep(Duration::from_secs_f64(secs));
 }
@@ -121,6 +130,13 @@ fn serve(stream: TcpStream) -> Result<()> {
             }
             sse.content("CAPTURE_COMPLETE\n", Some("stop"))?;
         }
+    } else if prompt.starts_with("TYPEAHEAD_RECEIPT") {
+        let receipt = if prompt == typeahead_input() { "TYPEAHEAD_EXACT_MATCH" } else { "TYPEAHEAD_MISMATCH" };
+        sse.content(&format!("{receipt}\n"), Some("stop"))?;
+    } else if prompt.starts_with("/tmp/rusty-shot/screen.png") {
+        let expected = format!("{} EDITED", typeahead_path_input());
+        let receipt = if prompt == expected { "TYPEAHEAD_PATH_EXACT_MATCH" } else { "TYPEAHEAD_PATH_MISMATCH" };
+        sse.content(&format!("{receipt}\n"), Some("stop"))?;
     } else if prompt.contains("Unix") {
         for _ in 0..60 {
             pause(0.15);

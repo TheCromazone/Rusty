@@ -317,11 +317,11 @@ pub fn poll(parent: &Parent) {
                 display::notice(&format!("side: {e:#}"));
             }
         } else if focused(&parent.book) && !input.starts_with("/btw") {
-            if !input.starts_with('/') && running(&parent.book) {
+            if !crate::slash::command_line(&input) && running(&parent.book) {
                 return;
             }
             signal::take_queued();
-            if input.starts_with('/') {
+            if crate::slash::command_line(&input) {
                 display::notice("use /back before main-chat commands");
             } else if let Err(e) = submit(parent, &input) {
                 display::notice(&format!("side: {e:#}"));
@@ -331,6 +331,7 @@ pub fn poll(parent: &Parent) {
 }
 
 pub fn wait(parent: &Parent) {
+    let _display = crate::display::Display::new(false);
     loop {
         poll(parent);
         signal::poll_keys();
