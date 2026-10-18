@@ -383,7 +383,8 @@ mod tests {
             .args([
                 "-c",
                 r#"
-import importlib.util, marshal, pathlib, struct
+import importlib.util, marshal, pathlib, struct, sys
+sys.pycache_prefix = None
 source = pathlib.Path('calc.py')
 cache = pathlib.Path(importlib.util.cache_from_source(str(source)))
 cache.parent.mkdir(exist_ok=True)
@@ -398,7 +399,10 @@ cache.write_bytes(header + marshal.dumps(compile('def add(a, b): return a + b', 
         let check = "python3 -B -c 'from calc import add; assert add(2, 3) == 5'";
         assert!(Command::new("bash")
             .current_dir(&workspace.0)
-            .args(["-c", check])
+            .args([
+                "-c",
+                "python3 -B -c 'import sys; sys.pycache_prefix = None; from calc import add; assert add(2, 3) == 5'"
+            ])
             .env_remove("PYTHONPYCACHEPREFIX")
             .status()
             .unwrap()
