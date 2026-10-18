@@ -135,8 +135,9 @@ impl Drop for ChildFixture {
         // The fixture owns this group, including on an assertion failure.
         if self.1 {
             unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            self.1 = false;
+            let _ = self.0.wait();
         }
-        let _ = self.0.wait();
     }
 }
 
@@ -211,21 +212,41 @@ fn deadline_exit_closes_the_silent_transport() {
     let end = Instant::now() + Duration::from_secs(120);
     let outcome = loop {
         match child.0.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => {
+                child.1 = false; // try_wait reaped: never signal this group again.
+                break Ok(status);
+            }
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(1)),
             Ok(None) => break Err("deadline child did not exit".to_string()),
-            Err(e) => break Err(e.to_string()),
+            Err(e) => {
+                child.1 = false; // Ownership uncertain; do not signal an identifier.
+                break Err(e.to_string());
+            }
         }
     };
-    if outcome.is_err() {
+    if outcome.is_err() && child.1 {
         unsafe { libc::kill(-(child.0.id() as i32), libc::SIGKILL) };
+        child.1 = false;
         let _ = child.0.wait();
     }
     // Join before asserting so every failure path closes the mock as well.
     let server_result = server.join();
-    let group_absent = unsafe { libc::kill(-(child.0.id() as i32), 0) } == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-    child.1 = !group_absent;
+    let end = Instant::now() + Duration::from_secs(60);
+    let group_absent = loop {
+        // Nonblocking reap attempts never restore signal authority, including
+        // after an earlier observation error.
+        let _ = child.0.try_wait();
+        if unsafe { libc::kill(-(child.0.id() as i32), 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            break true;
+        }
+        if Instant::now() >= end {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    // Group absence is observation-only after reap, never signal authority.
     let mut log = String::new();
     std::fs::File::open(root.0.join("child.log")).unwrap().take(64 * 1024).read_to_string(&mut log).unwrap();
     assert!(outcome.unwrap().success(), "{log}");
