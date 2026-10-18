@@ -33,7 +33,9 @@ diagnostics are drained to EOF. All subprocess diagnostics survive partial
 success, up to a separate 2,000-byte prefix with an omission marker. Lossy UTF-8
 conversion can temporarily expand invalid raw bytes up to threefold. The retained
 rendered prefixes are capped again at the same byte limits on a UTF-8 boundary,
-and any additional omission sets `output_truncated` or the diagnostic marker.
+excess String capacity is released, and any additional omission sets
+`output_truncated` or the diagnostic marker. This bounds retained query output,
+not process RSS or the allocator's freed-page retention.
 
 Only failure to find the ripgrep executable selects grep. The legacy grep
 fallback uses case-insensitive extended regex and build-directory exclusions;
