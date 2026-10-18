@@ -374,14 +374,16 @@ fn list_files(args: &Value) -> Result<String> {
     walk(Path::new(root), Path::new(root), 0, max_depth, &mut entries, &mut scan);
     let total = entries.len();
     entries.truncate(500);
-    let mut out = format!(
-        "[requested depth={requested_depth} effective depth={max_depth}; deeper paths outside scope]\n{}",
-        entries.join("\n")
-    );
+    let mut out = entries.join("\n");
     if total > 500 {
         let _ = write!(out, "\n… {} more entries (narrow the path or depth)", total - 500);
     }
     let truncated = total > 500 || out.len() > workspace_query::OUTPUT_BYTES;
+    if scan.incomplete || truncated {
+        out = format!(
+            "[requested depth={requested_depth} effective depth={max_depth}; deeper paths outside scope]\n{out}"
+        );
+    }
     Ok(scan.render(truncate(&out, workspace_query::OUTPUT_BYTES), truncated))
 }
 
@@ -853,7 +855,7 @@ fn outline_file(path: &Path) -> Result<String> {
             continue;
         }
         let sig = trimmed.trim_end_matches(['{', ':', ' ']);
-        let _ = writeln!(out, "{:>5}: {}{}", i + 1, " ".repeat(indent.min(8)), sig);
+        let _ = writeln!(out, "{:>5}: {}{}", i + 1, " ".repeat(indent.min(8)), truncate(sig, 160));
     }
     Ok(out)
 }
@@ -1063,6 +1065,21 @@ os._exit(0)
         let out = outline(&json!({"path":dir})).unwrap();
         assert!(out.contains("scan_complete=false output_truncated=false"));
         assert!(out.contains("1 eligible files not read"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn small_query_enumerations_keep_plain_output_and_outline_signatures_are_bounded() {
+        let dir = std::env::temp_dir().join(format!("rusty-outline-signatures-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.rs");
+        fs::write(&path, format!("fn huge_{}() {{\nfn second() {{\n", "é".repeat(1000))).unwrap();
+        assert_eq!(list_files(&json!({"path":dir})).unwrap(), "small.rs");
+        assert_eq!(glob(&json!({"path":dir,"pattern":"*.rs"})).unwrap(), "small.rs");
+        let text = outline(&json!({"path":path})).unwrap();
+        assert!(!text.starts_with("[query"));
+        assert!(text.lines().next().unwrap().len() <= 167);
+        assert!(text.contains("fn second()"));
         fs::remove_dir_all(dir).unwrap();
     }
 
