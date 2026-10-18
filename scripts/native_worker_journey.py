@@ -219,6 +219,8 @@ def run(binary, output, record_fixture):
                                  ["src/main.rs", "src/protocol.rs", "src/session_worker.rs", "src/inspect.rs"]}}
     receipt["source_head"] = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=source, timeout=5, text=True).strip()
+    receipt["source_tracked_dirty"] = bool(subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=source, text=True).strip())
     server = FixtureServer()
     server_thread = threading.Thread(target=server.serve_forever)
     server_thread.start()
