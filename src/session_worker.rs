@@ -1,15 +1,15 @@
 //! Private native-app transport. Each process owns one existing session lease.
 //! No UI toolkit, listener or provider logic is introduced here.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -57,6 +57,12 @@ impl Transport {
             return Err(std::io::Error::last_os_error().into());
         }
         let instance = identity()?;
+        let inspect_only = std::env::args().take_while(|arg| arg != "--").any(|arg| arg == "--inspect-worker");
+        let protocol_capabilities: &[&str] = if inspect_only {
+            &["inspect", "snapshot"]
+        } else {
+            &["message.submit", "run.cancel", "approval.decide", "snapshot", "shutdown"]
+        };
         let mut transport = Self { input, output, instance };
         crate::protocol::write_frame(
             &mut transport.output,
@@ -67,8 +73,8 @@ impl Transport {
                 kind: "hello".into(),
                 payload: json!({"protocol":crate::protocol::VERSION,
                 "schema_hash":crate::protocol::schema_hash(),"worker_instance_id":transport.instance,
-                "rusty_version":env!("CARGO_PKG_VERSION"),"phase":"starting","inspect_only":std::env::args().any(|arg|arg=="--inspect-worker"),
-                "protocol_capabilities":["message.submit","run.cancel","approval.decide","snapshot","inspect","shutdown"]}),
+                "rusty_version":env!("CARGO_PKG_VERSION"),"phase":"starting","inspect_only":inspect_only,
+                "protocol_capabilities":protocol_capabilities}),
             },
         )?;
         Ok(transport)
@@ -102,25 +108,175 @@ fn digest(value: &Value) -> String {
         .collect()
 }
 
+const EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+struct ByteBudget {
+    used: std::sync::atomic::AtomicUsize,
+    limit: usize,
+}
+struct ByteReservation {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+impl ByteReservation {
+    fn acquire(budget: &Arc<ByteBudget>, bytes: usize) -> Option<Self> {
+        let mut used = budget.used.load(Ordering::Acquire);
+        loop {
+            let total = used.checked_add(bytes).filter(|total| *total <= budget.limit)?;
+            match budget.used.compare_exchange_weak(used, total, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self { budget: budget.clone(), bytes }),
+                Err(current) => used = current,
+            }
+        }
+    }
+    fn shrink(&mut self, bytes: usize) {
+        self.budget.used.fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+        self.bytes = bytes;
+    }
+}
+impl Drop for ByteReservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+struct EncodedEvent {
+    bytes: Vec<u8>,
+    _reservation: ByteReservation,
+}
+// The sole producer serializer is bounded before allocation, not after it.
+// One maximum-frame reservation also covers bytes being encoded; once complete,
+// retained Vec capacity remains charged (wire length includes its newline).
+// This bounds queued/in-progress frame backing storage, not caller-built Value
+// payloads or the allocator's transient reallocation overhead.
+impl EncodedEvent {
+    fn encode(event: &crate::protocol::Event, budget: &Arc<ByteBudget>) -> Result<Option<Self>> {
+        let Some(mut reservation) = ByteReservation::acquire(budget, crate::protocol::MAX_FRAME_BYTES) else {
+            return Ok(None);
+        };
+        struct Frame(Vec<u8>);
+        impl std::io::Write for Frame {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > (crate::protocol::MAX_FRAME_BYTES - 1).saturating_sub(self.0.len()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "worker event exceeds protocol frame limit",
+                    ));
+                }
+                let needed = self.0.len() + bytes.len();
+                if needed > self.0.capacity() {
+                    // Reserve explicitly in powers of two: a single large JSON
+                    // string followed by its closing quotes must not cause Vec
+                    // to double a non-power-of-two capacity past the frame cap.
+                    let capacity = needed.next_power_of_two().min(crate::protocol::MAX_FRAME_BYTES);
+                    self.0.reserve_exact(capacity - self.0.len());
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut frame = Frame(Vec::new());
+        serde_json::to_writer(&mut frame, event)?;
+        frame.0.push(b'\n');
+        reservation.shrink(frame.0.capacity());
+        Ok(Some(Self { bytes: frame.0, _reservation: reservation }))
+    }
+}
+#[derive(Default)]
+struct LostEvents {
+    count: u64,
+    replies: u64,
+    first_seq: u64,
+    last_seq: u64,
+    reply_ids: Vec<String>,
+}
+impl LostEvents {
+    fn record(&mut self, event: &crate::protocol::Event) {
+        if self.count == 0 {
+            self.first_seq = event.seq;
+        }
+        self.count = self.count.saturating_add(1);
+        self.last_seq = event.seq;
+        if event.kind == "reply" {
+            self.replies = self.replies.saturating_add(1);
+            if self.reply_ids.len() < 16 {
+                if let Some(id) = event.payload["request_id"].as_str() {
+                    self.reply_ids.push(crate::ui::truncate(id, 128).to_string());
+                }
+            }
+        }
+    }
+    fn payload(&self) -> Value {
+        json!({"reason":"events or replies dropped; fetch authoritative snapshot and query submission receipts; do not infer a dropped reply succeeded", "lost_event_count":self.count,"lost_reply_count":self.replies,"first_lost_seq":self.first_seq,"last_lost_seq":self.last_seq,"lost_reply_ids":self.reply_ids,"lost_reply_ids_truncated":self.replies > self.reply_ids.len() as u64})
+    }
+}
 struct Events {
-    tx: Mutex<Option<mpsc::SyncSender<crate::protocol::Event>>>,
+    tx: Mutex<Option<mpsc::SyncSender<EncodedEvent>>>,
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     drained: Mutex<Option<mpsc::Receiver<()>>>,
     draining: Arc<AtomicBool>,
+    budget: Arc<ByteBudget>,
     instance: String,
-    sequence: AtomicU64,
-    order: Mutex<()>,
-    lost: AtomicBool,
+    sequence: Arc<AtomicU64>,
+    order: Arc<Mutex<()>>,
+    lost: Arc<AtomicBool>,
+    losses: Arc<Mutex<LostEvents>>,
     closed: Arc<AtomicBool>,
 }
+// Caller holds the producer order lock. A writer calls this only after
+// rechecking that its queue is empty under that same lock. Future producers
+// then receive larger sequences and cannot overtake this directly written frame.
+fn resync_frame(
+    instance: &str,
+    sequence: &AtomicU64,
+    lost: &AtomicBool,
+    losses: &Mutex<LostEvents>,
+    budget: &Arc<ByteBudget>,
+) -> Result<Option<EncodedEvent>> {
+    if !lost.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let frame = crate::protocol::Event {
+        protocol: crate::protocol::VERSION,
+        instance_id: instance.into(),
+        seq: sequence.fetch_add(1, Ordering::AcqRel) + 1,
+        kind: "resync_required".into(),
+        payload: losses.lock().unwrap().payload(),
+    };
+    EncodedEvent::encode(&frame, budget)
+}
 impl Events {
+    fn channel(instance: String, count: usize, limit: usize) -> (Self, mpsc::Receiver<EncodedEvent>) {
+        let (tx, rx) = mpsc::sync_channel(count);
+        (
+            Self {
+                tx: Mutex::new(Some(tx)),
+                writer: Mutex::new(None),
+                drained: Mutex::new(None),
+                draining: Arc::new(AtomicBool::new(false)),
+                budget: Arc::new(ByteBudget { used: std::sync::atomic::AtomicUsize::new(0), limit }),
+                instance,
+                sequence: Arc::new(AtomicU64::new(1)),
+                order: Arc::new(Mutex::new(())),
+                lost: Arc::new(AtomicBool::new(false)),
+                losses: Arc::new(Mutex::new(LostEvents::default())),
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+            rx,
+        )
+    }
     fn new(output: File, instance: String) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<crate::protocol::Event>(256);
+        let (events, rx) = Self::channel(instance.clone(), 256, EVENT_BYTES);
         let (done, drained) = mpsc::channel();
-        let closed = Arc::new(AtomicBool::new(false));
-        let draining = Arc::new(AtomicBool::new(false));
-        let ended = closed.clone();
-        let stop = draining.clone();
+        let ended = events.closed.clone();
+        let stop = events.draining.clone();
+        let budget = events.budget.clone();
+        let sequence = events.sequence.clone();
+        let order = events.order.clone();
+        let lost = events.lost.clone();
+        let losses = events.losses.clone();
         let writer = std::thread::spawn(move || {
             let mut deadline = None;
             let result = (|| -> Result<()> {
@@ -128,34 +284,52 @@ impl Events {
                     if stop.load(Ordering::Acquire) {
                         deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(2));
                     }
-                    match rx.recv_timeout(Duration::from_millis(50)) {
-                        Ok(event) => write_event(&output, &event, &stop, &mut deadline)?,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    let event = match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(event) => Some(event),
+                        Err(_) => {
+                            let _order = order.lock().unwrap();
+                            // A producer may have queued since the timeout.
+                            match rx.try_recv() {
+                                Ok(event) => Some(event),
+                                Err(error) => {
+                                    if let Some(marker) = resync_frame(&instance, &sequence, &lost, &losses, &budget)? {
+                                        lost.store(false, Ordering::Release);
+                                        *losses.lock().unwrap() = LostEvents::default();
+                                        Some(marker)
+                                    } else if matches!(error, mpsc::TryRecvError::Disconnected) {
+                                        return Ok(());
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    if let Some(event) = event {
+                        write_event(&output, &event, &stop, &mut deadline)?;
                     }
                 }
             })();
             if result.is_err() {
                 ended.store(true, Ordering::Release);
-                crate::signal::trip();
+                if active() {
+                    crate::signal::trip();
+                }
             }
+            // Release all queued reservations before acknowledging termination.
+            drop(rx);
             let _ = done.send(());
         });
-        Self {
-            tx: Mutex::new(Some(tx)),
-            writer: Mutex::new(Some(writer)),
-            drained: Mutex::new(Some(drained)),
-            draining,
-            instance,
-            sequence: AtomicU64::new(1),
-            order: Mutex::new(()),
-            lost: AtomicBool::new(false),
-            closed,
-        }
+        *events.writer.lock().unwrap() = Some(writer);
+        *events.drained.lock().unwrap() = Some(drained);
+        events
     }
     fn finish(&self) -> bool {
-        self.draining.store(true, Ordering::Release);
-        self.tx.lock().unwrap().take();
+        {
+            let _order = self.order.lock().unwrap();
+            self.draining.store(true, Ordering::Release);
+            self.tx.lock().unwrap().take();
+        }
         if let Some(done) = self.drained.lock().unwrap().take() {
             if done.recv_timeout(Duration::from_secs(3)).is_err() {
                 self.fail();
@@ -169,10 +343,7 @@ impl Events {
         }
         !self.closed.load(Ordering::Acquire)
     }
-    fn send(
-        &self,
-        event: crate::protocol::Event,
-    ) -> std::result::Result<(), mpsc::TrySendError<crate::protocol::Event>> {
+    fn send(&self, event: EncodedEvent) -> std::result::Result<(), mpsc::TrySendError<EncodedEvent>> {
         match self.tx.lock().unwrap().as_ref() {
             Some(tx) => tx.try_send(event),
             None => Err(mpsc::TrySendError::Disconnected(event)),
@@ -189,23 +360,40 @@ impl Events {
     }
     fn fail(&self) {
         self.closed.store(true, Ordering::Release);
-        crate::signal::trip();
+        if active() {
+            crate::signal::trip();
+        }
     }
     fn emit(&self, kind: &str, payload: Value) {
         let _order = self.order.lock().unwrap();
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.draining.load(Ordering::Acquire) {
             return;
         }
-        if self.lost.swap(false, Ordering::AcqRel) {
-            let marker = self.frame("resync_required", json!({"reason":"stream deltas coalesced; request snapshot"}));
-            if self.send(marker).is_err() {
-                self.lost.store(true, Ordering::Release);
+        match resync_frame(&self.instance, &self.sequence, &self.lost, &self.losses, &self.budget) {
+            Ok(Some(marker)) => {
+                if self.send(marker).is_ok() {
+                    self.lost.store(false, Ordering::Release);
+                    *self.losses.lock().unwrap() = LostEvents::default();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.fail();
+                return;
             }
         }
         let event = self.frame(kind, payload);
-        match self.send(event) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => {
+        match EncodedEvent::encode(&event, &self.budget) {
+            Ok(Some(frame)) => match self.send(frame) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.losses.lock().unwrap().record(&event);
+                    self.lost.store(true, Ordering::Release);
+                }
+                Err(_) => self.fail(),
+            },
+            Ok(None) => {
+                self.losses.lock().unwrap().record(&event);
                 self.lost.store(true, Ordering::Release);
             }
             Err(_) => self.fail(),
@@ -215,19 +403,13 @@ impl Events {
 
 // Socket sends are nonblocking per-call; pipe flags affect only the dedicated
 // output descriptor. The input side of an fd-3 socket remains blocking.
-fn write_event(
-    output: &File,
-    event: &crate::protocol::Event,
-    stop: &AtomicBool,
-    deadline: &mut Option<Instant>,
-) -> Result<()> {
+fn write_event(output: &File, event: &EncodedEvent, stop: &AtomicBool, deadline: &mut Option<Instant>) -> Result<()> {
     #[cfg(debug_assertions)]
-    event.validate_payload().map_err(|error| anyhow!("invalid worker event {}: {error}", event.kind))?;
-    let mut bytes = serde_json::to_vec(event)?;
-    bytes.push(b'\n');
-    if bytes.len() > crate::protocol::MAX_FRAME_BYTES {
-        return Err(anyhow!("worker event exceeds protocol frame limit"));
+    {
+        let decoded: crate::protocol::Event = serde_json::from_slice(&event.bytes[..event.bytes.len() - 1])?;
+        decoded.validate_payload().map_err(|error| anyhow!("invalid worker event {}: {error}", decoded.kind))?;
     }
+    let bytes = &event.bytes;
     let fd = output.as_raw_fd();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -669,7 +851,7 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
     let receipts = match load_receipts(&path) {
         Ok(receipts) => receipts,
         Err(error) if error.is::<ReceiptOverLimit>() => {
-            return serve_read_only(transport, agent, "receipt_ledger_over_limit")
+            return serve_read_only(transport, agent, "receipt_ledger_over_limit");
         }
         Err(error) => {
             transport.startup_failed("receipt_invalid", &error.to_string())?;
@@ -686,7 +868,7 @@ pub fn serve(mut transport: Transport, agent: &mut crate::agent::Agent) -> Resul
     }
     .to_string();
     if receipts.values().any(|r| r.state == "uncertain") {
-        const RECOVERY:&str="[from rusty, not the user] [native worker recovery] The previous run stopped with uncertain external effects. Do not assume it completed and do not replay its tools. Inspect actual state and ask before retrying irreversible work.";
+        const RECOVERY: &str = "[from rusty, not the user] [native worker recovery] The previous run stopped with uncertain external effects. Do not assume it completed and do not replay its tools. Inspect actual state and ask before retrying irreversible work.";
         if !agent.history.iter().any(|m| m["content"].as_str() == Some(RECOVERY)) {
             agent.history.push(json!({"role":"user","content":RECOVERY}));
             agent.save_session()?;
@@ -1010,11 +1192,9 @@ fn receipt_snapshot(shared: &Shared, ledger: &BTreeMap<String, Receipt>) -> Valu
     snapshot["receipts_truncated"] = json!(ledger.len() > 100);
     let uncertain: Vec<_> = recent.iter().filter(|(_, r)| r.state == "uncertain").collect();
     snapshot["uncertain_run_count"] = json!(uncertain.len());
-    snapshot["uncertain_runs"] = json!(uncertain
-        .iter()
-        .take(100)
-        .map(|(id, r)| { json!({"request_id":id,"run_id":r.run_id}) })
-        .collect::<Vec<_>>());
+    snapshot["uncertain_runs"] = json!(
+        uncertain.iter().take(100).map(|(id, r)| { json!({"request_id":id,"run_id":r.run_id}) }).collect::<Vec<_>>()
+    );
     snapshot["uncertain_runs_truncated"] = json!(uncertain.len() > 100);
     let tools: Vec<_> = uncertain.iter().flat_map(|(_, r)| r.tools.iter().map(|tool| {
         json!({"run_id":r.run_id,"tool":tool.tool,"summary":tool.summary,"requester":tool.requester,"started_at":tool.started_at,"activity_id":tool.activity_id})
@@ -1124,19 +1304,28 @@ fn handle_control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn shared(capacity: usize) -> (Shared, mpsc::Receiver<crate::protocol::Event>) {
-        let (tx, rx) = mpsc::sync_channel(capacity);
-        let events = Events {
-            tx: Mutex::new(Some(tx)),
-            writer: Mutex::new(None),
-            drained: Mutex::new(None),
-            draining: Arc::new(AtomicBool::new(false)),
-            instance: "epoch-test".into(),
-            sequence: AtomicU64::new(42),
-            order: Mutex::new(()),
-            lost: AtomicBool::new(false),
-            closed: Arc::new(AtomicBool::new(false)),
-        };
+    struct TestEvents(mpsc::Receiver<EncodedEvent>);
+    impl TestEvents {
+        fn decode(frame: EncodedEvent) -> crate::protocol::Event {
+            serde_json::from_slice(&frame.bytes).unwrap()
+        }
+        fn recv(&self) -> std::result::Result<crate::protocol::Event, mpsc::RecvError> {
+            self.0.recv().map(Self::decode)
+        }
+        fn try_recv(&self) -> std::result::Result<crate::protocol::Event, mpsc::TryRecvError> {
+            self.0.try_recv().map(Self::decode)
+        }
+        fn recv_timeout(
+            &self,
+            timeout: Duration,
+        ) -> std::result::Result<crate::protocol::Event, mpsc::RecvTimeoutError> {
+            self.0.recv_timeout(timeout).map(Self::decode)
+        }
+    }
+    fn shared(capacity: usize) -> (Shared, TestEvents) {
+        let (events, rx) = Events::channel("epoch-test".into(), capacity, EVENT_BYTES);
+        events.sequence.store(42, Ordering::Release);
+        let rx = TestEvents(rx);
         (
             Shared {
                 receipts: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1406,6 +1595,165 @@ mod tests {
         assert_eq!(rx.recv().unwrap().payload["request_id"], "fresh");
     }
 
+    fn output_pair() -> (File, std::os::unix::net::UnixStream) {
+        use std::os::fd::IntoRawFd;
+        let (output, input) = std::os::unix::net::UnixStream::pair().unwrap();
+        let size: libc::c_int = 16 * 1024;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    output.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        input.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        (unsafe { File::from_raw_fd(output.into_raw_fd()) }, input)
+    }
+    #[test]
+    fn byte_overflow_below_count_cap_emits_idle_resync_and_releases_every_byte() {
+        use std::io::BufRead;
+        let (output, input) = output_pair();
+        let events = Events::new(output, "byte-test".into());
+        let payload = json!({"text":"x".repeat(3*1024*1024)});
+        for _ in 0..8 {
+            events.emit("future.large", payload.clone());
+        }
+        assert!(events.lost.load(Ordering::Acquire), "byte bound did not reject any of only eight events");
+        let used = events.budget.used.load(Ordering::Acquire);
+        assert!(used > 0 && used <= EVENT_BYTES);
+        let (tx, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut prior = 0;
+            for line in BufReader::new(input).lines() {
+                let event: crate::protocol::Event = serde_json::from_str(&line.unwrap()).unwrap();
+                assert!(event.seq > prior, "writer/producer marker reordered sequences");
+                prior = event.seq;
+                if event.kind == "resync_required" {
+                    tx.send(event.payload).unwrap();
+                }
+            }
+        });
+        // No subsequent emit/control request: the writer must publish the loss.
+        let marker = received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(marker["lost_event_count"].as_u64().unwrap() > 0);
+        assert!(events.finish());
+        reader.join().unwrap();
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn concurrent_producers_and_writer_resync_preserve_transport_sequence_order() {
+        use std::io::BufRead;
+        let (output, input) = output_pair();
+        let events = Arc::new(Events::new(output, "race-test".into()));
+        events.emit("future.block", json!({"text":"x".repeat(256*1024)}));
+        for n in 0..300 {
+            events.emit("future.before", json!({"index":n}));
+        }
+        assert!(events.lost.load(Ordering::Acquire));
+        let reader = std::thread::spawn(move || {
+            let mut prior = 0;
+            let mut markers = 0;
+            for line in BufReader::new(input).lines() {
+                let event: crate::protocol::Event = serde_json::from_str(&line.unwrap()).unwrap();
+                assert!(event.seq > prior, "resync marker overtook an already queued frame");
+                prior = event.seq;
+                markers += usize::from(event.kind == "resync_required");
+            }
+            markers
+        });
+        let (done, completed) = mpsc::channel();
+        let producers: Vec<_> = (0..4)
+            .map(|owner| {
+                let events = events.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    for n in 0..128 {
+                        events.emit("future.race", json!({"owner":owner,"index":n}));
+                    }
+                    done.send(()).unwrap();
+                })
+            })
+            .collect();
+        for _ in 0..4 {
+            completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        assert!(events.finish());
+        assert!(reader.join().unwrap() > 0);
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+        assert!(!events.lost.load(Ordering::Acquire));
+    }
+    #[test]
+    fn rejected_reply_frames_release_bytes_and_report_bounded_ids() {
+        let (events, _rx) = Events::channel("reply-test".into(), 0, EVENT_BYTES);
+        for n in 0..100 {
+            events.emit("reply", json!({"request_id":format!("read-{n}"),"ok":true,"result":{}}));
+            assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+        }
+        let loss = events.losses.lock().unwrap().payload();
+        assert_eq!(loss["lost_reply_count"], 100);
+        assert_eq!(loss["lost_reply_ids"].as_array().unwrap().len(), 16);
+        assert_eq!(loss["lost_reply_ids_truncated"], true);
+        assert!(events.finish());
+        let seq = events.sequence.load(Ordering::Acquire);
+        events.emit("reply", json!({"request_id":"late","ok":true,"result":{}}));
+        assert_eq!(events.sequence.load(Ordering::Acquire), seq, "draining admitted a new event");
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn byte_budget_charges_retained_backing_capacity_not_only_wire_length() {
+        let (events, _rx) = Events::channel("allocation-test".into(), 1, EVENT_BYTES);
+        let event = events.frame("future.large", json!({"text":"x".repeat(3*1024*1024)}));
+        let frame = EncodedEvent::encode(&event, &events.budget).unwrap().unwrap();
+        assert!(frame.bytes.capacity() > frame.bytes.len());
+        assert!(frame.bytes.capacity() <= crate::protocol::MAX_FRAME_BYTES);
+        assert_eq!(events.budget.used.load(Ordering::Acquire), frame.bytes.capacity());
+        drop(frame);
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn encoded_frame_bound_includes_newline_and_failed_encoding_refunds_reservation() {
+        let (events, _rx) = Events::channel("frame-test".into(), 1, EVENT_BYTES);
+        let mut event = events.frame("future.large", json!({"text":""}));
+        let overhead = serde_json::to_vec(&event).unwrap().len() + 1;
+        event.payload["text"] = json!("x".repeat(crate::protocol::MAX_FRAME_BYTES - overhead));
+        let frame = EncodedEvent::encode(&event, &events.budget).unwrap().unwrap();
+        assert_eq!(frame.bytes.len(), crate::protocol::MAX_FRAME_BYTES);
+        assert_eq!(events.budget.used.load(Ordering::Acquire), frame.bytes.len());
+        drop(frame);
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+        event.payload["text"] = json!("x".repeat(crate::protocol::MAX_FRAME_BYTES - overhead + 1));
+        assert!(EncodedEvent::encode(&event, &events.budget).is_err());
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn transport_error_drops_in_progress_and_queued_byte_reservations() {
+        let (output, input) = output_pair();
+        drop(input);
+        let events = Events::new(output, "error-test".into());
+        for n in 0..8 {
+            events.emit("future.large", json!({"index":n,"text":"x".repeat(1024*1024)}));
+        }
+        assert!(!events.finish(), "broken transport reported a successful drain");
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+    #[cfg(debug_assertions)]
+    #[test]
+    fn payload_validation_failure_refunds_all_byte_reservations() {
+        let (output, _input) = output_pair();
+        let events = Events::new(output, "validation-test".into());
+        events.emit("approval.requested", json!({"approval_id":"missing-required-fields"}));
+        assert!(!events.finish());
+        assert_eq!(events.budget.used.load(Ordering::Acquire), 0);
+    }
+
     type ApprovalThread = std::thread::JoinHandle<(&'static str, std::result::Result<bool, &'static str>)>;
     fn approval_threads(shared: &Arc<Shared>) -> Vec<ApprovalThread> {
         ["worker-one", "worker-two"]
@@ -1447,7 +1795,7 @@ mod tests {
             },
         )
     }
-    fn next_approval_event(events: &mpsc::Receiver<crate::protocol::Event>, kind: &str) -> Value {
+    fn next_approval_event(events: &TestEvents, kind: &str) -> Value {
         let event = events.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(event.kind, kind);
         event.payload

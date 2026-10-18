@@ -76,11 +76,17 @@ Before sending a snapshot request, start buffering incoming events. Its reply
 has a later sequence than its watermark, so events newer than the snapshot may
 arrive before the reply; replay those buffered events after applying it.
 Sequences are allocated before queue admission, so dropped events leave gaps.
-The resync marker is emitted on the next available event emission; detect gaps
-even when no marker has arrived yet.
+The writer emits a resync marker after the queue drains even when no further
+event is produced. Detect sequence gaps even before a marker arrives.
 Live text is capped at 128 KiB per content/reasoning stream and explicitly labels truncation; completed
 transcripts remain authoritative. Deltas coalesce to approximately 30 Hz.
-A bounded event queue marks any dropped event with a resync requirement.
+A 256-event queue has a separate 16 MiB budget for retained serialized buffers,
+including encoding reservations and the frame being written. The budget charges
+buffer capacity, including newline space; it does not bound caller-built JSON
+values or transient allocator overhead. Serialization is bounded to 4 MiB per
+frame. Admission may drop early to reserve one maximum-sized encoding buffer.
+Dropped-event markers include counts and at most 16 dropped reply IDs with an
+explicit truncation flag. A missing reply never implies its operation succeeded.
 The client must fetch a snapshot after sequence gaps; receipt queries recover
 submission outcomes. Backpressure does not cancel work. Transport failures exit
 nonzero; normal shutdown drains the writer with a bounded deadline and emits
