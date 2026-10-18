@@ -812,6 +812,16 @@ mod tests {
         )
         .unwrap();
         let mut auth = Auth::load_from(path).unwrap();
+        let scale = if cfg!(debug_assertions) {
+            std::env::var("RUSTY_TEST_TIME_SCALE")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| (1..=1000).contains(n))
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (release, finished) = std::sync::mpsc::channel();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -821,16 +831,17 @@ mod tests {
             // client's former 30-second default (or indefinitely).
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
             stream.flush().unwrap();
-            std::thread::sleep(Duration::from_millis(500));
+            let _ = finished.recv_timeout(Duration::from_millis(500 * scale));
         });
 
         let http = reqwest::blocking::Client::builder().timeout(None).build().unwrap();
         let started = std::time::Instant::now();
-        let result = auth.refresh_at(&http, Duration::from_millis(100), &url);
+        let result = auth.refresh_at(&http, Duration::from_millis(100 * scale), &url);
         let elapsed = started.elapsed();
+        let _ = release.send(());
         server.join().unwrap();
         assert!(result.is_err(), "a refresh with no response must fail");
-        assert!(elapsed < Duration::from_millis(400), "refresh exceeded its 100ms cap: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(400 * scale), "refresh exceeded its scaled cap: {elapsed:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

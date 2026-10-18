@@ -23,6 +23,9 @@ const FAKE_RUSTY: &str = r#"#!/bin/bash
 traj=""
 while [ $# -gt 0 ]; do [ "$1" = --trajectory ] && traj=$2; shift; done
 echo "working on it"
+if [ -n "${RUSTY_FAKE_RELEASE:-}" ]; then
+    while [ ! -f "$RUSTY_FAKE_RELEASE" ]; do sleep 0.01; done
+fi
 sleep "${RUSTY_FAKE_SLEEP:-${FAKE_RUSTY_SLEEP:-0}}"
 echo 'print("fixed")' > app.py
 echo 'print("new")' > new_module.py
@@ -82,7 +85,7 @@ impl Remote for FakeRemote {
     }
     fn sh(&self, cmd: &str, timeout: u64) -> anyhow::Result<(i32, String)> {
         let child = self.command(cmd).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-        let out = wait(child, Duration::from_secs(timeout));
+        let out = wait_command(child, Duration::from_secs(timeout));
         Ok((
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr),
@@ -503,15 +506,22 @@ fn an_unreachable_model_endpoint_stops_before_the_agent_starts() {
 fn interrupting_a_run_detaches_and_logs_picks_it_up() {
     let tmp = TempDir::new("api-detach");
     let api = FakeDaytona::new(sandbox_machine(&tmp));
+    struct Gate(PathBuf);
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "continue");
+        }
+    }
+    let gate = Gate(api.machine.home.join("fixture-release"));
     api.add_snapshot("rusty-0123456789ab", "active");
     let repo = tmp.path().join("project");
     git_repo(&repo, &[("app.py", "print(\"broken\")\n")]);
-    // RUSTY_* settings travel to the sandbox; this one slows the fake rusty.
+    // Keep the remote process alive until detach and status are observed.
     let child = api
         .cloud(tmp.path())
         .env("NVIDIA_API_KEY", "k")
         .env("RUSTY_BASE_URL", format!("{}/v1", api.url))
-        .env("RUSTY_FAKE_SLEEP", "3")
+        .env("RUSTY_FAKE_RELEASE", &gate.0)
         .args(["run", "--snapshot", "rusty-0123456789ab", "--prompt", "x", "--repo"])
         .arg(&repo)
         .stdout(Stdio::piped())
@@ -519,12 +529,11 @@ fn interrupting_a_run_detaches_and_logs_picks_it_up() {
         .spawn()
         .unwrap();
     let pid = child.id() as i32;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !api.requests().iter().any(|r| r.target.ends_with("/exec")) {
-        assert!(std::time::Instant::now() < deadline, "rusty never started");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(300));
+    support::sync::until("remote execution and log following", || {
+        let requests = api.requests();
+        let Some(exec) = requests.iter().position(|r| r.target.ends_with("/exec")) else { return false };
+        requests[exec + 1..].iter().any(|r| r.body["command"].as_str().is_some_and(|c| c.contains("tail -c +")))
+    });
     unsafe { libc::kill(pid, libc::SIGINT) };
     let out = wait(child, Duration::from_secs(20));
     let (first, stderr) = text(&out);
@@ -536,6 +545,7 @@ fn interrupting_a_run_detaches_and_logs_picks_it_up() {
     assert_eq!(state["status"], "running");
     let out = api.cloud(tmp.path()).args(["status", &id]).output().unwrap();
     assert!(text(&out).0.contains("running"), "{}", text(&out).0);
+    std::fs::write(&gate.0, "continue").unwrap();
     let out = api.cloud(tmp.path()).args(["logs", &id]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out).1);
     let both = first + &text(&out).0;
@@ -711,13 +721,13 @@ fn swarm_provider() -> (Server, std::sync::Arc<(Mutex<Metrics>, std::sync::Condv
                     m.active += 1;
                     m.peak = m.peak.max(m.active);
                     cv.notify_all();
-                    let (mut m, timeout) = cv.wait_timeout_while(m, Duration::from_secs(5), |m| m.entered < 3).unwrap();
+                    let (mut m, timeout) =
+                        cv.wait_timeout_while(m, Duration::from_secs(60), |m| m.entered < 3).unwrap();
                     if timeout.timed_out() {
                         m.problems.push("workers did not overlap".into());
                     }
-                    drop(m);
-                    std::thread::sleep(Duration::from_millis(200));
-                    lock.lock().unwrap().active -= 1;
+                    // All three requests are recorded before any returns.
+                    m.active -= 1;
                     reply(
                         steps,
                         Some(("write_file", json!({"path": "swarm-worker-must-not-write.txt", "content": "x"}))),
@@ -879,6 +889,7 @@ fn hosted_swarm_journey_offline() {
         .env("RUSTY_API_KEY", "offline-test-key")
         .env("RUSTY_BASE_URL", format!("{}/v1", provider.url))
         .env("RUSTY_NO_DOTENV", "1")
+        .env("RUSTY_TEST_TIME_SCALE", "20")
         .args(["run", "--snapshot", "rusty-0123456789ab", "--mode", "standard", "--agents", "swarm"])
         .args(["--memory-mode", "learn", "--prompt", SWARM_PROMPT, "--repo"])
         .arg(&repo)
@@ -903,7 +914,7 @@ fn hosted_swarm_journey_offline() {
 ///
 ///     cargo test --test cloud -- --ignored live_swarm_journey
 #[test]
-#[ignore]
+#[ignore = "requires Daytona, a sandbox snapshot and live model credentials"]
 fn live_swarm_journey() {
     let (Ok(snapshot), Ok(git_ref)) = (std::env::var("RUSTY_CLOUD_SNAPSHOT"), std::env::var("RUSTY_CLOUD_REF")) else {
         panic!("set RUSTY_CLOUD_SNAPSHOT and RUSTY_CLOUD_REF");

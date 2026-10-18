@@ -124,6 +124,11 @@ impl Run {
 fn run(name: &str, args: &[&str], stdin: Option<&str>) -> Run {
     let seen: Seen = Arc::default();
     let server = serve(model(seen.clone()));
+    run_with(name, args, stdin, &server, &seen)
+}
+
+fn run_with(name: &str, args: &[&str], stdin: Option<&str>, server: &support::Server, seen: &Seen) -> Run {
+    seen.lock().unwrap().clear();
     let dir = TempDir::new(name);
     let (home, project) = (dir.path().join("home"), dir.path().join("project"));
     std::fs::create_dir_all(&project).unwrap();
@@ -141,6 +146,9 @@ fn run(name: &str, args: &[&str], stdin: Option<&str>) -> Run {
         .env("RUSTY_CONTEXT_TOKENS", "128000")
         .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
         .env("NO_COLOR", "1")
+        // This matrix checks delegation and permissions; advisor journeys
+        // have their own service tests. Avoid 64 unrelated daemon startups.
+        .args(["--memory", "off"])
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -158,6 +166,8 @@ fn run(name: &str, args: &[&str], stdin: Option<&str>) -> Run {
 #[test]
 fn every_execution_agents_entry_and_permission_combination_works() {
     let mut failures = Vec::new();
+    let seen: Seen = Arc::default();
+    let server = serve(model(seen.clone()));
     for exec in ["auto", "careful", "standard", "vibe"] {
         for agents in ["off", "sub", "swarm", "auto"] {
             for entry in ["prompt", "goal"] {
@@ -169,7 +179,7 @@ fn every_execution_agents_entry_and_permission_combination_works() {
                     } else {
                         ["--", "survey the project"]
                     });
-                    let r = run(&name, &args, None);
+                    let r = run_with(&name, &args, None, &server, &seen);
                     let problem = check(&r, exec, agents, entry);
                     if let Some(p) = problem {
                         failures.push(format!("{name}: {p}\n  stderr: {}", String::from_utf8_lossy(&r.out.stderr)));

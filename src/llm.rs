@@ -1166,6 +1166,9 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
 
+        let (tx, rx) = channel();
+        let (done, finished) = channel();
+        STATUS.with(|s| *s.borrow_mut() = Some(tx));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1175,34 +1178,34 @@ mod tests {
                 match listener.accept() {
                     Ok(pair) => break pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(start.elapsed() < Duration::from_secs(2));
+                        assert!(start.elapsed() < Duration::from_secs(120));
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(e) => panic!("{e}"),
                 }
             };
-            // On macOS the accepted socket inherits the listener's non-blocking
-            // flag, so a read before the request lands fails with WouldBlock.
+            // Accepted sockets inherit the listener's nonblocking flag on macOS.
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             loop {
                 line.clear();
-                reader.read_line(&mut line).unwrap();
+                assert!(reader.read_line(&mut line).unwrap() > 0, "EOF in fixture request headers");
                 if line == "\r\n" {
                     break;
                 }
             }
             // Let the request owner drop its event receiver before provoking
             // the immediate retry onto the second API key.
-            std::thread::sleep(Duration::from_millis(200));
+            drop(rx);
             write!(stream, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             stream.flush().unwrap();
 
-            let until = std::time::Instant::now() + Duration::from_millis(300);
+            let until = std::time::Instant::now() + Duration::from_secs(120);
             let mut count = 1;
-            while std::time::Instant::now() < until {
+            while finished.try_recv().is_err() {
+                assert!(std::time::Instant::now() < until, "request owner did not finish");
                 match listener.accept() {
                     Ok((mut next, _)) => {
                         count += 1;
@@ -1224,15 +1227,9 @@ mod tests {
             Client::new(vec![Endpoint::new(Provider::OpenAi, url.clone(), vec!["first".into(), "second".into()])])
                 .unwrap();
         let endpoint = &client.endpoints[0];
-        let (tx, rx) = channel();
-        STATUS.with(|s| *s.borrow_mut() = Some(tx));
-        let dropper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(rx);
-        });
         let result = client.send_with(endpoint, &url, (None, "catalog"), None, Retry::Once);
         STATUS.with(|s| *s.borrow_mut() = None);
-        dropper.join().unwrap();
+        done.send(()).unwrap();
         assert!(result.is_err());
         assert_eq!(server.join().unwrap(), 1, "do not rotate keys after the request owner disconnects");
     }
@@ -1242,18 +1239,14 @@ mod tests {
         let budget = crate::budget::Budget::unbounded();
         let (tx, rx) = channel();
         STATUS.with(|s| *s.borrow_mut() = Some(tx));
-        let dropper = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(rx);
-        });
+        let mut owner = Some(rx);
         let mut refresh_ran = false;
         let result = refresh_codex_auth(&budget, |_| {
-            std::thread::sleep(Duration::from_millis(100));
+            drop(owner.take());
             refresh_ran = true;
             Ok(())
         });
         STATUS.with(|s| *s.borrow_mut() = None);
-        dropper.join().unwrap();
         assert!(refresh_ran);
         assert!(result.is_err(), "cancelled request must stop before the model POST");
     }
@@ -1297,13 +1290,15 @@ mod tests {
         .unwrap();
         let auth = codex::Auth::load_from(expired_path).unwrap();
 
+        let (done, finished) = channel();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let until = std::time::Instant::now() + Duration::from_millis(350);
+            let until = std::time::Instant::now() + Duration::from_secs(120);
             let mut count = 0;
-            while std::time::Instant::now() < until {
+            while finished.try_recv().is_err() {
+                assert!(std::time::Instant::now() < until, "request owner did not finish");
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         count += 1;
@@ -1335,7 +1330,7 @@ mod tests {
                 release_rx.recv().unwrap();
                 *guard = codex::Auth::load_from(fresh_path).unwrap();
             });
-            locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            locked_rx.recv_timeout(Duration::from_secs(120)).unwrap();
             let client = &client;
             let url = &url;
             let requester = scope.spawn(move || {
@@ -1346,14 +1341,15 @@ mod tests {
             });
             // This empty status is the request's initial watcher check. It
             // then blocks on the auth mutex held above.
-            status_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            status_rx.recv_timeout(Duration::from_secs(120)).unwrap();
             drop(status_rx);
             release_tx.send(()).unwrap();
-            assert!(result_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "cancelled request should stop");
+            assert!(result_rx.recv_timeout(Duration::from_secs(120)).unwrap(), "cancelled request should stop");
             holder.join().unwrap();
             requester.join().unwrap();
         });
 
+        done.send(()).unwrap();
         assert_eq!(server.join().unwrap(), 0, "canceled waiter must not send a model POST");
         let _ = std::fs::remove_dir_all(dir);
     }
