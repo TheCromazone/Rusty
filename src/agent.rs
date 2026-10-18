@@ -1866,8 +1866,8 @@ impl Agent {
     }
 
     /// Refuses an edit, or an overwrite of an existing file, that the agent
-    /// hasn't read with read_file, or that changed on disk since it last read
-    /// or wrote it. A new file is always fine. Only a local workspace file
+    /// hasn't read with read_file, or that changed since it last read or
+    /// wrote it, whoever changed it. A new file is always fine. Only a local workspace file
     /// small enough to hash is checked.
     fn check_read(&self, args: &Value) -> Result<()> {
         if self.backend.name() != "local" {
@@ -1878,7 +1878,10 @@ impl Agent {
         match self.read_versions.get(&relative) {
             None => bail!("{path} has not been read yet. Read it with read_file first, then make the change."),
             Some(seen) if *seen != now => {
-                bail!("{path} changed on disk since you last read it. Read it again with read_file, then retry.")
+                bail!(
+                    "{path} changed since you last read it; a command you ran, a formatter or the user may have \
+                     changed it. Read it again with read_file, then retry."
+                )
             }
             Some(_) => Ok(()),
         }
@@ -3744,11 +3747,16 @@ mod read_first_tests {
         assert!(run(&mut a, "edit_file", edit("two", "three")).text.starts_with("edited"));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "three\n");
 
-        // Someone else changed it: read it again first.
-        std::fs::write(&file, "four\n").unwrap();
+        // A command it ran changed it: the message must not blame someone else.
+        let sed = format!("printf 'four\\n' > '{path}'");
+        assert!(run(&mut a, "bash", json!({"command": sed})).text.starts_with("exit code: 0"));
         let stale = run(&mut a, "edit_file", edit("four", "five"));
-        assert!(stale.text.contains("changed on disk since you last read it"), "{}", stale.text);
+        assert!(stale.text.contains("changed since you last read it; a command you ran"), "{}", stale.text);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "four\n");
+        // So did the user.
+        run(&mut a, "read_file", json!({"path": path}));
+        std::fs::write(&file, "four\n\n").unwrap();
+        assert!(run(&mut a, "edit_file", edit("four", "five")).text.contains("changed since you last read it"));
         run(&mut a, "read_file", json!({"path": path}));
         assert!(run(&mut a, "edit_file", edit("four", "five")).text.starts_with("edited"));
 
