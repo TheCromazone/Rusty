@@ -1,5 +1,8 @@
 # Design notes
 
+Start with [How Rusty works](HOW_IT_WORKS.md) for the simple architecture diagrams
+and feature walkthrough. This page gives the deeper design rationale.
+
 rusty is meant to be the coding agent you'd keep open all day: quick for small
 jobs, dependable over long ones, and honest about what it spends. This page
 explains why it's built the way it is.
@@ -123,10 +126,9 @@ No telemetry. No auto-commits or pushes. No attribution trailers. No flattery.
 No giant system prompt. No silent truncation. No surprise token burn. No
 lock-in: any OpenAI-compatible endpoint works.
 
-## Next
+## Current extension points
 
-- Parallel tool calls within a single turn
-- Checkpoints and `/undo` built on git
-- MCP client support
-- A sandbox mode (container or seatbelt) for unattended runs
-- Retrieval over the repo for very large codebases
+MCP tools and local/Daytona tool placement are implemented. See
+[the simple architecture guide](HOW_IT_WORKS.md#tools-the-hands-rusty-uses),
+[Cloud](CLOUD.md), and the [README](../README.md) for their current behavior.
+Future directions should be checked against current source and open work.
