@@ -1726,8 +1726,9 @@ impl Agent {
                     Answer::Always => {
                         let rule = Policy::suggest_rule(name, args);
                         println!("  {}", ui::dim(&format!("allowing `{rule}` from now on (/permissions to undo)")));
-                        self.policy.allow.push(rule);
-                        self.policy.save();
+                        if let Err(e) = self.policy.update(|p| p.allow.push(rule)) {
+                            display::notice(&format!("rule not saved: {e:#}"));
+                        }
                         approval = Verdict::Allow;
                     }
                     Answer::No(None) => {

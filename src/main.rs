@@ -293,7 +293,7 @@ fn run() -> Result<i32> {
     let identity = PathBuf::from(backend.identity(&cwd));
     let pdir = project_dir(&identity);
     let global = config::config_dir().unwrap_or_default();
-    let policy = Policy::load(pdir.join("permissions.json"), mode);
+    let policy = Policy::load(pdir.join("permissions.json"), mode)?;
 
     // Each startup probe waits on something outside rusty (git, kubectl,
     // the memory daemon, the endpoint's model list) and none needs another,
@@ -1286,25 +1286,30 @@ fn permissions_cmd(agent: &mut Agent, rest: &str) {
             );
         }
         "allow" | "deny" if !arg.is_empty() => {
-            if sub == "allow" {
-                p.allow.push(arg.into())
-            } else {
-                p.deny.push(arg.into())
+            let rule = arg.to_string();
+            let saved = if sub == "allow" { p.update(|p| p.allow.push(rule)) } else { p.update(|p| p.deny.push(rule)) };
+            match saved {
+                Ok(()) => println!("  {sub} `{arg}`"),
+                Err(e) => println!("  {}", ui::warn(&format!("not saved: {e:#}"))),
             }
-            p.save();
-            println!("  {sub} `{arg}`");
         }
         "remove" if !arg.is_empty() => {
-            p.allow.retain(|r| r != arg);
-            p.deny.retain(|r| r != arg);
-            p.save();
-            println!("  removed `{arg}`");
+            match p.update(|p| {
+                p.allow.retain(|r| r != arg);
+                p.deny.retain(|r| r != arg);
+            }) {
+                Ok(()) => println!("  removed `{arg}`"),
+                Err(e) => println!("  {}", ui::warn(&format!("not saved: {e:#}"))),
+            }
         }
         "reset" => {
-            p.allow.clear();
-            p.deny.clear();
-            p.save();
-            println!("  rules cleared");
+            match p.update(|p| {
+                p.allow.clear();
+                p.deny.clear();
+            }) {
+                Ok(()) => println!("  rules cleared"),
+                Err(e) => println!("  {}", ui::warn(&format!("not saved: {e:#}"))),
+            }
         }
         "check" if !arg.is_empty() => {
             let args = serde_json::json!({"command": arg});
