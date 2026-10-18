@@ -751,6 +751,146 @@ fn bash_reply(command: &str) -> serde_json::Value {
     tool_reply("bash", serde_json::json!({"command": command}))
 }
 
+/// A private control channel owns this escaped pipe holder's lifetime. The
+/// fixture never stores or signals a PID; dropping STOP also releases it.
+#[cfg(unix)]
+struct CaptureHolder {
+    command: String,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    control: Option<std::thread::JoinHandle<bool>>,
+}
+#[cfg(unix)]
+impl CaptureHolder {
+    fn new(s: &Sandbox) -> Self {
+        use std::io::Read;
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        std::fs::set_permissions(&s.home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = s.home.join("capture.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let script = s.home.join("capture.py");
+        std::fs::write(
+            &script,
+            r#"import os,socket,sys
+r,w=os.pipe()
+if os.fork()==0:
+    os.close(r)
+    os.setsid()
+    control=socket.socket(socket.AF_UNIX)
+    control.settimeout(25)
+    control.connect(sys.argv[1])
+    control.sendall(b'READY')
+    os.write(w,b'x')
+    os.close(w)
+    try: control.recv(1)
+    finally: os._exit(0)
+os.close(w)
+os.read(r,1)
+os.close(r)
+print('launcher completed',flush=True)
+os._exit(0)
+"#,
+        )
+        .unwrap();
+        let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\"'\"'"));
+        let command = format!("python3 {} {}", quote(&script), quote(&socket));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let control = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            // Darwin can inherit the listener's nonblocking flag on accept.
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut ready = [0; 5];
+            stream.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"READY");
+            let _ = stopped.recv_timeout(Duration::from_secs(20));
+            // Probe before STOP: EOF would mean timeout/natural exit, not
+            // evidence that capture returned while a live holder owned pipes.
+            stream.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+            let mut byte = [0];
+            let live = matches!(stream.read(&mut byte), Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            if live {
+                stream.write_all(b"S").unwrap();
+                assert_eq!(stream.read(&mut byte).unwrap(), 0, "holder did not close its owned channel");
+            }
+            live
+        });
+        Self { command, stop: Some(stop), control: Some(control) }
+    }
+    fn finish(mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        assert!(self.control.take().unwrap().join().unwrap(), "holder must remain live until capture returned");
+    }
+}
+#[cfg(unix)]
+impl Drop for CaptureHolder {
+    fn drop(&mut self) {
+        self.stop.take(); // EOF releases the fixture on assertion failure too.
+        if let Some(control) = self.control.take() {
+            let _ = control.join();
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn completion_contract_cli_keeps_exit_zero_but_rejects_incomplete_fixed_check_capture() {
+    let ordinary = Sandbox::new("capture-ordinary");
+    let holder = CaptureHolder::new(&ordinary);
+    let (stdout, stderr, requests) = scripted_run(
+        &ordinary,
+        &["--mode", "standard", "--agents", "off", "--memory", "off", "--permissions", "yolo", "inspect"],
+        vec![bash_reply(&holder.command), text_reply("observed")],
+    );
+    holder.finish();
+    assert_eq!(requests.len(), 2);
+    let tool_results = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(tool_results.contains("exit code: 0"), "{tool_results}");
+    assert!(tool_results.contains("capture_complete: false"), "{tool_results}");
+    assert!(!tool_results.contains("timed out"), "{tool_results}");
+    assert!(!format!("{stdout}{stderr}").contains("timed out"));
+
+    let fixed = Sandbox::new("capture-fixed");
+    let holder = CaptureHolder::new(&fixed);
+    let (out, trace, _) = verified_run(
+        &fixed,
+        &holder.command,
+        vec![done_reply(), text_reply("capture remains incomplete")],
+        "standard",
+        "yolo",
+    );
+    holder.finish();
+    assert_eq!(out.status.code(), Some(2));
+    let records = trace["verification"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{trace}");
+    assert_eq!(records[0]["exit_code"], 0);
+    assert_eq!(records[0]["outcome"], "EvidenceUnavailable", "{trace}");
+    assert!(records[0]["observation_error"].as_str().unwrap().contains("capture"));
+    assert_ne!(trace["goal_outcome"], "verified");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
+}
+
 const FIXED_CHECK: &str = "python3 -c 'from calc import add; assert add(2,3)==5 and add(-2,3)==1'";
 
 fn verified_run(
