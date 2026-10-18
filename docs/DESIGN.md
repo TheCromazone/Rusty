@@ -57,8 +57,8 @@ terminal, shaped so each call returns as little as possible while still
 answering the question.
 
 1. **Locate before you read.** `search` (ripgrep, smart case, bounded display,
-   optional context lines and globs) answers "where": first which files match
-   (`output_mode: files_with_matches`), then the lines. `glob` answers "which
+   optional context lines and globs) answers "where", as matching lines, just the
+   names of matching files (`output_mode: files_with_matches`) or counts. `glob` answers "which
    files", newest first and without what `.gitignore` ignores, and `outline`
    answers "what's in here" with signatures and line numbers. Only then
    `read_file`, for a range. There is no embedding index to build or keep

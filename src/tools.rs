@@ -43,7 +43,7 @@ fn build_definitions() -> Value {
             "path": {"type": "string", "description": "Directory (default .)"},
             "max_depth": {"type": "integer", "description": "Default 3"}
         }), &[]),
-        tool("search", "Search file contents with ripgrep smart-case regex and default ignore rules. To find where something lives, start with output_mode files_with_matches, then read or search those files for lines. Reports scan completeness separately from output truncation. Without ripgrep, git grep or grep runs with reduced semantics and is marked incomplete. Retrieval is not acceptance evidence.", json!({
+        tool("search", "Search file contents with ripgrep smart-case regex and default ignore rules. Reports scan completeness separately from output truncation. Without ripgrep, git grep or grep runs with reduced semantics and is marked incomplete. Retrieval is not acceptance evidence.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory or file (default .)"},
             "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
