@@ -377,29 +377,38 @@ fn prepare_source(env: &Env, cpu: u8, memory: u8) -> Result<i32> {
 }
 
 fn extract_source_archive(archive: &[u8], dir: &Path) -> Result<()> {
-    let path = dir.join(".rusty-source.tar");
-    let result = (|| -> Result<()> {
-        let mut file = crate::privacy::private_file(&path, false)?;
-        std::io::Write::write_all(&mut file, archive)?;
-        drop(file);
-        // tar can exit after its end markers without reading all valid zero
-        // padding. A regular file avoids racing that exit with a pipe writer.
-        let status = std::process::Command::new("tar")
-            .arg("xf")
-            .arg(&path)
-            .arg("-C")
-            .arg(dir)
-            .stdin(std::process::Stdio::null())
-            .status()
-            .context("running tar")?;
-        if !status.success() {
-            bail!("extracting the source archive failed");
+    use std::os::unix::fs::DirBuilderExt;
+    // Keep staging beside the destination, never inside the source namespace.
+    // Exclusive creation ensures cleanup only owns a directory we created.
+    let destination = dir.canonicalize()?;
+    let parent = destination.parent().context("source extraction needs a parent directory")?;
+    let staging = parent.join(format!("rusty-source-archive-{}", super::digest::random_hex(16)));
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
-        Ok(())
-    })();
-    let removed = std::fs::remove_file(&path);
-    result?;
-    removed.context("removing the source archive")?;
+    }
+    let cleanup = Cleanup(staging);
+    let path = cleanup.0.join("archive.tar");
+    let mut file = crate::privacy::private_file(&path, false)?;
+    std::io::Write::write_all(&mut file, archive)?;
+    drop(file);
+    // tar can exit after its end markers without reading all valid zero
+    // padding. A regular file avoids racing that exit with a pipe writer.
+    let status = std::process::Command::new("tar")
+        .arg("xf")
+        .arg(&path)
+        .arg("-C")
+        .arg(&destination)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .context("running tar")?;
+    if !status.success() {
+        bail!("extracting the source archive failed");
+    }
+    std::fs::remove_dir_all(&cleanup.0).context("removing the source archive staging directory")?;
     Ok(())
 }
 
@@ -529,12 +538,13 @@ mod source_archive_tests {
         crate::privacy::private_dir(&input).unwrap();
         crate::privacy::private_dir(&output).unwrap();
         std::fs::write(input.join("tracked.txt"), b"complete source\n").unwrap();
+        std::fs::write(input.join(".rusty-source.tar"), b"legitimate tracked content\n").unwrap();
         let tar = std::process::Command::new("tar")
             .arg("cf")
             .arg("-")
             .arg("-C")
             .arg(&input)
-            .arg("tracked.txt")
+            .args([".rusty-source.tar", "tracked.txt"])
             .output()
             .unwrap();
         assert!(tar.status.success());
@@ -544,9 +554,16 @@ mod source_archive_tests {
         archive.resize(archive.len() + 2 * 1024 * 1024, 0);
         extract_source_archive(&archive, &output).unwrap();
         assert_eq!(std::fs::read(output.join("tracked.txt")).unwrap(), b"complete source\n");
-        assert!(!output.join(".rusty-source.tar").exists());
+        assert_eq!(std::fs::read(output.join(".rusty-source.tar")).unwrap(), b"legitimate tracked content\n");
+        let mut remaining: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        remaining.sort();
+        assert_eq!(remaining, [std::ffi::OsString::from("input"), std::ffi::OsString::from("output")]);
 
         assert!(extract_source_archive(b"not a tar archive", &output).is_err());
-        assert!(!output.join(".rusty-source.tar").exists());
+        assert_eq!(std::fs::read(output.join("tracked.txt")).unwrap(), b"complete source\n");
+        assert_eq!(std::fs::read(output.join(".rusty-source.tar")).unwrap(), b"legitimate tracked content\n");
+        let mut remaining: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        remaining.sort();
+        assert_eq!(remaining, [std::ffi::OsString::from("input"), std::ffi::OsString::from("output")]);
     }
 }
