@@ -5438,3 +5438,232 @@ fn listing_an_empty_memory_store_is_explicit() {
         "{result}"
     );
 }
+
+fn integration_repo(s: &Sandbox) {
+    for args in [
+        vec!["init", "-q"],
+        vec!["remote", "add", "origin", "git@github.com:fork/project.git"],
+        vec!["remote", "add", "upstream", "https://github.com/base/project.git"],
+    ] {
+        assert!(Command::new("git").args(args).current_dir(&s.project).status().unwrap().success());
+    }
+}
+
+#[test]
+fn native_integrations_configure_a_project_without_a_model_key_and_target_the_selected_remote() {
+    let s = Sandbox::new("native-integrations");
+    integration_repo(&s);
+    s.fake(
+        "gh",
+        "printf '%s\\n' '[{\"number\":7,\"title\":\"review\",\"headRefName\":\"feature\",\"baseRefName\":\"main\"}]'",
+    );
+    let out = s
+        .cmd()
+        .env_remove("NVIDIA_API_KEY")
+        .args(["--integrations", "configure", "github", "upstream"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("base/project"));
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").args(["--integrations", "prs"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("headRefName"));
+    assert!(s.calls().contains("gh pr list --repo github.com/base/project --limit 20"), "{}", s.calls());
+    assert!(!s.calls().contains("auth login"));
+    let out = s.repl_off(&["/integrations status", "/git diff", "/exit"]);
+    assert!(out.contains("github.com/base/project"), "{out}");
+    let out = s.repl_off(&["/permissions deny gh", "/integrations prs", "/git push", "/exit"]);
+    assert!(out.contains("refused by permissions"), "{out}");
+    assert!(out.contains("native Git views"), "{out}");
+    assert_eq!(s.calls().lines().filter(|l| l.starts_with("gh pr list")).count(), 1);
+}
+
+#[test]
+fn native_integrations_support_self_hosted_gitlab_and_fail_closed_for_missing_bitbucket_auth() {
+    let s = Sandbox::new("native-gitlab");
+    integration_repo(&s);
+    assert!(Command::new("git")
+        .args(["remote", "set-url", "origin", "ssh://git@git.company.test/group/sub/repo.git"])
+        .current_dir(&s.project)
+        .status()
+        .unwrap()
+        .success());
+    s.fake("glab", "printf '%s\\n' '[{\"iid\":3,\"source_branch\":\"feature\",\"target_branch\":\"main\"}]'");
+    let out = s.cmd().args(["--integrations", "prs"]).output().unwrap();
+    assert!(!out.status.success());
+    let out = s.cmd().args(["--integrations", "configure", "gitlab"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = s.cmd().args(["--integrations", "prs"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        s.calls().contains("glab mr list --repo https://git.company.test/group/sub/repo --per-page 20 --output json"),
+        "{}",
+        s.calls()
+    );
+    let out = s.cmd().args(["--integrations", "setup"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("glab auth login --hostname 'git.company.test'"));
+    assert!(Command::new("git")
+        .args(["remote", "set-url", "origin", "git@bitbucket.org:workspace/repo.git"])
+        .current_dir(&s.project)
+        .status()
+        .unwrap()
+        .success());
+    let out = s.cmd().args(["--integrations", "configure", "auto"]).output().unwrap();
+    assert!(out.status.success());
+    let out = s
+        .cmd()
+        .env_remove("BITBUCKET_ACCESS_TOKEN")
+        .env_remove("BITBUCKET_EMAIL")
+        .env_remove("BITBUCKET_API_TOKEN")
+        .args(["--integrations", "check"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("BITBUCKET_ACCESS_TOKEN"));
+    let out = s.cmd().args(["--integrations", "configure", "unknown"]).output().unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn native_integration_auth_failures_are_redacted_and_credentials_are_never_persisted() {
+    let s = Sandbox::new("native-auth-failure");
+    integration_repo(&s);
+    s.fake("gh", "echo 'NVIDIA_API_KEY=nvapi-abcdefghijklmnop1234567890' >&2; exit 1");
+    let out = s.cmd().args(["--integrations", "check"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("nvapi-abcdefghijklmnop1234567890"), "{stderr}");
+    assert!(s.calls().contains("gh auth status --hostname github.com"));
+    assert!(!s.calls().contains("auth login"));
+    let out = s.cmd().args(["--integrations", "configure", "github", "origin"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut files = Vec::new();
+    find_files(&s.home, "json", &mut files);
+    let saved = files.iter().find(|p| p.file_name().unwrap() == "integrations.json").unwrap();
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(saved).unwrap()).unwrap();
+    assert_eq!(config, serde_json::json!({"provider":"github", "remote":"origin"}));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(saved.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn native_integrations_refuse_malformed_permission_rules_before_host_or_config_actions() {
+    let s = Sandbox::new("native-invalid-policy");
+    integration_repo(&s);
+    s.fake("gh", "exit 0");
+    let out = s.cmd().args(["--integrations", "configure", "github"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut files = Vec::new();
+    find_files(&s.home, "json", &mut files);
+    let config = files.iter().find(|p| p.file_name().unwrap() == "integrations.json").unwrap();
+    std::fs::write(config.with_file_name("permissions.json"), "{").unwrap();
+    for args in [vec!["--integrations", "check"], vec!["--integrations", "mcp", "add", "blocked", "/bin/true"]] {
+        let out = s.cmd().args(args).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("permissions"));
+    }
+    assert!(!s.calls().contains("gh auth"));
+    assert!(!s.project.join(".mcp.json").exists());
+}
+
+#[test]
+fn unified_mcp_setup_preserves_other_servers_and_never_launches_on_add_or_list() {
+    let s = Sandbox::new("native-mcp-setup");
+    let path = s.project.join(".mcp.json");
+    std::fs::write(&path, r#"{"mcpServers":{"existing":{"command":"unavailable-existing-server","env":{"TOKEN":"keep-this-secret"}}},"custom":{"preserve":true}}"#).unwrap();
+    s.fake("new-server", "printf started > launched");
+    let out = s
+        .cmd()
+        .env_remove("NVIDIA_API_KEY")
+        .args(["--integrations", "mcp", "add", "new", "new-server", "path with spaces"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(cfg["mcpServers"]["existing"]["env"]["TOKEN"], "keep-this-secret");
+    assert_eq!(cfg["custom"]["preserve"], true);
+    assert_eq!(cfg["mcpServers"]["new"]["args"][0], "path with spaces");
+    assert_eq!(cfg["mcpServers"]["new"]["required"], false);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"required\": true"));
+    let out = s.cmd().args(["--integrations", "mcp", "list"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("existing") && text.contains("new") && !text.contains("keep-this-secret"));
+    assert!(!s.project.join("launched").exists());
+    assert!(!s.calls().contains("new-server"));
+    let out =
+        s.cmd().args(["--permissions", "read-only", "--integrations", "mcp", "remove", "existing"]).output().unwrap();
+    assert!(!out.status.success());
+    let unchanged = std::fs::read(&path).unwrap();
+    let out = s.cmd().args(["--integrations", "mcp", "add", "new", "replacement"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), unchanged);
+    let out = s.cmd().args(["--integrations", "mcp", "remove", "new"]).output().unwrap();
+    assert!(out.status.success());
+    let out = s
+        .cmd()
+        .args(["--integrations", "mcp", "add", "gh", "--", "--env", "GH_TOKEN", "gh-server", "--verbose"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        cfg["mcpServers"]["gh"],
+        serde_json::json!({"command":"gh-server","args":["--verbose"],"required":false,"env":{"GH_TOKEN":"${GH_TOKEN}"}})
+    );
+    let out = s
+        .cmd()
+        .args(["--integrations", "mcp", "add", "leak", "--", "gh-server", "--token=abcdefghijklmnop"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("abcdefghijklmnop"));
+}
+
+#[test]
+fn unified_mcp_health_check_cannot_mark_an_unavailable_optional_server_healthy() {
+    let s = Sandbox::new("native-mcp-health");
+    std::fs::write(
+        s.project.join(".mcp.json"),
+        r#"{"mcpServers":{"broken":{"command":"not-an-installed-mcp-server"}}}"#,
+    )
+    .unwrap();
+    let out = s.cmd().env_remove("NVIDIA_API_KEY").args(["--integrations", "mcp", "check"]).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("all_connected") && err.contains("start_failed"), "{err}");
+    std::fs::write(s.project.join(".mcp.json"), "not json").unwrap();
+    let out = s.cmd().args(["--integrations", "mcp", "add", "new", "anything"]).output().unwrap();
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read_to_string(s.project.join(".mcp.json")).unwrap(), "not json");
+}
+
+#[test]
+fn concurrent_mcp_configuration_adds_preserve_every_server_across_profiles() {
+    let s = Sandbox::new("native-mcp-concurrent");
+    let mut children = Vec::new();
+    for n in 0..8 {
+        children.push(
+            s.cmd()
+                .env("RUSTY_HOME", s.home.join(format!("profile-{n}")))
+                .env_remove("NVIDIA_API_KEY")
+                .args(["--integrations", "mcp", "add", &format!("server{n}"), "/bin/true"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let out = wait(child, Duration::from_secs(30));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(s.project.join(".mcp.json")).unwrap()).unwrap();
+    let servers = config["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 8);
+    for n in 0..8 {
+        assert_eq!(servers[&format!("server{n}")]["command"], "/bin/true");
+    }
+    assert!(!s.project.join(".mcp.json.pending").exists());
+}

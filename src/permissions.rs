@@ -229,6 +229,13 @@ pub fn classify(tool: &str, args: &Value, cwd: &Path) -> Class {
         "read_file" if credential_file(args["path"].as_str().unwrap_or("")) => {
             risky(format!("reads credentials: {}", args["path"].as_str().unwrap_or("")))
         }
+        "integration_read" => {
+            if args["provider"] == "bitbucket" && matches!(args["operation"].as_str(), Some("check" | "prs")) {
+                Class::ReadOnly
+            } else {
+                risky("unsupported integration operation")
+            }
+        }
         "bash" => classify_command(args["command"].as_str().unwrap_or(""), cwd),
         t if crate::mcp::Mcp::is_tool(t) => crate::mcp::classify(t),
         // Reading, searching, memory and planning tools never need a prompt.
