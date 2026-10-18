@@ -1890,7 +1890,7 @@ impl Agent {
                     println!("{} {}", ui::info("▸"), tools::summary(name, args));
                 }
                 print!("{}", tools::preview(name, args));
-                match ask_user(&why, true) {
+                match ask_user(&why, true, &self.cwd) {
                     Answer::Yes | Answer::Always => {}
                     Answer::No(None) => {
                         self.refused(name, args, "declined", &why);
@@ -1916,7 +1916,7 @@ impl Agent {
                     println!("{} {}", ui::info("▸"), tools::summary(name, args));
                 }
                 print!("{}", tools::preview(name, args));
-                match ask_user(&why, false) {
+                match ask_user(&why, false, &self.cwd) {
                     Answer::Yes => {}
                     Answer::Always => {
                         let rule = Policy::suggest_rule(name, args);
@@ -2561,6 +2561,7 @@ impl Agent {
                      how many seconds to wait before the next run, or stop=true if nothing is left to do.)"
                 ),
             };
+            crate::ping::turn_started();
             if let Err(e) = self.run_turn(&text) {
                 break Err(e);
             }
@@ -3223,7 +3224,7 @@ fn unattended_destructive(mode: crate::permissions::Mode) -> bool {
 /// Asks for approval. Uses line editing so Ctrl-C cleanly means "no, stop".
 /// Asks the person at the keyboard. A destructive call can only be approved
 /// once, by typing `yes` in full, and never in a session nobody is watching.
-fn ask_user(why: &str, destructive: bool) -> Answer {
+fn ask_user(why: &str, destructive: bool, cwd: &std::path::Path) -> Answer {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return Answer::No(Some(if destructive {
@@ -3236,6 +3237,7 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
             "non-interactive session; the call needs approval".into()
         }));
     }
+    crate::ping::notify(crate::ping::Outcome::NeedsApproval, cwd);
     if destructive {
         println!("  {} {}", ui::err("‼ can't be undone:"), why);
         let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));

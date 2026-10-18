@@ -19,6 +19,7 @@ mod llm;
 mod markdown;
 mod mcp;
 mod permissions;
+mod ping;
 mod session;
 mod side;
 mod signal;
@@ -409,6 +410,7 @@ fn run() -> Result<i32> {
     };
     agent.agents = settings.agents.clone();
     agent.tips = settings.tips;
+    ping::set(&settings.ping);
     agent.model_override = cli.model.clone();
     agent.delegation_override =
         cli.agents.is_some() || settings.delegation_override || settings.agents.mode != AgentsMode::Off;
@@ -501,12 +503,18 @@ fn run() -> Result<i32> {
                         verification::CheckSpec::new(command, cli.verify_timeout)?.pin_files(&cwd, &cli.verify_file)?,
                     );
                 }
-                agent.run_goal(Some(goal))
+                ping::turn_started();
+                let result = agent.run_goal(Some(goal));
+                ping::notify(ping::Outcome::of_goal(agent.goal_outcome(), result.is_err()), &cwd);
+                result
             }
             None => {
                 let input = cli.prompt.join(" ");
                 let input = expand_skill(&cwd, &input).unwrap_or(input);
-                agent.run_turn(&input).map(|_| ())
+                ping::turn_started();
+                let result = agent.run_turn(&input).map(|_| ());
+                ping::notify(ping::Outcome::of_turn(result.is_err()), &cwd);
+                result
             }
         };
         agent.save_session()?;
@@ -767,7 +775,10 @@ fn repl(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut Sett
                 Ok(())
             })()
         } else {
-            agent.run_turn(&input).map(|_| ())
+            ping::turn_started();
+            let result = agent.run_turn(&input).map(|_| ());
+            ping::notify(ping::Outcome::of_turn(result.is_err()), cwd);
+            result
         };
         drop(typing);
         hold_queued |= signal::interrupted();
@@ -1054,6 +1065,27 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 settings.save();
             }
         }
+        "/ping" => {
+            if rest.is_empty() || !ping::set(rest) {
+                println!(
+                    "  ping {} {}",
+                    ui::bold(ping::mode()),
+                    ui::dim(&format!("({}; after turns of 10s or more)", ping::MODES.join(" · ")))
+                );
+            } else {
+                settings.ping = rest.to_string();
+                settings.save();
+                println!("  ping {}", ui::bold(ping::mode()));
+                // Terminal.app ignores the notification escape; its bell can
+                // badge or bounce the dock icon (Settings, Profiles, Advanced).
+                if rest == "on" && std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "Apple_Terminal") {
+                    println!(
+                        "{}",
+                        ui::dim("  Terminal.app shows no notification for this; /ping sound uses the bell instead")
+                    );
+                }
+            }
+        }
         "/tips" => {
             agent.tips = match rest {
                 "off" => false,
@@ -1166,8 +1198,13 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                 agent.goal = None;
                 println!("{}", ui::dim("  goal cleared"));
             }
-            "resume" | "continue" => agent.run_goal(None)?,
-            objective => agent.run_goal(Some(objective))?,
+            objective => {
+                let objective = (!matches!(objective, "resume" | "continue")).then_some(objective);
+                ping::turn_started();
+                let result = agent.run_goal(objective);
+                ping::notify(ping::Outcome::of_goal(agent.goal_outcome(), result.is_err()), cwd);
+                result?
+            }
         },
         "/loop" => match parse_loop(rest) {
             Some((interval, max, prompt)) => agent.run_loop(&prompt, interval, max)?,

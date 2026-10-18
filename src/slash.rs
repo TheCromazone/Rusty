@@ -191,6 +191,13 @@ pub const COMMANDS: &[Command] = &[
         &[("compact", ""), ("rust", ""), ("block", ""), ("thin", ""), ("classic", "")],
     ),
     with("/tips", "[on|off]", "show or hide tips", "setup", &[("on", ""), ("off", "")]),
+    with(
+        "/ping",
+        "[off|on|sound]",
+        "notify when a long turn ends",
+        "setup",
+        &[("off", ""), ("on", "desktop notification"), ("sound", "notification and bell")],
+    ),
     cmd("/settings", "", "everything saved for next time", "setup"),
     cmd("/skills", "", "built-in and your own skills", "setup"),
     cmd("/yolo", "", "permissions to yolo for this session", "setup"),

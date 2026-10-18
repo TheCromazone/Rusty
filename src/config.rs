@@ -244,6 +244,8 @@ pub struct Settings {
     pub font: String,
     pub view: String,
     pub tips: bool,
+    /// Ping when a long turn ends: off, on (desktop notification) or sound.
+    pub ping: String,
     pub agents: AgentsConfig,
     /// None means rusty picks per request.
     pub execution_mode: Option<crate::execution::ExecutionMode>,
@@ -270,6 +272,7 @@ impl Default for Settings {
             font: "compact".into(),
             view: "default".into(),
             tips: true,
+            ping: "off".into(),
             agents: AgentsConfig::default(),
             execution_mode: None,
             delegation_override: false,
