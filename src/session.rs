@@ -872,6 +872,8 @@ mod tests {
                 Command::new(&exe)
                     .args(["--exact", "session::tests::index_writer_child_entry", "--nocapture"])
                     .env("RUSTY_TEST_SESSION_INDEX_DIR", &dir)
+                    // The parent's libtest JSON stream must contain only parent events.
+                    .stdout(std::process::Stdio::null())
                     .spawn()
                     .unwrap()
             })
