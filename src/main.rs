@@ -52,7 +52,7 @@ struct Cli {
     #[arg(long)]
     integrations: bool,
 
-    /// Tool location: local or daytona (reasoning and memory stay in this process)
+    /// Tool location: local, daytona or ssh (reasoning and memory stay in this process)
     #[arg(long, env = "RUSTY_TOOLS")]
     tools: Option<String>,
 
@@ -563,7 +563,7 @@ fn capabilities() -> serde_json::Value {
         "mode": modes,
         "agents": accepted(&["off", "sub", "swarm", "auto"], &|v| AgentsMode::parse(v).is_some()),
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
-        "tools": ["local", "daytona"],
+        "tools": ["local", "daytona", "ssh"],
         "toolset": ["full", "shell"],
         "verify": {"supported": true, "timeout_secs": [1, 600]},
         "integrations": {"flag": true, "hosts": ["github", "gitlab", "bitbucket-cloud"], "git_views": ["status", "diff", "log"], "mcp_management": ["list", "add", "remove", "check"]},
@@ -939,8 +939,8 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         }
         "/tools" => {
             if !rest.is_empty() {
-                if !matches!(rest, "local" | "daytona") {
-                    return Err(anyhow!("tool placement must be local or daytona"));
+                if !matches!(rest, "local" | "daytona" | "ssh") {
+                    return Err(anyhow!("tool placement must be local, daytona or ssh"));
                 }
                 settings.tools = rest.into();
                 settings.save();

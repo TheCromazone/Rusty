@@ -488,7 +488,7 @@ impl Agent {
     }
 
     pub fn set_backend(&mut self, backend: crate::backend::Backend) -> Result<()> {
-        if backend.name() == "daytona" {
+        if backend.name() != "local" {
             let description = backend.initial_description();
             self.cwd = backend.cwd(&self.cwd);
             self.project_notes = description["notes"].as_str().unwrap_or("").to_string();
@@ -535,7 +535,7 @@ impl Agent {
         } else {
             self.agents.swarm_max
         };
-        if self.backend.name() == "daytona" {
+        if self.backend.name() != "local" {
             cap.min(8)
         } else {
             cap

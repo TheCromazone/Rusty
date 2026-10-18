@@ -561,3 +561,113 @@ fn the_hybrid_command_runs_local_rusty_against_remote_tools() {
     assert!(!h.api.requests().iter().any(|r| r.method == "DELETE" || r.target.contains("/start")));
     h.api.assert_ok();
 }
+
+/// The SSH transport substitutes only the OpenSSH process; everything above
+/// it (CLI, bridge, permissions, tools and scripted swarm) is real.
+#[test]
+fn ssh_keeps_reasoning_local_and_edits_only_the_attached_workspace() {
+    use rusty::cloud::shell::quote;
+    let h = Hybrid::new("ssh-cli");
+    let initial_daytona_calls = h.api.requests().len();
+    let (server, shared) = model();
+    let bin = h.tmp.path().join("ssh-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let remote_bin = Path::new(RUSTY).parent().unwrap();
+    write_exec(
+        &bin.join("ssh"),
+        &format!(
+            r#"#!/bin/sh
+set -eu
+# The transport must not leak model keys to ssh, even through SendEnv.
+test -z "${{NVIDIA_API_KEY+x}}"
+test -z "${{DAYTONA_API_KEY+x}}"
+printf '%s\n' "$@" > {}
+exec env -i HOME={} PATH={} RUSTY_NO_DOTENV=1 /bin/bash -s
+"#,
+            quote(h.tmp.path().join("ssh-args").to_str().unwrap()),
+            quote(h.tmp.path().join("remote-home").to_str().unwrap()),
+            quote(&format!("{}:/usr/bin:/bin", remote_bin.display()))
+        ),
+    );
+    let trace = h.tmp.path().join("ssh.json");
+    let out = wait(
+        Command::new(CLOUD)
+            .current_dir(&h.host)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", &h.home)
+            .env("RUSTY_HOME", &h.home)
+            .env("RUSTY_NO_DOTENV", "1")
+            .env("NVIDIA_API_KEY", "offline-model-key")
+            .env("DAYTONA_API_KEY", "must-not-travel")
+            .env("NO_COLOR", "1")
+            .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
+            .args(["ssh", "--host", "user@offline-box", "--workspace", h.remote.to_str().unwrap()])
+            .args(["--local-binary", RUSTY, "--agents", "swarm", "--memory-mode", "off", "--trajectory"])
+            .arg(&trace)
+            .args(["--prompt", "Inspect with three workers then fix the function and verify."])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(60),
+    );
+    assert_model_ok(&shared);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(std::fs::read_to_string(h.remote.join("result.txt")).unwrap(), "checked");
+    assert!(!h.host.join("note.txt").exists());
+    let trace: Value = serde_json::from_str(&std::fs::read_to_string(trace).unwrap()).unwrap();
+    assert!(trace["tools_location"].as_str().unwrap().starts_with("ssh · user@offline-box"));
+    let args = std::fs::read_to_string(h.tmp.path().join("ssh-args")).unwrap();
+    assert!(args.contains("-oBatchMode=yes\n") && args.contains("-oStrictHostKeyChecking=yes\n"));
+    assert!(!args.contains("offline-model-key") && !args.contains("must-not-travel"));
+    assert_eq!(h.api.requests().len(), initial_daytona_calls, "SSH must not contact Daytona");
+}
+
+#[test]
+fn ssh_connection_failure_is_terminal_and_does_not_expose_stderr() {
+    let h = Hybrid::new("ssh-failure");
+    let initial = h.api.requests().len();
+    let bin = h.tmp.path().join("ssh-bin");
+    std::fs::create_dir(&bin).unwrap();
+    write_exec(&bin.join("ssh"), "#!/bin/sh\necho credential-canary >&2\nsleep 30 &\nexit 255\n");
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = calls.clone();
+    let server = serve(Arc::new(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Response::json(500, json!({}))
+    }));
+    let started = Instant::now();
+    let out = Command::new(CLOUD)
+        .current_dir(&h.host)
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("HOME", &h.home)
+        .env("RUSTY_HOME", &h.home)
+        .env("RUSTY_NO_DOTENV", "1")
+        .env("NVIDIA_API_KEY", "offline-model-key")
+        .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
+        .args([
+            "ssh",
+            "--host",
+            "offline-box",
+            "--workspace",
+            h.remote.to_str().unwrap(),
+            "--local-binary",
+            RUSTY,
+            "--memory-mode",
+            "off",
+            "--prompt",
+            "write a local fallback file",
+        ])
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5), "an SSH descendant retained the output pipe");
+    assert!(!out.status.success());
+    assert!(!text(&out).contains("credential-canary"));
+    assert!(text(&out).contains("no local fallback"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(h.api.requests().len(), initial);
+    assert!(!h.host.join("note.txt").exists());
+}

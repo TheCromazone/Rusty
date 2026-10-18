@@ -72,6 +72,8 @@ enum Command {
     Run(RunArgs),
     /// Local reasoning/memory + Daytona tools; attach only, no new sandbox
     Hybrid(HybridArgs),
+    /// Local reasoning/memory + tools on an existing Linux SSH host
+    Ssh(super::ssh::Args),
     /// Is it still working?
     Status(RunRef),
     /// Follow the output, then export
@@ -194,12 +196,13 @@ fn dispatch(env: &Env, command: Command) -> Result<i32> {
         }
         Command::Run(args) => run(env, &runs, args),
         Command::Hybrid(args) => {
-            hybrid::command(&args)?; // Validate before any API call.
+            hybrid::command(&args, "daytona")?; // Validate before any API call.
             let d = env.client(None)?;
             let sandbox = d.sandbox(&args.sandbox)?;
             let remote: Arc<dyn Remote> = Arc::new(d.remote(&sandbox)?);
             hybrid::attach(&sandbox.state, remote, &args, &mut hybrid::run_child)
         }
+        Command::Ssh(args) => super::ssh::attach(args),
         Command::Status(r) => status(env, &runs, &r.run),
         Command::Logs(r) => {
             let (d, remote, mut state) = reconnect(env, &runs, &r.run)?;
