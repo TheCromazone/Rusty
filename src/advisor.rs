@@ -251,13 +251,25 @@ pub const SAVED_PREFIX: &str = "saved memory ";
 /// What `remember` answers when a near-duplicate was already on file and
 /// only its anchors were refreshed.
 pub const KNOWN_PREFIX: &str = "already saved ";
+// Offline process fixtures scale deadlines together under scheduler load.
+// Release builds contain neither this lookup nor a changed duration.
+fn deadline(ms: u64) -> Duration {
+    #[cfg(debug_assertions)]
+    let ms = std::env::var("RUSTY_TEST_TIME_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| (1..=1000).contains(n))
+        .map_or(ms, |n| ms.saturating_mul(n));
+    Duration::from_millis(ms)
+}
+
 pub fn rpc(socket: &Path, req: &Request) -> Result<Response> {
     let mut stream = UnixStream::connect(socket)?;
     // Hooks still return after HOOK_MS. Explicit management may flush SQLite
     // or transfer a snapshot, so its transport must honor the control budget.
     let transport_ms = if matches!(req.op.as_str(), "begin" | "event" | "finish" | "advice") { 200 } else { 1000 };
-    stream.set_read_timeout(Some(Duration::from_millis(transport_ms)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(transport_ms)))?;
+    stream.set_read_timeout(Some(deadline(transport_ms)))?;
+    stream.set_write_timeout(Some(deadline(transport_ms)))?;
     let mut body = serde_json::to_vec(req)?;
     if body.len() > if req.op == "import" { TRANSFER } else { FRAME } {
         bail!("memory frame too large");
@@ -327,7 +339,7 @@ impl Hooks {
                 .context("install rusty-memoryd alongside rusty")?;
             let start = Instant::now();
             while UnixStream::connect(&socket).is_err() {
-                if child.try_wait()?.is_some() || start.elapsed() > Duration::from_secs(2) {
+                if child.try_wait()?.is_some() || start.elapsed() > deadline(2000) {
                     bail!("memory daemon did not start");
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -364,12 +376,8 @@ impl Hooks {
             data,
         };
         let (tx, rx) = mpsc::channel();
-        let result = self
-            .tx
-            .try_send((req, tx))
-            .ok()
-            .and_then(|_| rx.recv_timeout(Duration::from_millis(ms)).ok())
-            .and_then(Result::ok);
+        let result =
+            self.tx.try_send((req, tx)).ok().and_then(|_| rx.recv_timeout(deadline(ms)).ok()).and_then(Result::ok);
         self.metrics.hooks += 1;
         let us = start.elapsed().as_micros() as u64;
         self.metrics.hook_us += us;
@@ -1320,8 +1328,7 @@ pub fn serve(home: &Path) -> Result<()> {
         let Ok(mut stream) = stream else {
             continue;
         };
-        if stream.set_read_timeout(Some(Duration::from_millis(50))).is_err()
-            || stream.set_write_timeout(Some(Duration::from_millis(50))).is_err()
+        if stream.set_read_timeout(Some(deadline(50))).is_err() || stream.set_write_timeout(Some(deadline(50))).is_err()
         {
             continue;
         }
