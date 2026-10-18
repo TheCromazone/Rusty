@@ -1,4 +1,4 @@
-{"instance_id":"fixture-host-1","kind":"hello","payload":{"inspect_only":false,"phase":"starting","protocol":1,"protocol_capabilities":["message.submit","run.cancel","snapshot","approval.decide","shutdown"],"schema_hash":"380d7310d9fe1d1c92a284a55f117eb8d50b66556b9589d88f2dd4d3b774413f","worker_instance_id":"fixture-host-1"},"protocol":1,"seq":1}
+{"instance_id":"fixture-host-1","kind":"hello","payload":{"inspect_only":false,"phase":"starting","protocol":1,"protocol_capabilities":["message.submit","run.cancel","snapshot","approval.decide","shutdown"],"schema_hash":"d23086cb0d459c05f8dd8f5d731a0e768edd87ea69b89088becf566c8bd4c0ad","worker_instance_id":"fixture-host-1"},"protocol":1,"seq":1}
 {"method":"message.submit","params":{"text":"Fix café 🦀\nthen test"},"protocol":1,"request_id":"submit-1"}
 {"method":"run.cancel","params":{"run_id":"run-1"},"protocol":1,"request_id":"cancel-1"}
 {"method":"approval.decide","params":{"allowed":true,"approval_id":"approval-1","operation_digest":"sha256:fixture-operation","typed":"yes"},"protocol":1,"request_id":"approve-1"}

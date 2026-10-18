@@ -86,15 +86,28 @@ public extension Request {
     func command() throws -> Command {
         guard self.protocol == protocolVersion else { throw FramingError.unsupportedVersion }
         guard !request_id.isEmpty && request_id.utf8.count <= 128 && request_id.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [46, 95, 58, 45].contains($0) }) else { throw FramingError.invalidFrame }
+        guard case .object(let fields) = params else { throw FramingError.invalidFrame }
         let data = try JSONEncoder().encode(params)
         let decoder = JSONDecoder()
         switch method {
-        case "message.submit": return .MessageSubmit(try decoder.decode(SubmitParams.self, from: data))
-        case "run.cancel": return .Cancel(try decoder.decode(CancelParams.self, from: data))
-        case "approval.decide": return .ApprovalDecide(try decoder.decode(ApprovalParams.self, from: data))
-        case "snapshot": return .Snapshot(try decoder.decode(EmptyParams.self, from: data))
-        case "inspect": return .Inspect(try decoder.decode(InspectParams.self, from: data))
-        case "shutdown": return .Shutdown(try decoder.decode(EmptyParams.self, from: data))
+        case "message.submit":
+            guard Set(fields.keys).isSubset(of: Set<String>(["text"])) else { throw FramingError.invalidFrame }
+            return .MessageSubmit(try decoder.decode(SubmitParams.self, from: data))
+        case "run.cancel":
+            guard Set(fields.keys).isSubset(of: Set<String>(["run_id"])) else { throw FramingError.invalidFrame }
+            return .Cancel(try decoder.decode(CancelParams.self, from: data))
+        case "approval.decide":
+            guard Set(fields.keys).isSubset(of: Set<String>(["approval_id","allowed","operation_digest","typed"])) else { throw FramingError.invalidFrame }
+            return .ApprovalDecide(try decoder.decode(ApprovalParams.self, from: data))
+        case "snapshot":
+            guard Set(fields.keys).isSubset(of: Set<String>([])) else { throw FramingError.invalidFrame }
+            return .Snapshot(try decoder.decode(EmptyParams.self, from: data))
+        case "inspect":
+            guard Set(fields.keys).isSubset(of: Set<String>(["operation","arguments"])) else { throw FramingError.invalidFrame }
+            return .Inspect(try decoder.decode(InspectParams.self, from: data))
+        case "shutdown":
+            guard Set(fields.keys).isSubset(of: Set<String>([])) else { throw FramingError.invalidFrame }
+            return .Shutdown(try decoder.decode(EmptyParams.self, from: data))
         default: throw FramingError.invalidFrame
         }
     }
@@ -425,4 +438,4 @@ public enum JSONValue: Codable, Equatable, Sendable {
     }
 }
 
-public let protocolSchemaHash = "380d7310d9fe1d1c92a284a55f117eb8d50b66556b9589d88f2dd4d3b774413f"
+public let protocolSchemaHash = "d23086cb0d459c05f8dd8f5d731a0e768edd87ea69b89088becf566c8bd4c0ad"

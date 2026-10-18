@@ -91,6 +91,24 @@ final class ProtocolTests: XCTestCase {
             XCTAssertTrue(kinds.contains(kind), "missing \(kind)")
         }
     }
+    func testEveryCommandRejectsUnknownParameterKeys() throws {
+        let cases: [(String, [String: JSONValue])] = [
+            ("message.submit", ["text": .string("hello")]),
+            ("run.cancel", ["run_id": .string("run")]),
+            ("approval.decide", ["approval_id": .string("a"), "operation_digest": .string("d"), "allowed": .bool(true)]),
+            ("snapshot", [:]),
+            ("inspect", ["operation": .string("tree.snapshot"), "arguments": .object([:])]),
+            ("shutdown", [:]),
+        ]
+        for (method, params) in cases {
+            let valid = Request(protocol: 1, request_id: "key-test", method: method, params: .object(params))
+            XCTAssertNoThrow(try valid.command(), "valid \(method)")
+            var extra = params
+            extra["unexpected_authority"] = .bool(true)
+            let invalid = Request(protocol: 1, request_id: "key-test", method: method, params: .object(extra))
+            XCTAssertThrowsError(try invalid.command(), "extra field in \(method)")
+        }
+    }
     func testRequestIdsAndTypedPayloadsFailClosed() throws {
         for id in ["", String(repeating: "x", count: 129), "line\nbreak", "café", "a/b", "a b"] {
             let request = Request(protocol: 1, request_id: id, method: "snapshot", params: .object([:]))

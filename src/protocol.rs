@@ -19,6 +19,8 @@ macro_rules! wire_struct {
         pub struct $name { $(pub $field: $ty),* }
         #[cfg(test)]
         impl $name {
+            #[allow(dead_code)] // Only command params need strict key validation.
+            fn swift_keys() -> &'static [&'static str] { &[$(stringify!($field)),*] }
             fn swift() -> String {
                 let mut s = format!("public struct {}: Codable, Equatable, Sendable {{\n", stringify!($name));
                 $(s.push_str(&format!("    public var `{}`: {}\n", stringify!($field), $swift));)*
@@ -116,8 +118,8 @@ macro_rules! commands {
         fn swift_commands() -> String {
             let mut s = String::from("public enum Command: Equatable, Sendable {\n");
             $(s.push_str(&format!("    case {}({})\n", stringify!($variant), stringify!($params)));)*
-            s.push_str("}\n\npublic extension Request {\n    func command() throws -> Command {\n        guard self.protocol == protocolVersion else { throw FramingError.unsupportedVersion }\n        guard !request_id.isEmpty && request_id.utf8.count <= 128 && request_id.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [46, 95, 58, 45].contains($0) }) else { throw FramingError.invalidFrame }\n        let data = try JSONEncoder().encode(params)\n        let decoder = JSONDecoder()\n        switch method {\n");
-            $(s.push_str(&format!("        case \"{}\": return .{}(try decoder.decode({}.self, from: data))\n", $method, stringify!($variant), stringify!($params)));)*
+            s.push_str("}\n\npublic extension Request {\n    func command() throws -> Command {\n        guard self.protocol == protocolVersion else { throw FramingError.unsupportedVersion }\n        guard !request_id.isEmpty && request_id.utf8.count <= 128 && request_id.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [46, 95, 58, 45].contains($0) }) else { throw FramingError.invalidFrame }\n        guard case .object(let fields) = params else { throw FramingError.invalidFrame }\n        let data = try JSONEncoder().encode(params)\n        let decoder = JSONDecoder()\n        switch method {\n");
+            $(s.push_str(&format!("        case \"{}\":\n            guard Set(fields.keys).isSubset(of: Set<String>({})) else {{ throw FramingError.invalidFrame }}\n            return .{}(try decoder.decode({}.self, from: data))\n", $method, serde_json::to_string($params::swift_keys()).unwrap(), stringify!($variant), stringify!($params)));)*
             s.push_str("        default: throw FramingError.invalidFrame\n        }\n    }\n}\n\n"); s
         }
     }
@@ -374,6 +376,28 @@ mod tests {
             assert!(read_request(&mut Cursor::new(value.to_string() + "\n")).is_err());
         }
         assert!(read_request(&mut Cursor::new(b"{broken}\n")).is_err());
+    }
+    #[test]
+    fn every_command_rejects_unknown_parameter_keys() {
+        for (method, mut params) in [
+            ("message.submit", serde_json::json!({"text":"hello"})),
+            ("run.cancel", serde_json::json!({"run_id":"run"})),
+            ("approval.decide", serde_json::json!({"approval_id":"a","operation_digest":"d","allowed":true})),
+            ("snapshot", serde_json::json!({})),
+            ("inspect", serde_json::json!({"operation":"tree.snapshot","arguments":{}})),
+            ("shutdown", serde_json::json!({})),
+        ] {
+            let mut request = Request {
+                protocol: VERSION,
+                request_id: "key-test".into(),
+                method: method.into(),
+                params: params.clone(),
+            };
+            assert!(request.command().is_ok(), "valid {method}");
+            params["unexpected_authority"] = serde_json::json!(true);
+            request.params = params;
+            assert!(request.command().is_err(), "extra field in {method}");
+        }
     }
     #[test]
     fn request_ids_use_the_pinned_printable_charset() {
