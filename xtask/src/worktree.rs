@@ -56,3 +56,15 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
     );
     Ok(ExitCode::SUCCESS)
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shared_targets_keep_checkout_code_and_clippy_checks_distinct() {
+        let status = std::process::Command::new("python3")
+            .arg(super::super::root().join("scripts/test-cargo-shared.py"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}

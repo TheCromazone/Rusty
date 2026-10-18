@@ -44,3 +44,6 @@
   text passes such as redaction are single-pass with no allocation per token;
   streaming work per delta is proportional to the delta, never to the answer
   so far.
+
+- Create parallel checkouts with `cargo xtask worktree BRANCH --dir PARENT`.
+- Run its printed cargo function; caches are shared by compiler identity and the function locks whole commands.
