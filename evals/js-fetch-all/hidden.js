@@ -5,21 +5,34 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
   assert.deepStrictEqual(await fetchAll([], async () => 1), []);
-  // Never more than `concurrency` in flight, and the pool refills promptly.
+  // Hold two initial calls open and release a third. The pool must refill
+  // before the held calls finish, regardless of machine speed.
   let live = 0, peak = 0;
   const started = [];
-  const t0 = Date.now();
   const ids = Array.from({ length: 12 }, (_, i) => i);
-  const out = await fetchAll(ids, async (i) => {
+  const gates = ids.map(() => {
+    let release;
+    const promise = new Promise((resolve) => { release = resolve; });
+    return { promise, release };
+  });
+  const pending = fetchAll(ids, async (i) => {
     started.push(i);
     live++; peak = Math.max(peak, live);
-    await sleep(i === 0 ? 120 : 20);
+    await gates[i].promise;
     live--;
     return `r${i}`;
   }, { concurrency: 3 });
+  // setImmediate lets every queued promise continuation finish without a
+  // wall-clock threshold or assumptions about the order calls start in.
+  await new Promise(setImmediate);
+  assert.strictEqual(started.length, 3, "fill the available pool slots");
+  gates[started[1]].release();
+  await new Promise(setImmediate);
+  assert.strictEqual(started.length, 4, "refill while earlier calls are still pending (no fixed batches)");
+  for (const gate of gates) gate.release();
+  const out = await pending;
   assert.deepStrictEqual(out, ids.map((i) => `r${i}`));
   assert.strictEqual(peak, 3, `peak ${peak}`);
-  assert.ok(Date.now() - t0 < 200, "a slow call must not hold up the others (no fixed batches)");
   // Default concurrency is 4.
   live = 0; peak = 0;
   await fetchAll(ids, async () => { live++; peak = Math.max(peak, live); await sleep(5); live--; });
