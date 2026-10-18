@@ -1,0 +1,251 @@
+//! Offline correctness receipts: compare live queries with an unbounded direct rg reference.
+use rusty::workspace_query::{files_under, search, SearchResult};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Fixture(PathBuf);
+impl Fixture {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rusty-query-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn put(&self, path: &str, contents: &str) {
+        let path = self.0.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    fn query(&self, pattern: &str, glob: Option<&str>, context: u64) -> SearchResult {
+        let result = search(pattern, self.0.to_str().unwrap(), glob, context).unwrap();
+        assert_eq!(result.engine, "rg", "correctness fixtures require installed ripgrep");
+        let mut reference = Command::new("rg");
+        reference.args(["--no-config", "--sort", "path", "-nH", "--no-heading", "--color", "never", "--smart-case"]);
+        reference.args(["-C", &context.min(10).to_string()]);
+        if let Some(g) = glob {
+            reference.args(["-g", g]);
+        }
+        let raw = reference.args(["-e", pattern, "--"]).arg(&self.0).output().unwrap();
+        assert_eq!(result.exit_code, raw.status.code());
+        if !result.output.truncated {
+            assert_eq!(result.output.text, String::from_utf8_lossy(&raw.stdout));
+        } else {
+            assert!(String::from_utf8_lossy(&raw.stdout).starts_with(result.output.text.trim_end_matches('\u{fffd}')));
+        }
+        assert_eq!(result.scan_complete, matches!(raw.status.code(), Some(0 | 1)) && raw.stderr.is_empty());
+        result
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn fixed_regex_case_glob_context_and_visibility_match_reference() {
+    let f = Fixture::new();
+    git(&f.0, &["init", "-q"]);
+    f.put(".gitignore", "ignored/\n");
+    f.put("src/a.rs", "before\nneedle retry\nNeedle deadline\nafter\n");
+    f.put("src/nested/b.rs", "deadline\n");
+    f.put("docs/a.txt", "needle\n");
+    f.put("ignored/no.rs", "needle\n");
+    f.put(".hidden.rs", "needle\n");
+    for pattern in ["needle", "Needle", "retry|deadline", "^before$", "absent_literal", "\\bdeadline\\b"] {
+        for glob in [None, Some("*.rs"), Some("src/**/*.rs"), Some("!*.txt")] {
+            for context in [0, 2, 100] {
+                let result = f.query(pattern, glob, context);
+                assert!(result.scan_complete);
+                if glob.is_none() {
+                    assert!(!result.output.text.contains("ignored/no.rs"));
+                    assert!(!result.output.text.contains(".hidden.rs"));
+                }
+            }
+        }
+    }
+    let enumeration = files_under(&f.0);
+    assert!(!enumeration.incomplete);
+    // Glob/outline intentionally retain their prior visibility policy, unlike rg.
+    assert!(enumeration.files.contains(&f.0.join(".hidden.rs")));
+    assert!(enumeration.files.contains(&f.0.join("ignored/no.rs")));
+    assert!(!enumeration.files.iter().any(|p| p.starts_with(f.0.join(".git"))));
+}
+
+#[test]
+fn empty_results_observe_user_shell_add_delete_rename_and_ignore_changes() {
+    let f = Fixture::new();
+    git(&f.0, &["init", "-q"]);
+    f.put("a.rs", "old value\n");
+    assert!(f.query("needle", None, 0).output.text.is_empty());
+    // Same-length overwrite: timestamps/length are insufficient freshness keys.
+    f.put("a.rs", "needle!!!\n");
+    assert!(f.query("needle", None, 0).output.text.contains("a.rs:1:"));
+    f.put("new.rs", "needle\n");
+    assert!(f.query("needle", None, 0).output.text.contains("new.rs:1:"));
+    fs::rename(f.0.join("new.rs"), f.0.join("renamed.rs")).unwrap();
+    let renamed = f.query("needle", None, 0).output.text;
+    assert!(renamed.contains("renamed.rs:1:") && !renamed.contains("new.rs:1:"));
+    fs::remove_file(f.0.join("a.rs")).unwrap();
+    assert!(!f.query("needle", None, 0).output.text.contains("a.rs:1:"));
+    f.put(".gitignore", "renamed.rs\n");
+    assert!(f.query("needle", None, 0).output.text.is_empty());
+    f.put(".gitignore", "");
+    assert!(f.query("needle", None, 0).output.text.contains("renamed.rs:1:"));
+    let status = Command::new("sh")
+        .args(["-c", "printf 'needle from shell\n' > shell.rs; exit 1"])
+        .current_dir(&f.0)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    assert!(f.query("needle", None, 0).output.text.contains("shell.rs:1:"));
+}
+
+#[test]
+fn separate_git_worktrees_never_share_query_results() {
+    let f = Fixture::new();
+    git(&f.0, &["init", "-q"]);
+    f.put("a.rs", "first\n");
+    git(&f.0, &["add", "."]);
+    git(&f.0, &["-c", "user.name=Query Test", "-c", "user.email=query@example.invalid", "commit", "-qm", "fixture"]);
+    let other = Fixture::new();
+    git(&f.0, &["worktree", "add", "--detach", other.0.to_str().unwrap(), "HEAD"]);
+    other.put("a.rs", "needle\n");
+    assert!(f.query("needle", None, 0).output.text.is_empty());
+    assert!(other.query("needle", None, 0).output.text.contains("a.rs:1:needle"));
+    f.put("a.rs", "needle root\n");
+    assert!(f.query("needle", None, 0).output.text.contains("needle root"));
+    assert!(!other.query("needle", None, 0).output.text.contains("needle root"));
+}
+
+#[test]
+fn output_truncation_is_distinct_from_incomplete_scans() {
+    let f = Fixture::new();
+    f.put("a.txt", &"needle\n".repeat(2_000));
+    let full = f.query("needle", None, 0);
+    assert!(full.scan_complete && full.output.truncated);
+    assert!(full.render().contains("scan_complete=true output_truncated=true"));
+    // Regression: the old max-count=30 hid all later matches in each file.
+    f.put("a.txt", &"needle\n".repeat(40));
+    let forty = f.query("needle", None, 0);
+    assert_eq!(forty.output.text.lines().count(), 40);
+    assert!(!forty.output.truncated);
+    f.put("a.txt", &format!("{}needle\n", "x".repeat(400)));
+    assert!(f.query("needle", None, 0).output.text.contains(&"x".repeat(400)));
+    let invalid = f.query("[", None, 0);
+    assert!(!invalid.scan_complete && !invalid.diagnostics.text.is_empty());
+    let missing = search("needle", f.0.join("missing").to_str().unwrap(), None, 0).unwrap();
+    assert!(!missing.scan_complete && missing.render().contains("search incomplete"));
+    assert!(missing.render().contains("missing"));
+}
+
+#[test]
+#[cfg(unix)]
+fn skipped_paths_and_partial_matches_keep_error_evidence() {
+    use std::os::unix::{fs::symlink, fs::PermissionsExt};
+    let f = Fixture::new();
+    f.put("good.rs", "needle\n");
+    f.put("private.rs", "needle secret\n");
+    fs::set_permissions(f.0.join("private.rs"), fs::Permissions::from_mode(0)).unwrap();
+    let partial = f.query("needle", None, 0);
+    fs::set_permissions(f.0.join("private.rs"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!partial.scan_complete);
+    assert!(partial.output.text.contains("good.rs"));
+    assert!(partial.render().contains("private.rs") && partial.render().contains("Permission denied"));
+    symlink(&f.0, f.0.join("loop")).unwrap();
+    symlink(f.0.join("absent"), f.0.join("broken.rs")).unwrap();
+    let scan = files_under(&f.0);
+    assert!(scan.incomplete && scan.skipped == 2);
+    let report = scan.render("files observed", false);
+    assert!(report.contains("loop") && report.contains("broken.rs"));
+    assert!(report.contains("scan_complete=false output_truncated=false"));
+}
+
+/// Same-machine plumbing timing, not solve-rate evidence. Explicitly opt in.
+#[test]
+#[ignore]
+fn benchmark_query_reference_and_legacy() {
+    use std::time::Instant;
+    let f = Fixture::new();
+    for i in 0..400 {
+        f.put(
+            &format!("src/{i:04}.rs"),
+            &format!("{}{}\n", "ordinary content\n".repeat(24), if i % 10 == 0 { "needle" } else { "other" }),
+        );
+    }
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    for i in 0..16 {
+        let legacy = || {
+            let start = Instant::now();
+            let output = Command::new("rg")
+                .args([
+                    "--line-number",
+                    "--no-heading",
+                    "--color",
+                    "never",
+                    "--smart-case",
+                    "--max-columns",
+                    "300",
+                    "--max-count",
+                    "30",
+                    "-C",
+                    "0",
+                    "-e",
+                    "needle",
+                ])
+                .arg(&f.0)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            (start.elapsed().as_micros(), output.stdout)
+        };
+        let current = || {
+            let start = Instant::now();
+            let result = search("needle", f.0.to_str().unwrap(), None, 0).unwrap();
+            let elapsed = start.elapsed().as_micros();
+            assert!(result.scan_complete && !result.output.truncated);
+            (elapsed, result.output.text)
+        };
+        let (a, b) = if i % 2 == 0 {
+            let a = legacy();
+            (a, current())
+        } else {
+            let b = current();
+            (legacy(), b)
+        };
+        let mut old_lines: Vec<_> = std::str::from_utf8(&a.1).unwrap().lines().collect();
+        let mut new_lines: Vec<_> = b.1.lines().collect();
+        old_lines.sort_unstable();
+        new_lines.sort_unstable();
+        assert_eq!(old_lines, new_lines);
+        eprintln!("query_bench iteration={i} legacy_us={} current_us={} equal=true", a.0, b.0);
+        old.push(a.0);
+        new.push(b.0);
+    }
+    let cold = (old.remove(0), new.remove(0));
+    old.sort_unstable();
+    new.sort_unstable();
+    eprintln!(
+        "query_bench files=400 cold_us={cold:?} warm_n=15 legacy_median_us={} current_median_us={} cache=none",
+        old[7], new[7]
+    );
+}
