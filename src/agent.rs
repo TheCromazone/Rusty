@@ -3429,6 +3429,10 @@ fn ask_user(why: &str, destructive: bool, cwd: &std::path::Path) -> Answer {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/budget_deadline.rs"]
+mod budget_deadline_tests;
+
+#[cfg(test)]
 mod stable_prompt_tests {
     use super::*;
 
