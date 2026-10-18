@@ -325,6 +325,11 @@ docker run --rm -v "$PWD:/work" -e NVIDIA_API_KEY rusty --yolo --goal "fix the f
 docker build --target bin -o out .  # just the static binary
 ```
 
+The Docker build retains Cargo registry and compiler caches across source
+edits. All three binaries, including `rusty-cloud`, are available in the
+`bin` export and the runtime image. The runtime includes OpenSSH for attached
+Linux hosts. BuildKit is required for cache mounts.
+
 ## AWS
 
 - **EC2 or Cloud9-style dev boxes:** copy the static binary from
