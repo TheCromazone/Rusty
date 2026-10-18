@@ -320,6 +320,39 @@ Put MCP servers in `.mcp.json`, or set `RUSTY_MCP_CONFIG` to a configuration fil
 servers or tools can stop startup if unavailable; unsupported URL transports
 are reported. [Tool architecture](docs/HOW_IT_WORKS.md#tools-the-hands-rusty-uses).
 
+### Hooks: run your own checks around tool calls
+
+A hook is a shell command of yours that runs before or after a tool call:
+a script that refuses edits to generated files, say, or a formatter after
+every write. Put them in `~/.config/rusty/hooks.json`:
+
+```json
+{
+  "PreToolUse":  [{"matcher": "edit_file|write_file", "command": "~/bin/check.sh", "timeout_secs": 30}],
+  "PostToolUse": [{"matcher": "edit_file|write_file", "command": "cargo fmt -q"}]
+}
+```
+
+`matcher` lists tool names separated by `|` (MCP tools by their full
+`mcp__server__tool` name); leave it out, or use `*`, to match every tool.
+The command runs in the working directory with JSON on its stdin: `event`,
+`tool`, `args`, `cwd`, `session_id` when the session is saved, and after the
+call `result` and `ok`. It gets 60 seconds unless `timeout_secs` says
+otherwise (at most 600). What the exit code means:
+
+| Exit code | PreToolUse (before the call) | PostToolUse (after the call) |
+|---|---|---|
+| 0 | The call goes ahead. | Nothing more happens. |
+| 2 | The call is blocked. The model gets the hook's stderr as the reason and can try something else. | The hook's stderr is added to the result as a note for the model. |
+| anything else, or a timeout | The call goes ahead and you see a warning. | You see a warning. |
+
+PreToolUse hooks run before any permission prompt, so a call a hook blocks
+never asks you. Hooks run for every call, including workers' and side
+chats'. Notes for the model are redacted like any other tool output.
+Hooks are only read from your own config directory, never from the project:
+a cloned repository can't run commands on your machine just by being opened.
+A `hooks.json` that doesn't parse gets one warning at startup and runs no hooks.
+
 ### Local or cloud tools: choose where commands land
 
 Local tools run on your machine. Hybrid Daytona keeps the lead and memory

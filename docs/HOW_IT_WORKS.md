@@ -331,6 +331,18 @@ shell command reuse a secret without exposing its value to the model. Redaction
 recognizes particular patterns; it is not a promise to detect every sensitive
 string. [Privacy implementation](../src/privacy.rs)
 
+### Hooks
+
+Hooks are your own shell commands, set in `~/.config/rusty/hooks.json`, that
+run around each tool call. A PreToolUse hook runs after the call is shown and
+before the permission check; exit code 2 blocks the call and its stderr goes
+back to the model as the reason. A PostToolUse hook runs once the call
+finishes; exit code 2 adds its stderr to the result as a note. Any other
+failure is a warning to you, never a failed call. Reads that a PreToolUse
+hook matches don't run ahead of their turn, so the hook always sees a call
+before it happens. Hooks are never read from the project, so opening a
+repository can't run its commands. [Format and exit codes](../README.md#hooks-run-your-own-checks-around-tool-calls)
+
 ### Where the work runs
 
 | Arrangement | Coordinator and worker loops | Built-in workspace tools |

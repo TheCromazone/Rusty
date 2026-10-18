@@ -1789,6 +1789,68 @@ fn reads_in_one_reply_come_back_in_order_and_after_earlier_writes() {
     assert!(text(6).contains("delta"), "{}", text(6));
 }
 
+/// The user's hooks see every call. A PreToolUse hook that exits 2 stops the
+/// call before any permission check and tells the model why; a PostToolUse
+/// hook's exit-2 note reaches the model, redacted like the tool's output.
+#[test]
+fn user_hooks_block_calls_and_add_notes() {
+    let s = Sandbox::new("hooks");
+    let pre = s.home.join("pre.sh");
+    let post = s.home.join("post.sh");
+    std::fs::write(
+        &pre,
+        "input=$(cat)\ncase \"$input\" in *blocked.txt*|*credentials*) echo '  that path is off limits  ' >&2; exit 2;; esac\n",
+    )
+    .unwrap();
+    std::fs::write(&post, "cat > post.json\necho 'formatted it; DB_PASSWORD=hunter22-real' >&2\nexit 2\n").unwrap();
+    let hooks = serde_json::json!({
+        "PreToolUse": [{"matcher": "write_file|read_file", "command": format!("sh {}", pre.display())}],
+        "PostToolUse": [{"matcher": "write_file", "command": format!("sh {}", post.display())}],
+    });
+    std::fs::write(s.home.join("hooks.json"), hooks.to_string()).unwrap();
+    let calls: Vec<serde_json::Value> = [
+        ("write_file", serde_json::json!({"path": "blocked.txt", "content": "no\n"})),
+        ("read_file", serde_json::json!({"path": "~/.aws/credentials"})),
+        ("write_file", serde_json::json!({"path": "ok.txt", "content": "yes\n"})),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (name, args))| {
+        serde_json::json!({"index": i, "id": format!("call{i}"), "type": "function",
+            "function": {"name": name, "arguments": args.to_string()}})
+    })
+    .collect();
+    let batch = serde_json::json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}});
+    let (out, _, requests) =
+        scripted_run(&s, &["--memory", "off", "--mode", "standard", "write them"], vec![batch, text_reply("ok")]);
+    let results: Vec<String> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| m["content"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(results[0], "error: blocked by a PreToolUse hook: that path is off limits");
+    assert!(!s.project.join("blocked.txt").exists());
+    // Without the hook this read would wait for an approval nobody can give.
+    assert_eq!(results[1], results[0], "the hook speaks before the permission check");
+    assert_eq!(std::fs::read_to_string(s.project.join("ok.txt")).unwrap(), "yes\n");
+    assert!(results[2].starts_with("wrote 1 lines to ok.txt"), "{}", results[2]);
+    assert!(results[2].contains("\n\nPostToolUse hook: formatted it;"), "{}", results[2]);
+    assert!(!results[2].contains("hunter22-real") && !out.contains("hunter22-real"), "{}", results[2]);
+    let seen: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.project.join("post.json")).unwrap()).unwrap();
+    assert_eq!(seen["event"], "PostToolUse");
+    assert_eq!(seen["tool"], "write_file");
+    assert_eq!(seen["args"]["path"], "ok.txt");
+    assert_eq!(seen["ok"], true);
+    assert!(seen["result"].as_str().unwrap().starts_with("wrote 1 lines to ok.txt"), "{seen}");
+    assert_eq!(seen["cwd"], s.project.canonicalize().unwrap().display().to_string());
+    assert!(out.contains("PreToolUse hook blocked write_file"), "{out}");
+    assert!(out.contains("PostToolUse hook added a note to write_file"), "{out}");
+}
+
 #[test]
 fn careful_goal_gets_one_checker_review_then_closes() {
     let s = Sandbox::new("careful-goal");

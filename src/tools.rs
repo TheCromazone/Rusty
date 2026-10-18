@@ -521,7 +521,13 @@ pub struct ShellCapture {
 }
 
 pub fn run_capture(command: &str, timeout: Duration) -> Result<ShellCapture> {
-    run_owned(command, timeout, None)
+    run_owned(command, timeout, None, None)
+}
+
+/// Runs a user hook: `input` on its stdin, in `dir` (rusty's own working
+/// directory when None), otherwise exactly like a bash call.
+pub fn run_hook(command: &str, dir: Option<&Path>, input: &str, timeout: Duration) -> Result<ShellCapture> {
+    run_owned(command, timeout, None, Some((dir, input)))
 }
 
 /// The activity owner may cancel its shell without interrupting unrelated work.
@@ -530,18 +536,27 @@ pub(crate) fn run_cancellable(
     timeout: Duration,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<(Option<Option<i32>>, String, String)> {
-    let capture = run_owned(command, timeout, Some(cancel))?;
+    let capture = run_owned(command, timeout, Some(cancel), None)?;
     Ok((capture.status, capture.stdout, capture.stderr))
 }
 
-fn run_owned(command: &str, timeout: Duration, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<ShellCapture> {
+fn run_owned(
+    command: &str,
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    hook: Option<(Option<&Path>, &str)>,
+) -> Result<ShellCapture> {
     use std::sync::atomic::Ordering;
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     if cancelled() || signal::interrupted() {
         return Ok(ShellCapture { status: None, stdout: String::new(), stderr: String::new(), capture_complete: true });
     }
     let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("-c").arg(command).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if hook.is_some() { Stdio::piped() } else { Stdio::null() });
+    if let Some((Some(dir), _)) = hook {
+        cmd.current_dir(dir);
+    }
     // Secrets the model saw only as ${RUSTY_SECRET_n} handles.
     cmd.envs(rusty::privacy::secret_env());
     #[cfg(unix)]
@@ -550,6 +565,14 @@ fn run_owned(command: &str, timeout: Duration, cancel: Option<&std::sync::atomic
         cmd.process_group(0);
     }
     let mut child = OwnedShell(cmd.spawn().context("failed to spawn bash")?);
+    if let (Some((_, input)), Some(mut stdin)) = (hook, child.0.stdin.take()) {
+        // On its own thread: a hook that never reads its input must not stall
+        // rusty on a full pipe. The write fails once the hook has exited.
+        let input = input.to_string();
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, input.as_bytes());
+        });
+    }
 
     // Drain pipes on threads so a chatty command can't deadlock on a full pipe.
     let so = child.0.stdout.take().unwrap();
@@ -989,7 +1012,7 @@ os._exit(0)
             let run = std::thread::spawn(move || {
                 let _scope = signal::cancel_scope(flag.clone());
                 let timeout = if mode == "timeout" { Duration::from_secs(2) } else { Duration::from_secs(10) };
-                let _ = tx.send(run_owned(&command, timeout, Some(&flag)));
+                let _ = tx.send(run_owned(&command, timeout, Some(&flag), None));
             });
             let deadline = Instant::now() + Duration::from_secs(8);
             let mut control = loop {

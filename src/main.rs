@@ -12,6 +12,7 @@ mod display;
 mod doctor;
 mod execution;
 mod footer;
+mod hooks;
 mod inbox;
 mod infra;
 mod integrations;
@@ -342,6 +343,7 @@ fn run() -> Result<i32> {
     let blobs_probe = local.then(|| probe(&cwd, snapshot::blobs));
 
     let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy);
+    agent.hooks = hooks::Hooks::user();
     if let Some(target) = target_probe {
         agent.infra.target = joined(target);
     }

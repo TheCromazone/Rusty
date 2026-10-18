@@ -44,6 +44,7 @@ pub struct Parent {
     pub history_cap: Option<usize>,
     pub book: Shared,
     pub local: bool,
+    pub hooks: crate::hooks::Hooks,
 }
 impl Parent {
     fn id(&self) -> String {
