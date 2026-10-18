@@ -1,0 +1,7 @@
+## env RUSTY_CONTEXT_TOKENS=26000
+## env RUSTY_HISTORY_CAP_TOKENS=6000
+## env RUSTY_COMPACTION=aggressive
+We need a codename for the next release. Choose it yourself: one ordinary English word that names a bird, but not eagle, robin, sparrow, owl, hawk, falcon, crow, raven or heron. Reply with only the word and don't write it to any file.
+Read all of big_a.py and list the name of every function it defines, one per line.
+Read all of big_b.py and list the name of every function it defines, one per line.
+Write the release codename you chose earlier to CODENAME.txt, the word alone. Don't ask me for it; use your earlier choice.
