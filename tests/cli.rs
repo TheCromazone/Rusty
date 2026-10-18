@@ -1002,6 +1002,7 @@ fn completion_contract_fixed_verification_follows_the_careful_review_and_its_edi
     assert_eq!(requests.len(), 4);
     assert_eq!(trace["verification"].as_array().unwrap().len(), 1);
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
 }
 
 #[test]
@@ -1591,7 +1592,7 @@ fn careful_blocked_goal_does_not_spend_review_calls() {
         .spawn()
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert_eq!(server.join().unwrap().len(), 1);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"blocked\""));
 }
@@ -1667,7 +1668,7 @@ fn truncated_reply_after_the_check_leaves_the_goal_open_completion_contract() {
         .spawn()
         .map(|child| wait(child, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert_eq!(server.join().unwrap().len(), 3);
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
 }
@@ -1973,7 +1974,7 @@ fn careful_goal_keeps_its_single_checker_budget_after_resume() {
         .spawn()
         .map(|c| wait(c, Duration::from_secs(20)))
         .unwrap();
-    assert!(out.status.success());
+    assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("\"goal\":\"open\""));
     assert_eq!(server.join().unwrap().len(), 3);
     let (url, server) = scripted_endpoint(vec![done]);
@@ -5420,6 +5421,7 @@ fn completion_contract_pinned_checker_accepts_repair() {
     let (out, trace) = pinned_completion("repair", vec![fix_calc(), done_reply()]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
 }
 
 #[test]
@@ -5453,6 +5455,7 @@ fn completion_contract_pinned_checker_can_be_restored_then_rechecked() {
     assert_eq!(trace["claims"]["check_error"], 1);
     assert_eq!(trace["claims"]["accepted"], 1);
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert_eq!(trace["goal_outcome"], "verified");
 }
 
 #[test]
@@ -5565,4 +5568,113 @@ fn completion_contract_pinned_checker_survives_real_session_resume() {
     assert_eq!(trace["claims"]["check_error"], 1);
     assert!(trace["messages"].to_string().contains("pinned verification file changed"));
     assert_eq!(trace["goal"]["status"], "Active");
+}
+
+#[test]
+fn completion_contract_goal_outcomes_without_a_checker() {
+    for (case, reply, code, outcome) in [
+        ("claim", done_reply(), 0, "completed_unverified"),
+        ("blocked", tool_reply("goal_done", serde_json::json!({"blocked":true,"evidence":"need input"})), 2, "blocked"),
+        ("turn-limit", text_reply("still investigating"), 2, "incomplete"),
+    ] {
+        let s = Sandbox::new(&format!("outcome-{case}"));
+        let (url, server) = scripted_endpoint(vec![reply]);
+        let path = s.home.join("trace.json");
+        let out = wait(
+            s.cmd()
+                .env("RUSTY_BASE_URL", url)
+                .env("RUSTY_GOAL_MAX_TURNS", "1")
+                .args(["--mode", "standard", "--memory", "off", "--goal", "inspect", "--stats", "--trajectory"])
+                .arg(&path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            Duration::from_secs(15),
+        );
+        assert_eq!(out.status.code(), Some(code), "{case}: {}", String::from_utf8_lossy(&out.stderr));
+        let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(trace["goal_outcome"], outcome);
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("\"goal_outcome\":\"{outcome}\"")));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn completion_contract_executed_check_retains_receipt_when_pin_changes() {
+    let s = Sandbox::new("check-changes-pin");
+    std::fs::write(s.project.join("criterion.txt"), "original").unwrap();
+    let (url, server) = scripted_endpoint(vec![done_reply(), text_reply("cannot finish")]);
+    let path = s.home.join("trace.json");
+    let out = wait(
+        s.cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", "1")
+            .args([
+                "--mode",
+                "standard",
+                "--memory",
+                "off",
+                "--yolo",
+                "--goal",
+                "inspect",
+                "--verify",
+                "printf changed > criterion.txt; printf receipt-marker",
+                "--verify-file",
+                "criterion.txt",
+                "--trajectory",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        Duration::from_secs(15),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["verification"].as_array().unwrap().len(), 1);
+    let receipt = &trace["verification"][0];
+    assert_eq!(receipt["outcome"], "EvidenceUnavailable");
+    assert_eq!(receipt["exit_code"], 0);
+    assert!(receipt["output"].as_str().unwrap().contains("receipt-marker"));
+    assert!(receipt["observation_error"].as_str().unwrap().contains("criterion.txt"));
+    assert_eq!(trace["claims"]["check_failed"], 1);
+    assert_eq!(trace["claims"]["check_error"], 0);
+    assert_eq!(trace["goal_outcome"], "incomplete");
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
+    let s = Sandbox::new("interactive-fixed-goal");
+    seed_calc(&s);
+    std::fs::write(s.project.join("check.py"), "from calc import add\nassert add(2,3)==5\n").unwrap();
+    let (url, server) = scripted_endpoint(vec![fix_calc(), done_reply()]);
+    let path = s.home.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .args(["--mode", "standard", "--memory", "off", "--yolo", "--trajectory"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "/goal verify python3 check.py\n/goal pin check.py\n/goal repair calc.py\n/goal status\n/exit"
+    )
+    .unwrap();
+    let out = wait(child, Duration::from_secs(15));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["goal_outcome"], "verified");
+    assert_eq!(trace["verification"][0]["outcome"], "Passed");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("verified:"));
+    assert_eq!(server.join().unwrap().len(), 2);
 }
