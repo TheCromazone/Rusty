@@ -212,6 +212,56 @@ fn tool_endpoint_flag_after_double_dash_remains_a_user_prompt() {
 }
 
 #[test]
+fn interactive_fixed_verification_rejects_remote_tools_before_setting_a_criterion() {
+    let h = Hybrid::new("remote-fixed-verification");
+    let bridge = h.bridge();
+    let (server, shared) = model();
+    let mut command = h.rusty();
+    let mut child = command
+        .args(["--tools", "daytona", "--mode", "standard", "--agents", "off", "--memory", "off"])
+        .envs(bridge.env())
+        .env("RUSTY_BASE_URL", format!("{}/v1", server.url))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"/goal verify printf forbidden > verification-ran\n\
+              /goal verify --timeout 7 printf forbidden > verification-ran\n\
+              /goal pin acceptance.txt\n/goal status\n/exit\n",
+        )
+        .unwrap();
+    let out = wait(child, Duration::from_secs(30));
+    drop(bridge);
+    let output = text(&out);
+    assert!(out.status.success(), "{output}");
+    assert_eq!(
+        output.matches("/goal verify requires local tools; remote acceptance is not qualified").count(),
+        2,
+        "{output}"
+    );
+    // Pinning must still see no configured check after both rejected commands.
+    assert!(output.contains("set /goal verify <command> first"), "{output}");
+    assert!(output.contains("no goal."), "{output}");
+    assert!(!output.contains("fixed check set for future goals"), "{output}");
+    assert!(!h.host.join("verification-ran").exists());
+    assert!(!h.remote.join("verification-ran").exists());
+    let calls = h.machine().calls.lock().unwrap();
+    // Startup must really attach to the bridge. Only its read-only description
+    // is allowed; neither criterion setup nor shell dispatch reaches it.
+    assert!(calls.iter().any(|request| request["op"] == "describe"), "{calls:?}");
+    assert!(calls.iter().all(|request| request["op"] == "describe"), "{calls:?}");
+    assert_eq!(shared.0.lock().unwrap().requests, 0, "a slash command contacted the scripted model");
+    assert_model_ok(&shared);
+    h.api.assert_ok();
+}
+
+#[test]
 fn saved_tool_default_only_changes_future_sessions() {
     let h = Hybrid::new("saved-default");
     let repl = |args: &[&str], input: &str| {
