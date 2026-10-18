@@ -3,6 +3,9 @@ on:
   pull_request:
     branches: [main, feat/ssh-execution-transport]
     paths: ['Dockerfile', 'Cargo.toml', 'Cargo.lock', 'src/**', '.github/workflows/container.yml']
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
