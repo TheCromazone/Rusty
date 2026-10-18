@@ -278,7 +278,7 @@ fn receipt(o: &Options, steps: &[Step]) -> Result<Value> {
     Ok(
         json!({"revision": source["revision"], "dirty": source["dirty"], "source_start":source, "source_end":null, "source_unchanged":null,
         "status": "running", "scope": if o.changed { "changed-only" } else { "full" }, "live": o.live, "perf": o.perf, "cloud": o.cloud,
-        "configuration": configuration, "test_time_scale":super::testing::time_scale(o.changed)?,
+        "configuration": configuration, "test_time_scale":super::testing::time_scale()?,
         "steps": steps.iter().map(|s| json!({"name": s.name, "status": "not-run", "seconds": 0.0})).collect::<Vec<_>>()}),
     )
 }

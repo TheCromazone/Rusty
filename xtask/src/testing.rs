@@ -181,28 +181,21 @@ fn parse_suite(bytes: &[u8]) -> Result<ParsedSuite> {
     parsed.ignored = counts[2];
     Ok(parsed)
 }
-fn parse_time_scale(changed: bool, explicit: Option<&str>) -> Result<u64> {
+fn parse_time_scale(explicit: Option<&str>) -> Result<u64> {
     let scale = match explicit {
         Some(raw) => raw.parse::<u64>().context("RUSTY_TEST_TIME_SCALE must be an integer from 1 to 100")?,
-        None => {
-            if changed {
-                1
-            } else {
-                20
-            }
-        }
+        None => 1,
     };
     if !(1..=100).contains(&scale) {
         bail!("RUSTY_TEST_TIME_SCALE must be an integer from 1 to 100");
     }
     Ok(scale)
 }
-/// Full qualification keeps the load-tolerant scale; changed checks use the
-/// ordinary boundary unless the caller explicitly requests another scale.
-pub fn time_scale(changed: bool) -> Result<u64> {
+/// Keep ordinary deadlines unless the caller explicitly requests a scale.
+pub fn time_scale() -> Result<u64> {
     match std::env::var("RUSTY_TEST_TIME_SCALE") {
-        Ok(raw) => parse_time_scale(changed, Some(&raw)),
-        Err(std::env::VarError::NotPresent) => parse_time_scale(changed, None),
+        Ok(raw) => parse_time_scale(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => parse_time_scale(None),
         Err(e) => Err(e).context("RUSTY_TEST_TIME_SCALE is not valid Unicode"),
     }
 }
@@ -309,7 +302,7 @@ fn fresh_report(name: &str) -> Result<PathBuf> {
 
 pub fn tests(only_changed: bool) -> Result<bool> {
     let report = fresh_report("test-suite.json")?;
-    let scale = time_scale(only_changed)?;
+    let scale = time_scale()?;
     println!("Test profile: {} (time scale {scale})", if only_changed { "changed" } else { "full" });
     let mut bins = binaries()?;
     let selection = if only_changed { changed()? } else { None };
@@ -359,7 +352,7 @@ pub fn flaky(args: &[String]) -> Result<ExitCode> {
         bail!("--runs must be positive");
     }
     let report = fresh_report("flaky.json")?;
-    let scale = time_scale(false)?;
+    let scale = time_scale()?;
     println!("Test profile: full (time scale {scale})");
     let bins = binaries()?;
     let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -483,15 +476,12 @@ mod tests {
 
     #[test]
     fn timing_profiles_validate_and_canonicalize_before_launch() {
-        assert_eq!(parse_time_scale(false, None).unwrap(), 20);
-        assert_eq!(parse_time_scale(true, None).unwrap(), 1);
-        for changed in [false, true] {
-            for (raw, canonical) in [("1", 1), ("001", 1), ("20", 20), ("100", 100)] {
-                assert_eq!(parse_time_scale(changed, Some(raw)).unwrap(), canonical);
-            }
-            for raw in ["0", "101", "1000", "garbage", "", "-1", "1.0", " 1", "18446744073709551616"] {
-                assert!(parse_time_scale(changed, Some(raw)).is_err(), "{raw:?}");
-            }
+        assert_eq!(parse_time_scale(None).unwrap(), 1);
+        for (raw, canonical) in [("1", 1), ("001", 1), ("20", 20), ("100", 100)] {
+            assert_eq!(parse_time_scale(Some(raw)).unwrap(), canonical);
+        }
+        for raw in ["0", "101", "1000", "garbage", "", "-1", "1.0", " 1", "18446744073709551616"] {
+            assert!(parse_time_scale(Some(raw)).is_err(), "{raw:?}");
         }
     }
     #[test]
