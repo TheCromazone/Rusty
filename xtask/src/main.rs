@@ -1,6 +1,6 @@
 //! Repository tasks: `cargo xtask <command>`.
 //!
-//!     cargo xtask qa [--live]          fmt, clippy, tests (incl. the offline cloud suites) and smoke checks
+//!     cargo xtask qa [--live|--perf|--cloud] [--list]   unified quality gate
 //!     cargo xtask check-message FILE   one commit message (`-` reads stdin)
 //!     cargo xtask check-body           a pull request description, on stdin
 //!     cargo xtask install-hooks        check every commit message locally
@@ -25,6 +25,7 @@ mod message;
 mod pattern;
 mod provider;
 mod pty;
+mod qa;
 mod record;
 mod report;
 mod screen;
@@ -50,7 +51,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<ExitCode> {
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
-        Some("qa") => qa(rest.iter().any(|a| a == "--live")).map(|()| ExitCode::SUCCESS),
+        Some("qa") => qa::command(rest),
         Some("check-message") => {
             let text = read_arg(rest.first().map_or("-", String::as_str))?;
             Ok(verdict(message::commit_problem(&text)))
@@ -74,7 +75,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
         Some("bench") => bench::command(rest),
         _ => {
             eprintln!(
-                "usage: cargo xtask <qa [--live] | check-message FILE|- | check-body | install-hooks\n    \
+                "usage: cargo xtask <qa [--live|--perf|--cloud] [--list] | check-message FILE|- | check-body | install-hooks\n    \
                  | eval [TASKS] | eval-report FILE.jsonl...\n    \
                  | memory-smoke [...] | memory-bench [...] | memory-summary FILE\n    \
                  | tty [ctrl-c|approval|steady]... [--binary PATH] [--live]\n    \
@@ -130,10 +131,6 @@ pub fn debug_rusty() -> Result<PathBuf> {
     Ok(target_dir().join("debug/rusty"))
 }
 
-fn step(name: &str) {
-    println!("\n\x1b[1m▸ {name}\x1b[0m");
-}
-
 /// Runs a command from the repository root and fails if it does.
 fn sh(program: &str, args: &[&str]) -> Result<()> {
     let status =
@@ -141,45 +138,6 @@ fn sh(program: &str, args: &[&str]) -> Result<()> {
     if !status.success() {
         bail!("{program} {} failed ({status})", args.join(" "));
     }
-    Ok(())
-}
-
-fn qa(live: bool) -> Result<()> {
-    step("format");
-    sh("cargo", &["fmt", "--all", "--check"])?;
-    step("lint");
-    sh("cargo", &["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
-    step("unit + offline end-to-end tests");
-    sh("cargo", &["test", "--workspace"])?;
-
-    step("memory hooks (real CLI, offline provider)");
-    sh("cargo", &["build", "--bins"])?;
-    let report = std::env::temp_dir().join(format!("rusty-memory-offline-{}.json", std::process::id()));
-    let smoke = memory::Smoke::new(target_dir().join("debug/rusty"), report);
-    if !memory::smoke(&smoke)? {
-        bail!("the memory smoke failed");
-    }
-
-    if live {
-        sh("cargo", &["build", "--release"])?;
-        step("live end-to-end tests");
-        sh("cargo", &["test", "--test", "cli", "--", "--ignored", "--test-threads", "4"])?;
-        step("real-terminal ctrl-c");
-        let work = std::env::temp_dir().join(format!("rusty-tty-{}", std::process::id()));
-        std::fs::create_dir_all(&work)?;
-        let binary = target_dir().join("release/rusty");
-        let result = tty::ctrl_c(&binary, &work, None, Box::new(std::io::stdout()));
-        let _ = std::fs::remove_dir_all(&work);
-        println!("\n{}", tty::verdict(&result));
-        if !matches!(result, Ok(tty::Interrupt::Stopped(_))) {
-            bail!("the terminal check failed");
-        }
-        step("evals");
-        if !eval::run("")? {
-            bail!("the evals failed");
-        }
-    }
-    println!("\n\x1b[32m✓ qa passed\x1b[0m");
     Ok(())
 }
 

@@ -70,8 +70,11 @@ The template in `.github/pull_request_template.md` keeps this short.
 ## Before you push
 
 ```bash
-cargo xtask qa         # fmt, clippy -D warnings, unit and end-to-end tests
-cargo xtask qa --live  # needs NVIDIA_API_KEY: live tests, terminal checks, evals
+cargo xtask qa         # fmt, lint, all offline tests, memory and full PTY journeys
+cargo xtask qa --live  # explicit model use: live CLI, memory, interrupt, evals
 cargo xtask eval TASK  # one eval (or a comma-separated list, or multi)
 cargo xtask tty        # terminal UI changes: real-terminal checks, no key needed
 ```
+
+[Testing](docs/TESTING.md) documents the single CI workflow, optional performance
+and hosted gates, feature coverage, receipts, and remaining release checks.

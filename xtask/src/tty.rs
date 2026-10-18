@@ -610,6 +610,13 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Approval, Check::CtrlC], false)? {
         bail!("the ctrl-c capture was inconclusive");
     }
+    if args.iter().any(|a| a == "--all") {
+        for (name, check) in
+            [("owned", Check::Owned), ("aside", Check::Aside), ("side", Check::Side), ("summary", Check::Summary)]
+        {
+            run(&binary, &output.join(name), &[check], false)?;
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -706,6 +713,11 @@ fn lines_json(lines: &[String]) -> String {
 /// `last-screen.txt`.
 pub fn inspect(args: &[String]) -> Result<ExitCode> {
     let Some(root) = args.first().map(PathBuf::from) else { bail!("usage: cargo xtask tty-inspect DIR") };
+    if args.iter().any(|a| a == "--all") {
+        for name in ["owned", "aside", "side", "summary"] {
+            inspect(&[root.join(name).display().to_string()])?;
+        }
+    }
     let mut reports = Vec::new();
     let mut replays = Vec::new();
     for cols in WIDTHS {

@@ -579,12 +579,13 @@ Careful used about 2.5 times the tokens of standard on the tasks both passed.
 Five newer tasks (a Rust ring buffer, exact-cents bill splitting, backup
 rotation in bash, a bounded-concurrency `fetchAll` in JS, and a TTL cache
 written from its docstring) check more than their visible tests do, so
-fixing only the example doesn't pass. The `evals` workflow runs any of this
-on demand from GitHub with the repository's keys.
+fixing only the example doesn't pass. The `ci` workflow runs these extensions
+on demand; PRs stay offline.
+[Testing](docs/TESTING.md) maps every feature to its checks and evidence limits.
 
 ```bash
-cargo xtask qa           # offline checks
-cargo xtask qa --live    # plus live tests, the terminal check and every eval
+cargo xtask qa           # unified offline gate, including real-terminal journeys
+cargo xtask qa --live    # also live CLI, memory, interrupt and selected evals
 cargo xtask memory-smoke --live --binary target/release/rusty   # the memory cases at every level on NVIDIA
 cargo xtask memory-bench # memory advice latency with 512 stored lessons (release build)
 cargo xtask eval multi   # just the multi-turn evals; logs land in target/evals/
@@ -791,3 +792,6 @@ The inbox survives restart. Delivery receipts are saved with the parent before
 queued notes are removed, so replay does not duplicate a summary. Repeating
 `/send main` without further side discussion does not spend another model call.
 Sending findings does not apply a patch, merge a branch or close the main goal.
+
+The unified [quality gate](docs/TESTING.md) is `cargo xtask qa`. Add `--perf`,
+`--live` or `--cloud` explicitly; use `--list` to inspect its plan.
