@@ -97,11 +97,11 @@ impl Ssh {
 
     fn acquire(&self, deadline: Instant) -> Result<ConnectionSlot<'_>> {
         loop {
-            if self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 4).then_some(n + 1)).is_ok() {
-                return Ok(ConnectionSlot(&self.active));
-            }
             if Instant::now() >= deadline {
                 bail!("SSH connection queue timed out; no command started");
+            }
+            if self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 4).then_some(n + 1)).is_ok() {
+                return Ok(ConnectionSlot(&self.active));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -384,9 +384,10 @@ mod tests {
     #[test]
     fn nine_callers_share_four_connection_slots() {
         let ssh = Ssh::new("box").unwrap();
-        let slots: Vec<_> = (0..4).map(|_| ssh.acquire(Instant::now()).unwrap()).collect();
+        let slots: Vec<_> = (0..4).map(|_| ssh.acquire(Instant::now() + Duration::from_secs(5)).unwrap()).collect();
         assert!(ssh.acquire(Instant::now()).unwrap_err().to_string().contains("no command started"));
         drop(slots);
+        assert!(ssh.acquire(Instant::now()).is_err(), "an expired request must not start even with free slots");
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let barrier = std::sync::Barrier::new(9);
