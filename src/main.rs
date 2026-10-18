@@ -126,6 +126,10 @@ struct Cli {
     #[arg(long, requires = "goal", value_name = "COMMAND")]
     verify: Option<String>,
 
+    /// Pin an acceptance file before work starts; repeat for each workspace-relative file
+    #[arg(long, requires = "verify", value_name = "PATH")]
+    verify_file: Vec<PathBuf>,
+
     /// Deadline for the fixed acceptance command (1..600 seconds)
     #[arg(long, requires = "verify", default_value = "120", value_parser = clap::value_parser!(u64).range(1..=600))]
     verify_timeout: u64,
@@ -468,7 +472,9 @@ fn run() -> Result<i32> {
                             "--verify currently requires local tools; remote acceptance is not qualified"
                         ));
                     }
-                    agent.goal_check = Some(verification::CheckSpec::new(command, cli.verify_timeout)?);
+                    agent.goal_check = Some(
+                        verification::CheckSpec::new(command, cli.verify_timeout)?.pin_files(&cwd, &cli.verify_file)?,
+                    );
                 }
                 agent.run_goal(Some(goal))
             }
@@ -520,7 +526,7 @@ fn joined<T>(probe: std::thread::JoinHandle<T>) -> T {
 
 /// Bumped when a harness-facing flag, exit code or `--stats` key changes
 /// meaning (docs/VERIFICATION.md, "Harness contract").
-const CONTRACT: u32 = 2;
+const CONTRACT: u32 = 3;
 
 /// What this build accepts, so a harness can refuse an unsupported setting
 /// before any model call. Each list is filtered through the parser that
@@ -549,7 +555,7 @@ fn capabilities() -> serde_json::Value {
         "permissions": accepted(&["read-only", "ask", "auto", "yolo"], &|v| Mode::parse(v).is_some()),
         "tools": ["local", "daytona"],
         "toolset": ["full", "shell"],
-        "verify": {"supported": true, "timeout_secs": [1, 600]},
+        "verify": {"supported": true, "timeout_secs": [1, 600], "files_flag": true},
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
