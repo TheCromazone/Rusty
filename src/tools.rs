@@ -43,11 +43,12 @@ fn build_definitions() -> Value {
             "path": {"type": "string", "description": "Directory (default .)"},
             "max_depth": {"type": "integer", "description": "Default 3"}
         }), &[]),
-        tool("search", "Search file contents with ripgrep smart-case regex and default ignore rules. Reports scan completeness separately from output truncation. Grep fallback has reduced semantics and is marked incomplete. Retrieval is not acceptance evidence.", json!({
+        tool("search", "Search file contents with ripgrep smart-case regex and default ignore rules. To find where something lives, start with output_mode files_with_matches, then read or search those files for lines. Reports scan completeness separately from output truncation. Grep fallback has reduced semantics and is marked incomplete. Retrieval is not acceptance evidence.", json!({
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "Directory or file (default .)"},
             "glob": {"type": "string", "description": "Only search files matching this glob, e.g. *.rs"},
-            "context": {"type": "integer", "description": "Lines of context around each match (default 0)"}
+            "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "content: matching lines (default). files_with_matches: only file names, newest first. count: matches per file"},
+            "context": {"type": "integer", "description": "Lines of context around each match in content mode (default 0)"}
         }), &["pattern"]),
         tool("glob", "Find files by path pattern: *.rs, src/**/*.ts, **/test_*.py. Names only, no contents, most recently modified first. Skips build directories and, in a git repository, .gitignore'd paths; includes hidden files. Reports incomplete enumeration and skipped paths.", json!({
             "pattern": {"type": "string"},
@@ -108,7 +109,14 @@ pub fn summary(name: &str, args: &Value) -> String {
                 n => format!("{}  (+{n} line{})", truncate(&first, 100), if n == 1 { "" } else { "s" }),
             }
         }
-        "search" => format!("/{}/ in {}", s("pattern"), args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or(".")),
+        "search" => {
+            let mode = match args["output_mode"].as_str() {
+                Some("files_with_matches") => " (files)",
+                Some("count") => " (count)",
+                _ => "",
+            };
+            format!("/{}/ in {}{mode}", s("pattern"), args["path"].as_str().filter(|s| !s.is_empty()).unwrap_or("."))
+        }
         "glob" => s("pattern"),
         "outline" => s("path"),
         "swarm" => format!("{} tasks", args["tasks"].as_array().map_or(0, Vec::len)),
@@ -455,6 +463,7 @@ fn search(args: &Value) -> Result<String> {
         path,
         args["glob"].as_str(),
         args["context"].as_u64().unwrap_or(0),
+        workspace_query::Mode::parse(args["output_mode"].as_str())?,
         signal::interrupted,
     )?
     .render())

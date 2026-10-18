@@ -246,9 +246,31 @@ fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, O
     collect_query_cancellable(child, timeout, &|| false, None)
 }
 
+/// What a search reports: matching lines with optional context, only the
+/// names of the files that match, or how many matches each file has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Content,
+    Files,
+    Count,
+}
+
+impl Mode {
+    pub fn parse(name: Option<&str>) -> Result<Self> {
+        match name.unwrap_or("") {
+            "" | "content" => Ok(Self::Content),
+            "files_with_matches" => Ok(Self::Files),
+            "count" => Ok(Self::Count),
+            other => anyhow::bail!("unknown output_mode `{other}`; use content, files_with_matches or count"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SearchResult {
     pub engine: &'static str,
+    pub mode: Mode,
     pub scan_complete: bool,
     pub audit_complete: bool,
     pub match_limit_possible: bool,
@@ -265,10 +287,11 @@ impl SearchResult {
             "[query engine={} scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true exit={:?} termination={}]\n",
             self.engine, self.scan_complete, self.output.truncated, self.exit_code, self.termination
         );
-        let scope = if self.engine == "rg" {
-            format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible)
-        } else {
-            "[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n".into()
+        let scope = match (self.engine, self.mode) {
+            ("rg", Mode::Content) => format!("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; max_count={MATCHES_PER_FILE} max_columns={MAX_COLUMNS} audit_complete={} match_limit_possible={} column_limit_possible={}; sorted retained records, not a stable truncated subset or atomic snapshot]\n", self.audit_complete, self.match_limit_possible, self.column_limit_possible),
+            ("rg", Mode::Files) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; names of matching files, most recently modified first]\n".into(),
+            ("rg", Mode::Count) => "[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; matches per file, sorted by path]\n".into(),
+            _ => "[scope: grep fallback; case-insensitive ERE, build directories excluded; ripgrep ignore/glob/regex parity unavailable]\n".into(),
         };
         let body = if self.output.text.trim().is_empty() {
             if self.scan_complete {
@@ -315,8 +338,8 @@ fn render_bounded(mut header: String, scope: &str, body: &str, diagnostics: &str
 
 /// Spawn rg directly each time: cached executable availability could outlive a PATH change.
 /// Only a missing executable selects fallback; a failed rg query must retain its diagnostics.
-pub fn search(pattern: &str, path: &str, glob: Option<&str>, context: u64) -> Result<SearchResult> {
-    search_cancellable(pattern, path, glob, context, || false)
+pub fn search(pattern: &str, path: &str, glob: Option<&str>, context: u64, mode: Mode) -> Result<SearchResult> {
+    search_cancellable(pattern, path, glob, context, mode, || false)
 }
 
 /// The caller owns cancellation; this layer creates no global state or polling threads.
@@ -325,9 +348,10 @@ pub fn search_cancellable(
     path: &str,
     glob: Option<&str>,
     context: u64,
+    mode: Mode,
     cancelled: impl Fn() -> bool,
 ) -> Result<SearchResult> {
-    search_with("rg", pattern, path, glob, context, &cancelled)
+    search_with("rg", pattern, path, glob, context, mode, &cancelled)
 }
 
 fn search_with(
@@ -336,11 +360,13 @@ fn search_with(
     path: &str,
     glob: Option<&str>,
     context: u64,
+    mode: Mode,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SearchResult> {
     if cancelled() {
         return Ok(SearchResult {
             engine: "rg",
+            mode,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -353,65 +379,56 @@ fn search_with(
     }
     let context = context.min(10).to_string();
     let mut rg = Command::new(program);
-    rg.args([
-        "--no-config",
-        "--line-number",
-        "--with-filename",
-        "--no-heading",
-        "--color",
-        "never",
-        "--smart-case",
-        "--null",
-        "--no-context-separator",
-        "--max-count",
-        "30",
-        "--max-columns",
-        "300",
-        "-C",
-        &context,
-    ]);
+    rg.args(["--no-config", "--color", "never", "--smart-case", "--null"]);
+    match mode {
+        Mode::Content => rg.args([
+            "--line-number",
+            "--with-filename",
+            "--no-heading",
+            "--no-context-separator",
+            "--max-count",
+            "30",
+            "--max-columns",
+            "300",
+            "-C",
+            &context,
+        ]),
+        Mode::Files => rg.arg("--files-with-matches"),
+        Mode::Count => rg.args(["--count-matches", "--with-filename"]),
+    };
     if let Some(g) = glob {
         rg.args(["-g", g]);
     }
-    rg.args(["-e", pattern, "--", path]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (child, engine) = match spawn_query(&mut rg) {
-        Ok(child) => (child, "rg"),
+    rg.args(["-e", pattern, "--", path]);
+    let child = match spawn_query(&mut rg) {
+        Ok(child) => child,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut grep = Command::new("grep");
-            grep.args(["-rnEiIH", "-C", &context]);
-            for d in SKIP_DIRS {
-                grep.arg(format!("--exclude-dir={d}"));
-            }
-            if let Some(g) = glob {
-                grep.arg(format!("--include={g}"));
-            }
-            grep.args(["-e", pattern, "--", path]);
-            grep.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            (spawn_query(&mut grep).context("cannot start grep fallback")?, "grep")
+            return fallback(pattern, path, glob, &context, mode, cancelled)
         }
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
+    // Only line output has per-file match and column limits to audit.
     let mut audit = RgAudit::new();
-    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(
-        child,
-        QUERY_TIMEOUT,
-        cancelled,
-        if engine == "rg" { Some(&mut audit) } else { None },
-    )?;
+    let (output, diagnostics, exit_code, termination) =
+        collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, (mode == Mode::Content).then_some(&mut audit))?;
     audit.complete &= audit.pending.is_empty();
-    let audit_complete = engine == "rg" && audit.complete;
+    let audit_complete = audit.complete;
     let match_limit_possible = audit.match_limit_possible;
     let column_limit_possible = audit.column_limit_possible;
-    let mut output = if engine == "rg" { present_rg(output) } else { output };
+    let mut output = match mode {
+        Mode::Content => present_rg(output),
+        Mode::Files => present_files(output, '\0'),
+        Mode::Count => present_counts(output, '\0'),
+    };
     output.truncated |= match_limit_possible || column_limit_possible;
-    let scan_complete = engine == "rg"
-        && termination == "exited"
+    let scan_complete = termination == "exited"
         && matches!(exit_code, Some(0 | 1))
         && diagnostics.text.is_empty()
         && audit_complete
         && !match_limit_possible;
     Ok(SearchResult {
-        engine,
+        engine: "rg",
+        mode,
         scan_complete,
         audit_complete,
         match_limit_possible,
@@ -423,9 +440,123 @@ fn search_with(
     })
 }
 
+/// Without ripgrep, grep: case-insensitive extended regex, build directories
+/// excluded. It lacks rg's semantics, so it never reports a complete scan.
+fn fallback(
+    pattern: &str,
+    path: &str,
+    glob: Option<&str>,
+    context: &str,
+    mode: Mode,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SearchResult> {
+    let mut grep = Command::new("grep");
+    grep.arg("-rEiIH");
+    match mode {
+        Mode::Content => grep.args(["-n", "-C", context]),
+        Mode::Files => grep.arg("-l"),
+        Mode::Count => grep.arg("-c"),
+    };
+    for d in SKIP_DIRS {
+        grep.arg(format!("--exclude-dir={d}"));
+    }
+    if let Some(g) = glob {
+        grep.arg(format!("--include={g}"));
+    }
+    grep.args(["-e", pattern, "--", path]);
+    let child = spawn_query(&mut grep).context("cannot start grep fallback")?;
+    let (output, diagnostics, exit_code, termination) =
+        collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, None)?;
+    Ok(unaudited("grep", mode, output, diagnostics, exit_code, termination))
+}
+
+fn unaudited(
+    engine: &'static str,
+    mode: Mode,
+    output: Capture,
+    diagnostics: Capture,
+    exit_code: Option<i32>,
+    termination: &'static str,
+) -> SearchResult {
+    let output = match mode {
+        Mode::Content => output,
+        Mode::Files => present_files(output, '\n'),
+        Mode::Count => present_counts(output, ':'),
+    };
+    SearchResult {
+        engine,
+        mode,
+        scan_complete: false,
+        audit_complete: false,
+        match_limit_possible: false,
+        column_limit_possible: false,
+        output,
+        diagnostics,
+        exit_code,
+        termination,
+    }
+}
+
 /// The top of the git work tree holding `dir`, found by its `.git` entry.
 pub fn repo_root(dir: &Path) -> Option<&Path> {
     dir.ancestors().find(|d| d.join(".git").exists())
+}
+
+/// Matching file names, most recently modified first as `glob` lists them.
+/// A name cut off by the capture limit is dropped rather than shown half.
+fn present_files(raw: Capture, sep: char) -> Capture {
+    let mut names: Vec<&str> = raw.text.split(sep).collect();
+    if raw.truncated && !raw.text.ends_with(sep) {
+        names.pop();
+    }
+    let mut stamped: Vec<_> = names
+        .into_iter()
+        .filter(|n| !n.is_empty())
+        .map(|n| (fs::metadata(n).and_then(|m| m.modified()).ok(), n))
+        .collect();
+    stamped.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let mut text = String::with_capacity(raw.text.len());
+    for (_, name) in stamped {
+        text.push_str(name);
+        text.push('\n');
+    }
+    Capture { text, truncated: raw.truncated }
+}
+
+/// `path:count` for each file with a match, sorted by path, then the total.
+/// `sep` divides a path from its count in the engine's output.
+fn present_counts(raw: Capture, sep: char) -> Capture {
+    let mut truncated = raw.truncated;
+    let mut lines: Vec<&str> = raw.text.lines().collect();
+    if raw.truncated && !raw.text.ends_with('\n') {
+        lines.pop();
+    }
+    let mut counts = Vec::with_capacity(lines.len());
+    for line in lines {
+        match line.rsplit_once(sep).and_then(|(path, n)| Some((path, n.parse::<u64>().ok()?))) {
+            // grep -c names every file it read, matching or not.
+            Some((_, 0)) => {}
+            Some(count) => counts.push(count),
+            None => truncated = true,
+        }
+    }
+    counts.sort_unstable();
+    let mut text = String::new();
+    for (path, n) in &counts {
+        let _ = writeln!(text, "{path}:{n}");
+    }
+    if !counts.is_empty() {
+        let total: u64 = counts.iter().map(|c| c.1).sum();
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let _ = writeln!(
+            text,
+            "{total} match{} in {} file{}",
+            if total == 1 { "" } else { "es" },
+            counts.len(),
+            plural(counts.len())
+        );
+    }
+    Capture { text, truncated }
 }
 
 /// Audit every drained frame independently of the retained display prefix.
@@ -792,6 +923,7 @@ mod tests {
         assert_eq!(output.text.len(), 40);
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: true,
             audit_complete: true,
             match_limit_possible: false,
@@ -872,6 +1004,7 @@ mod tests {
     fn rendered_bound_retains_completeness_flags_and_diagnostics() {
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: true,
             match_limit_possible: false,
@@ -911,7 +1044,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let result = search_with(script.to_str().unwrap(), "needle", ".", None, 0, &|| false);
+        let result = search_with(script.to_str().unwrap(), "needle", ".", None, 0, Mode::Content, &|| false);
         fs::remove_dir_all(dir).unwrap();
         let result = result.unwrap();
         assert_eq!(result.exit_code, Some(0));
@@ -942,6 +1075,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
     fn partial_matches_keep_diagnostics_and_never_claim_complete() {
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -959,13 +1093,21 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
 
     #[test]
     fn missing_rg_falls_back_without_claiming_semantic_parity() {
-        let result =
-            search_with("/rusty/nonexistent-rg", &"pub fn search".to_uppercase(), file!(), None, 0, &|| false).unwrap();
+        let result = search_with(
+            "/rusty/nonexistent-rg",
+            &"pub fn search".to_uppercase(),
+            file!(),
+            None,
+            0,
+            Mode::Content,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(result.engine, "grep");
         assert!(!result.scan_complete);
         assert!(!result.output.text.is_empty());
         assert!(result.render().contains("parity unavailable"));
-        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0, &|| false).unwrap();
+        let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0, Mode::Content, &|| false).unwrap();
         assert!(empty.render().contains("no matches observed; search incomplete"));
     }
 
@@ -986,6 +1128,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
         assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
         let result = SearchResult {
             engine: "rg",
+            mode: Mode::Content,
             scan_complete: false,
             audit_complete: false,
             match_limit_possible: false,
@@ -1002,7 +1145,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
     #[test]
     #[cfg(unix)]
     fn caller_cancellation_reaps_the_owned_child() {
-        let before = search_with("/rusty/nonexistent-rg", "needle", ".", None, 0, &|| true).unwrap();
+        let before = search_with("/rusty/nonexistent-rg", "needle", ".", None, 0, Mode::Content, &|| true).unwrap();
         assert_eq!(before.termination, "cancelled");
         assert!(!before.scan_complete && before.output.text.is_empty());
         let mut cmd = Command::new("sh");
@@ -1189,5 +1332,63 @@ os._exit(0)
         let plain = files_under(&root);
         assert!(!plain.ignores_applied && plain.files.len() == files.len() - 1);
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_and_count_modes_list_names_and_totals() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rusty-query-modes-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("rg-fixture");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+case " $* " in *" --max-count "*) exit 64;; esac
+case " $* " in
+  *" --files-with-matches "*) printf 'b.rs\000a.rs\000' ;;
+  *" --count-matches "*) printf 'z.rs\0003\na.rs\0002\n' ;;
+  *) exit 65 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let program = script.to_str().unwrap();
+        let files = search_with(program, "needle", ".", None, 0, Mode::Files, &|| false);
+        let counts = search_with(program, "needle", ".", None, 0, Mode::Count, &|| false);
+        fs::remove_dir_all(dir).unwrap();
+        let files = files.unwrap();
+        // Neither name exists here, so both lack a time and fall back to name order.
+        assert_eq!(files.output.text, "a.rs\nb.rs\n");
+        assert!(files.scan_complete && files.render().contains("most recently modified first"));
+        let counts = counts.unwrap();
+        assert_eq!(counts.output.text, "a.rs:2\nz.rs:3\n5 matches in 2 files\n");
+        assert!(counts.scan_complete);
+    }
+
+    #[test]
+    fn matching_files_come_newest_first_and_a_cut_name_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("rusty-query-newest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.rs"), dir.join("new.rs"));
+        for (path, age) in [(&old, 3600), (&new, 60)] {
+            let file = fs::File::create(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(age)).unwrap();
+        }
+        let raw = format!("{}\0{}\0{}/cut", old.display(), new.display(), dir.display());
+        let shown = present_files(Capture { text: raw, truncated: true }, '\0');
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(shown.text, format!("{}\n{}\n", new.display(), old.display()));
+        assert!(shown.truncated);
+        let counts = present_counts(Capture { text: "a.rs:0\nb.rs:1\n".into(), truncated: false }, ':');
+        assert_eq!(counts.text, "b.rs:1\n1 match in 1 file\n");
+    }
+
+    #[test]
+    fn output_modes_parse_by_name() {
+        assert!(Mode::parse(None).is_ok_and(|m| m == Mode::Content));
+        assert!(Mode::parse(Some("files_with_matches")).is_ok_and(|m| m == Mode::Files));
+        assert!(Mode::parse(Some("lines")).is_err());
     }
 }

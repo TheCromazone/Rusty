@@ -57,9 +57,12 @@ terminal, shaped so each call returns as little as possible while still
 answering the question.
 
 1. **Locate before you read.** `search` (ripgrep, smart case, bounded display,
-   optional context lines and globs) answers "where", `glob` answers "which
-   files", and `outline` answers "what's in here" with signatures and line
-   numbers. Only then `read_file`, for a range.
+   optional context lines and globs) answers "where": first which files match
+   (`output_mode: files_with_matches`), then the lines. `glob` answers "which
+   files", newest first and without what `.gitignore` ignores, and `outline`
+   answers "what's in here" with signatures and line numbers. Only then
+   `read_file`, for a range. There is no embedding index to build or keep
+   fresh: every answer is read from the files as they are now.
 2. **Exact edits.** `edit_file` replaces one unique string. It fails loudly
    when the match is ambiguous and never guesses.
 3. **The shell for everything else.** `bash` runs builds, tests, git and

@@ -1,5 +1,5 @@
 //! Offline correctness receipts: compare live queries with an unbounded direct rg reference.
-use rusty::workspace_query::{files_under, search, SearchResult};
+use rusty::workspace_query::{files_under, search, Mode, SearchResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,7 +23,7 @@ impl Fixture {
         fs::write(path, contents).unwrap();
     }
     fn query(&self, pattern: &str, glob: Option<&str>, context: u64) -> SearchResult {
-        let result = search(pattern, self.0.to_str().unwrap(), glob, context).unwrap();
+        let result = search(pattern, self.0.to_str().unwrap(), glob, context, Mode::Content).unwrap();
         assert_eq!(result.engine, "rg", "correctness fixtures require installed ripgrep");
         let mut reference = Command::new("rg");
         reference.args([
@@ -181,7 +181,7 @@ fn output_truncation_is_distinct_from_incomplete_scans() {
     assert!(wide.output.text.contains("[Omitted "));
     let invalid = f.query("[", None, 0);
     assert!(!invalid.scan_complete && !invalid.diagnostics.text.is_empty());
-    let missing = search("needle", f.0.join("missing").to_str().unwrap(), None, 0).unwrap();
+    let missing = search("needle", f.0.join("missing").to_str().unwrap(), None, 0, Mode::Content).unwrap();
     assert!(!missing.scan_complete && missing.render().contains("search incomplete"));
     assert!(missing.render().contains("missing"));
 }
@@ -246,6 +246,27 @@ fn skipped_paths_and_partial_matches_keep_error_evidence() {
     assert!(report.contains("scan_complete=false output_truncated=false"));
 }
 
+#[test]
+fn file_and_count_modes_agree_with_ripgrep_visibility() {
+    let f = Fixture::new();
+    git(&f.0, &["init", "-q"]);
+    f.put(".gitignore", "ignored/\n");
+    f.put("src/a.rs", "needle\nneedle\n");
+    f.put("b.rs", "needle\n");
+    f.put("ignored/c.rs", "needle\n");
+    f.put("d.rs", "nothing\n");
+    let root = f.0.to_str().unwrap();
+    let files = search("needle", root, None, 0, Mode::Files).unwrap();
+    assert_eq!(files.engine, "rg", "correctness fixtures require installed ripgrep");
+    assert!(files.scan_complete && !files.output.truncated);
+    let mut names: Vec<&str> = files.output.text.lines().collect();
+    names.sort_unstable();
+    assert_eq!(names, [format!("{root}/b.rs"), format!("{root}/src/a.rs")]);
+    let counts = search("needle", root, None, 0, Mode::Count).unwrap();
+    assert!(counts.scan_complete);
+    assert_eq!(counts.output.text, format!("{root}/b.rs:1\n{root}/src/a.rs:2\n3 matches in 2 files\n"));
+}
+
 /// Same-machine plumbing timing, not solve-rate evidence. Explicitly opt in.
 #[test]
 #[ignore = "opt-in same-machine timing benchmark; run with --ignored --nocapture"]
@@ -287,7 +308,7 @@ fn benchmark_query_reference_and_legacy() {
         };
         let current = || {
             let start = Instant::now();
-            let result = search("needle", f.0.to_str().unwrap(), None, 0).unwrap();
+            let result = search("needle", f.0.to_str().unwrap(), None, 0, Mode::Content).unwrap();
             let elapsed = start.elapsed().as_micros();
             assert!(result.scan_complete && !result.output.truncated);
             (elapsed, result.output.text)

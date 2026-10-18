@@ -23,7 +23,13 @@ observed by that scan. No snapshot identity or persisted freshness is claimed.
 ## Matching and visibility
 
 Search invokes ripgrep on every request with smart case, line numbers, and
-optional glob/context arguments (context is clamped to ten lines). It retains
+optional glob/context arguments (context is clamped to ten lines).
+`output_mode` picks what comes back: `content` (matching lines, the default),
+`files_with_matches` (only the names of matching files, most recently
+modified first) or `count` (matches per file, sorted by path, then the total).
+The two shorter modes have no per-file match or column cap, so they skip the
+streaming audit described below; a clean ripgrep exit with no diagnostics is
+a complete scan. Every mode retains
 ripgrep's default hidden, binary, and ignore rules, including explicit glob
 overrides. Descendant symlinks are not followed. Ambient config is disabled.
 
