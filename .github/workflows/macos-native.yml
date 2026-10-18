@@ -1,0 +1,42 @@
+name: native contracts
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/worker.rs'
+      - 'apps/macos/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/macos-native.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/worker.rs'
+      - 'apps/macos/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/macos-native.yml'
+permissions:
+  contents: read
+concurrency:
+  group: native-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  native-contracts:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      RUST_TEST_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: worker protocol and repository inspection
+        run: |
+          cargo test --bin rusty protocol::tests --locked
+          cargo test --bin rusty inspect::tests --locked
+          cargo test --bin rusty session_worker::tests --locked
+          cargo test --test worker --locked
+      - name: Swift protocol fixtures
+        run: swift test --package-path apps/macos/RustyKit --jobs 2

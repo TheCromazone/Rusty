@@ -24,6 +24,7 @@ mod ignores;
 mod json;
 mod memory;
 mod message;
+mod native;
 mod pattern;
 mod provider;
 mod pty;
@@ -55,6 +56,9 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<ExitCode> {
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
+        Some("protocol-fixtures") => native::protocol().map(|()| ExitCode::SUCCESS),
+        Some("cli-gate") => native::cli_gate(rest).map(|()| ExitCode::SUCCESS),
+        Some("fixture-provider") => native::fixture_provider(rest).map(|()| ExitCode::SUCCESS),
         Some("qa") => qa::command(rest),
         Some("flaky") => testing::flaky(rest),
         Some("worktree") => worktree::command(rest),
