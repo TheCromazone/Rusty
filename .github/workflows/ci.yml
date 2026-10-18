@@ -178,7 +178,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
-          if git -C after diff --quiet "$BASE" "$HEAD" -- \
+          if git -C after diff --quiet "$BASE...$HEAD" -- \
             src/tools.rs src/cloud/image.rs src/cloud/digest.rs src/cloud/api.rs \
             examples/cloud_perf.rs scripts/cloud-memory-bench.py \
             .github/workflows/ci.yml .github/workflows/cloud-memory.yml; then
@@ -249,7 +249,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
-          if git diff --quiet "$BASE" "$HEAD" -- 'src/cloud/' 'src/backend.rs' 'tests/cloud_hybrid.rs' '.github/workflows/ssh-network.yml' '.github/workflows/ci.yml'; then
+          if git diff --quiet "$BASE...$HEAD" -- 'src/cloud/' 'src/backend.rs' 'tests/cloud_hybrid.rs' '.github/workflows/ssh-network.yml' '.github/workflows/ci.yml'; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
           else
@@ -334,7 +334,7 @@ jobs:
           HEAD: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: |
-          if git diff --quiet "$BASE" "$HEAD" -- 'Dockerfile' 'Cargo.toml' 'Cargo.lock' 'src/' '.github/workflows/container.yml' '.github/workflows/ci.yml'; then
+          if git diff --quiet "$BASE...$HEAD" -- 'Dockerfile' 'Cargo.toml' 'Cargo.lock' 'src/' '.github/workflows/container.yml' '.github/workflows/ci.yml'; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
             echo 'No relevant changes; scoped gate was not selected.' >> "$GITHUB_STEP_SUMMARY"
           else
