@@ -45,6 +45,10 @@ flowchart LR
     Tools --> Lead
 ```
 
+Jump to [everyday feature explanations](#everyday-features-explained),
+[quickstart](#quickstart), [demos](#see-the-modes-in-action), or
+[the command reference](#commands).
+
 **[Read the simple architecture guide](docs/HOW_IT_WORKS.md)** for diagrams
 and plain explanations of `/goal`, memory, compaction, subagents, swarms,
 execution modes, permissions, side discussions, sessions, tools, and budgets.
@@ -129,25 +133,249 @@ whether to delegate. `/agents off` keeps the work with the lead. The recording
 shows each setting handling a source inspection; the separate swarm clip shows
 parallel module audits.
 
-## Everything else
+## Everyday features, explained
 
-| | |
+### Auto-compaction: make room before the conversation fills up
+
+**This happens automatically.** The model can only read a limited amount in
+one request: its context window. As that space fills, Rusty first shortens
+older tool output, then summarizes older conversation so work can continue.
+You see a notice when it compacts.
+
+```mermaid
+flowchart LR
+    Full["Context fills up"] --> Trim["Shorten old tool output"]
+    Trim --> Summarize["Summarize older work"]
+    Summarize --> Continue["Continue with room to work"]
+```
+
+The goal and plan stay outside ordinary history. User instructions and useful
+working-set details are carried forward within their budgets. A summary can
+lose detail, so name anything especially important when you compact manually:
+
+```text
+/compact keep the rounding rules and the failing test cases
+/context
+```
+
+`/context` shows where the space is going. You can also choose when automatic
+compaction happens:
+
+| Setting | Shorten old tool output after | Summarize older work after |
+|---|---|---|
+| `aggressive` | 40% | 60% |
+| `standard` | 60% | 80% |
+| `passive` | 75% | 95% |
+| `smart` | 60% | 80%, or a suitable work boundary chosen by the model |
+
+These percentages refer to usable context; a history cap can trigger it
+earlier. If you have not chosen a setting, windows below 48k tokens use
+aggressive, and larger ones use standard. Smart mode keeps the normal
+thresholds as a backstop and can refuse a badly timed compaction.
+
+```text
+/compact settings smart
+```
+
+`--history-cap-tokens` sets an earlier history ceiling. `--compaction-model`
+can use a different model for summaries, with the session model as fallback.
+[Context details](docs/DESIGN.md#token-allocation).
+
+### Memory: useful notes for the next task
+
+Memory saves small lessons such as “prices are in cents” or “run this test
+before editing the parser.” The local memory helper chooses relevant notes
+for later requests using their relevance, track record, and file freshness.
+Preferences are included separately when memory is enabled.
+
+```text
+/remember gotcha: prices are in cents; use integer arithmetic
+/memory list
+/memory search prices
+/forget <id>
+```
+
+| Startup setting | What it adds |
 |---|---|
-| **High-recall context** | Budgets scale with the model's real context window, and fullness comes from the provider's own token counts. Old tool output gets trimmed first, because it can be re-read, and only then are older turns summarised. Your messages, the plan and the goal survive every compaction, and a file whose edits were undone is listed as unchanged rather than changed. |
-| **Real memory** | Typed lessons (`preference`, `fact`, `decision`, `gotcha`) offered one at a time when BM25 relevance × confidence × file freshness clears a bar, not a file pasted into every prompt. Lessons are tied to the files they describe and gain or lose confidence only when a goal's fixed check passes or fails. `--memory off · recall · learn · reflect · deep` sets how aggressively memory captures, applies and prunes ([docs/MEMORY.md](docs/MEMORY.md)). Benchmark runs should pass `--memory off`. |
-| **Permission classifier** | Builds, installs, feature-branch pushes and read-only cloud commands just run. Pushes to main, deploys and anything unclear ask. Force pushes, cloud and database deletes and `terraform destroy` need a typed yes every time, even in yolo. |
-| **Execution modes** | `careful` has a read-only checker review finished work, `vibe` moves fast with a few read-only workers, `standard` sits in between. Separate from permissions. |
-| **Infrastructure harness** | Knows where it's pointed: the banner and `/target` show the kube context, cloud account, Terraform workspace and branch, and a production target makes auto pick careful. In careful mode there's no apply without a diff or plan from the same session, a snapshot of what a change touches is taken before it runs, and the rollout is checked after. Every infra command goes into an audit log, and `/changes` shows what the session changed. See [docs/INFRA.md](docs/INFRA.md). |
-| **Secrets stay out of the transcript, and still work** | Tool output is redacted before the model, the screen or a session file sees it. Each secret shows up as a name like `${RUSTY_SECRET_1}` that your shell commands can use, so the agent can connect to a database with a password it never reads. |
-| **`/loop`** | `/loop 5m check CI and fix failures`, or let rusty set its own pace. |
-| **Subagents and swarms** | `/agents sub\|swarm\|auto`. A swarm takes up to 32 tasks and runs them through a pool, and workers share findings with each other while they work, so they build on each other instead of repeating searches. Workers are read-only; the lead confirms what they found and makes every change. Models can rotate and temperatures spread. Off by default, so you never pay for tokens you didn't ask for. |
-| **Skills** | `/review` `/explore` `/feature` `/debug` `/test` `/commit`, plus your own markdown skills per project or per user. |
-| **MCP servers** | Put stdio servers in `.mcp.json` (`{"mcpServers": {...}}`, or point `RUSTY_MCP_CONFIG` at one) and their tools, every page of them, appear as `mcp__server__tool`; a name that is too long or clashes ends in a stable hash. Reads run freely, deletes (by name or `destructiveHint`) need a typed yes, everything else follows your permission mode. A broken or `url` server is skipped with a warning unless it has `"required": true` or `"requiredTools": [...]`, which stop startup. `rusty --mcp-check` prints what connected as JSON, with a `reason` for each gap (`unsupported_transport`, `bad_config`, `start_failed`, `handshake_failed`, `discovery_failed`, `missing_tools`), and exits 1 if something required is missing. |
-| **Terminal-native tools** | `search` (ripgrep), `glob`, `outline` (definitions with line numbers), ranged `read_file`, exact `edit_file`, `bash`. Find first, then read only what you need. An edit that would break a file that parsed before is refused, with the line and the error: a JSON file always, a Python or shell file when its parser is installed. |
-| **Knows where it is and what's left** | The first request carries a snapshot of the workspace (files, git state, the CLIs on PATH), so no calls go on `ls` and `which`. In a bounded run every request says how many calls, tokens and minutes are left, and near the end it says to finish rather than explore. Goals close only with evidence for each requirement. |
-| **Token tips** | After a turn that spent heavily, one specific tip based on what actually happened, never generic nagging. |
-| **Instant Ctrl-C** | Stops a turn mid-stream in about 15 ms, and the next turn works. Type while it works and your message runs next. Press Ctrl-C twice to quit. |
-| **Looks good** | Rust-and-steel themes, a starfield banner with today's mission line, a steady geometric status panel with falling diamonds, grouped tool lines, rendered markdown. |
+| `--memory off` | Work without memory; useful for isolated benchmarks. |
+| `--memory recall` | Retrieve relevant saved notes. |
+| `--memory learn` | Also observe recent tool activity and update eligible notes from a goal's fixed check. This is the default. |
+| `--memory reflect` | Also use a budgeted reflection after checked goals; successful checks can produce short new notes. |
+| `--memory deep` | Allow more advice and more aggressive reflection and retirement. |
+
+The helper, `rusty-memoryd`, starts on demand and stores notes locally. It does
+matching and bookkeeping; reflection uses the lead's model client and budget.
+Notes can be merged, lose trust, or be retired. `/memory helpful <id>` and
+`/memory harmful <id>` let you give feedback. [Memory details](docs/MEMORY.md).
+
+### Context, sessions, and memory each keep something different
+
+| Thing | Easy way to think about it | Command |
+|---|---|---|
+| Context | Papers currently on the model's desk. | `/context`, `/compact` |
+| Session | The saved folder for this particular job. | `/resume`, `rusty -c` |
+| Memory | A notebook of lessons for future jobs. | `/remember`, `/memory` |
+
+`rusty -c` resumes the latest session here. `/resume <words>` searches saved
+work. `/clear` starts a fresh conversation while keeping long-term memory.
+
+### Goals and plans: keep a finish line in view
+
+`/goal fix the discount tests` keeps an objective open across turns. A plan
+breaks it into smaller steps; `/plan` shows that checklist. The lead performs
+the work through tools and proposes completion with evidence.
+
+To have the runtime decide completion using a check you chose beforehand:
+
+```sh
+rusty --goal "fix the discount tests" --verify "python3 -m unittest -q"
+```
+
+The fixed check runs after remaining work and any required careful review.
+Failure or an unconfirmed result keeps the goal open. `/goal status` shows
+progress, `/goal resume` continues, and `/goal clear` drops the objective.
+A goal without `--verify` has no pinned acceptance command.
+[Verification details](docs/VERIFICATION.md).
+
+### Modes, permissions, workers, and views are separate knobs
+
+| Knob | What it controls | Choices |
+|---|---|---|
+| `/mode` | How much thinking and checking to ask for. | `auto`, `careful`, `standard`, `vibe` |
+| `/permissions` | What may run without asking you. | `read-only`, `ask`, `auto`, `yolo` |
+| `/agents` | Whether optional research helpers are available. | `off`, `sub`, `swarm`, `auto`, `default` |
+| `/view` | How much work appears on screen. | `default`, `verbose`, `adhd` |
+
+Careful adds one read-only completion checker for changed work; the lead makes
+any fixes. Vibe favors small iterations and can use a small worker pool. Auto
+chooses a profile and explains why. These choices do not grant permissions.
+The careful checker still applies when optional delegation is off.
+
+Default view groups exploration; verbose expands calls and results; ADHD
+keeps a short display and concise answers. [Execution details](#execution-modes)
+· [Permission details](#permissions).
+
+### Subagents and swarms: extra readers, one lead editor
+
+A subagent takes one focused question, reads in its own context, and returns
+a report. A swarm runs several jobs through a pool. Workers can share short
+findings while they work. They are read-only; the lead assesses their reports,
+makes the changes, and verifies the result.
+
+```text
+/agents sub
+/agents swarm
+/swarm size 2
+```
+
+These settings make delegation available; the lead still chooses when to use
+it. `/agents auto` lets it choose the arrangement. `/agents off` disables
+optional helpers. `/agents default` follows the execution profile: vibe uses
+small automatic delegation, while other profiles default to off.
+
+`/swarm size` sets how many workers run at once, up to 16 locally; a call can
+contain up to 32 tasks. `/agents model` chooses a worker model. `/swarm models`
+and `/swarm spread` tune model rotation and temperature spread. Extra workers
+use extra model requests from the shared budget.
+
+### `/btw` and `/side`: follow a tangent without losing the main task
+
+`/btw why did that test fail?` answers from a snapshot of existing context,
+without tools or inserting the exchange into the main conversation.
+
+`/side new rounding` opens a persistent read-only discussion with its own
+history. `/side list` finds discussions; `/side open <id or name>` reopens one.
+Use `/send main` to explicitly queue a summary of side findings, and `/back`
+to return to the main task. The main chat checks observed file versions when
+accepting a summary, so stale observations can be flagged.
+
+### `/loop`: repeat a check while Rusty is running
+
+```text
+/loop 5m x3 check the test results and report changes
+```
+
+This repeats the prompt every five minutes, up to three runs. Without a fixed
+interval, Rusty can choose its next delay. A loop is useful for repeated
+checks; a goal works toward a finish line. The loop stops with the process.
+
+### Tools, skills, and MCP: find things, do work, reuse a routine
+
+| Feature | What happens |
+|---|---|
+| `search`, `glob`, `outline` | Find a file or definition before reading lots of code. |
+| `read_file` | Read the relevant part of a file. |
+| `write_file`, `edit_file` | Create a file or replace an exact, unambiguous string. Supported syntax checks can refuse a broken edit. |
+| `bash` | Run a command under the permission policy, with bounded output and a timeout. |
+| Owned running commands | Track a live command, inspect its status, and cancel it. A saved transcript cannot recreate its live handle. |
+| `/review`, `/debug`, `/test`, `/feature` | Load reusable instructions that guide the lead's normal work loop. `/skills` lists built-ins and your own routines. |
+| MCP servers | Discover additional tools from configured stdio servers and apply permission checks when calling them. |
+
+Put MCP servers in `.mcp.json`, or set `RUSTY_MCP_CONFIG` to a configuration file.
+`rusty --mcp-check` reports what connected and why anything is missing. Required
+servers or tools can stop startup if unavailable; unsupported URL transports
+are reported. [Tool architecture](docs/HOW_IT_WORKS.md#tools-the-hands-rusty-uses).
+
+### Local or cloud tools: choose where commands land
+
+Local tools run on your machine. Hybrid Daytona keeps the lead and memory
+local while file and shell tools run in a configured sandbox. A full cloud run
+moves the coordinator there too; model requests still use the provider.
+
+`/tools local` or `/tools daytona` saves the default for the next session;
+it does not move active work. A remote setup requires its bridge and an
+existing environment. [Cloud setup](docs/CLOUD.md).
+
+For infrastructure, `/target` shows the target account, context, workspace, and
+branch. Careful mode applies relevant plan/diff and rollout checks. `/audit`
+shows attempted infrastructure actions; `/changes` shows changed resources.
+[Infrastructure details](docs/INFRA.md).
+
+### Models, usage, and limits: see and bound the work
+
+`/model` switches models while keeping the conversation in view. `/models`
+lists available choices. `/doctor` checks configured providers and routing,
+showing key names rather than values.
+
+`/tokens` shows usage. `--stats` prints totals and `--trajectory` saves a record
+of work. Request, token, and time limits are opt-in and shared across model
+calls, including workers and reviews:
+
+```sh
+rusty --max-requests 20 --max-budget-tokens 100000 --budget-secs 300 \
+  "explain the failing tests"
+```
+
+These are model admission limits, not a dollar billing cap. Near a bounded
+run's end, the lead is told what remains and asked to finish rather than explore.
+`/tips off` hides usage tips; `/tips on` restores them.
+
+### Interrupts, repetition guards, and secrets: small protections during work
+
+Ctrl-C interrupts a turn and cancels owned work. Inspect partial effects before
+retrying. You can type a follow-up while Rusty works; it runs next. Press
+Ctrl-C twice to quit.
+
+Four consecutive identical calls returning unchanged results stop a turn.
+A changed result or different call resets that counter. This catches a
+particular repeated-call loop; it does not detect every kind of stalled work.
+
+Recognized secrets in tool output are redacted before the model, screen, and
+saved transcript see them. For local tools, handles such as `${RUSTY_SECRET_1}`
+let an approved shell command reuse the value. Detection covers known patterns,
+so avoid intentionally printing credentials.
+
+### Menus and appearance: find the command without memorizing it
+
+Type `/` to open the command menu. Keep typing to narrow it, use arrows to
+choose, Tab to complete, and Enter to run or fill in an argument. Unknown
+commands get a suggestion. Destructive session commands require an unambiguous
+spelling.
+
+`/theme` changes colors and `/font` changes the banner lettering. `/settings`
+shows saved choices; command-line options can override relevant choices for a
+run. `/help` lists commands. The [command reference](#commands) below keeps the
+exact syntax in one place.
 
 ## Quickstart
 
