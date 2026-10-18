@@ -96,7 +96,7 @@ impl Drop for StalledSocket {
 }
 
 #[test]
-fn real_stalled_socket_times_out_and_joins_the_hook_worker() {
+fn real_stalled_socket_times_out_and_releases_worker_state() {
     use std::sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -171,7 +171,7 @@ fn real_stalled_socket_times_out_and_joins_the_hook_worker() {
     }
     assert!(real_wait, "socket journey must use the real timed wait");
     assert!(initially_live, "worker lifetime witness was never live");
-    assert!(worker.upgrade().is_none(), "hook worker retained after dropping Hooks");
+    assert!(worker.upgrade().is_none(), "hook worker scope retained after dropping Hooks");
     server_result.unwrap().unwrap();
     assert!(advice.is_empty());
     assert_eq!(timeouts, 1);
