@@ -87,6 +87,14 @@ fn spawn_query(cmd: &mut Command) -> std::io::Result<Child> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // Group ownership requires that no other handler can reap this child.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if action.sa_sigaction != libc::SIG_DFL || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err(std::io::Error::other("query child requires exclusive SIGCHLD ownership"));
+        }
         cmd.process_group(0);
         cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
     }
@@ -97,32 +105,60 @@ fn spawn_query(cmd: &mut Command) -> std::io::Result<Child> {
     }
 }
 
-/// Always reap the owned child and kill its ordinary descendants, including error paths.
+/// Abnormal cleanup signals only an owned, unreaped process group.
 struct QueryChild {
     child: Child,
     group_cleaned: bool,
+    reaped: bool,
 }
 impl QueryChild {
     fn kill_group(&mut self) -> bool {
-        if self.group_cleaned {
+        if self.group_cleaned || self.reaped {
             return false;
         }
-        self.group_cleaned = true;
         #[cfg(unix)]
         {
-            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) == 0 }
+            // Like the SSH transport, observe ownership without releasing the PID.
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let result = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        self.child.id() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                if result == 0 {
+                    break;
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    self.reaped = true; // Never signal after ECHILD or uncertain ownership.
+                    return false;
+                }
+            }
+            self.group_cleaned = true;
+            let killed = unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) == 0 };
+            if !killed {
+                let _ = self.child.kill(); // Ownership was verified and the PID is still unreaped.
+            }
+            killed
         }
         #[cfg(not(unix))]
         {
+            self.group_cleaned = true;
             self.child.kill().is_ok()
         }
     }
 }
 impl Drop for QueryChild {
     fn drop(&mut self) {
-        self.kill_group();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            self.kill_group();
+            if !self.reaped {
+                let _ = self.child.wait();
+            }
+        }
     }
 }
 
@@ -133,7 +169,7 @@ fn collect_query_cancellable(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     use std::os::fd::AsRawFd;
-    let mut child = QueryChild { child, group_cleaned: false };
+    let mut child = QueryChild { child, group_cleaned: false, reaped: false };
     let mut stdout = child.child.stdout.take().expect("piped stdout");
     let mut stderr = child.child.stderr.take().expect("piped stderr");
     for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
@@ -154,18 +190,19 @@ fn collect_query_cancellable(
         if status.is_none() {
             status = child.child.try_wait()?;
             if status.is_some() {
+                child.reaped = true;
                 exited_at = Some(Instant::now());
-                if child.kill_group() {
-                    termination = "descendants_killed";
-                }
             }
         }
         let was_cancelled = cancelled();
         if was_cancelled || started.elapsed() >= timeout {
             termination = if was_cancelled { "cancelled" } else { "deadline" };
-            child.kill_group();
-            let _ = child.child.kill();
-            status = Some(child.child.wait()?);
+            if status.is_none() {
+                child.kill_group();
+                anyhow::ensure!(!child.reaped, "query child ownership lost before cleanup");
+                status = Some(child.child.wait()?);
+                child.reaped = true;
+            }
             break;
         }
         if status.is_some() && output.eof && diagnostics.eof {
@@ -188,7 +225,7 @@ fn collect_query_cancellable(
     _: Duration,
     _: &dyn Fn() -> bool,
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
-    drop(QueryChild { child, group_cleaned: false });
+    drop(QueryChild { child, group_cleaned: false, reaped: false });
     anyhow::bail!("bounded workspace search requires Unix pipes")
 }
 
@@ -643,20 +680,73 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
 
     #[test]
     #[cfg(unix)]
-    fn exited_child_cannot_leave_descendants_holding_output_pipes() {
+    fn cleanup_refuses_to_signal_an_already_reaped_group() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        let child = spawn_query(&mut cmd).unwrap();
+        let mut owned = QueryChild { child, group_cleaned: false, reaped: false };
+        owned.child.wait().unwrap();
+        assert!(!owned.kill_group());
+        assert!(owned.reaped && !owned.group_cleaned);
+        // Drop must also skip group and individual PID signals in this state.
+        drop(owned);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cancellation_and_deadline_after_normal_reap_preserve_status() {
+        for cancel in [false, true] {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 0.3 & printf done"]);
+            let child = spawn_query(&mut cmd).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            // Observe normal exit without reaping, so the collector's first poll
+            // deterministically reaps before the cancellation/deadline check.
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let observed = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child.id() as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                };
+                assert_eq!(observed, 0);
+                if unsafe { info.si_pid() } != 0 {
+                    break;
+                }
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let timeout = if cancel { Duration::from_secs(5) } else { Duration::ZERO };
+            let (out, _, status, reason) = collect_query_cancellable(child, timeout, &|| cancel).unwrap();
+            assert_eq!(status, Some(0));
+            assert_eq!(out.text, "done");
+            assert_eq!(reason, if cancel { "cancelled" } else { "deadline" });
+            std::thread::sleep(Duration::from_millis(350));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reaped_child_with_inherited_pipes_is_not_signalled_again() {
         for _ in 0..5 {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", "sleep 30 & printf done"]);
+            // The fixture holder owns a finite lifetime; normal exit never signals
+            // a released PGID. It may keep the pipe open beyond our grace period.
+            cmd.args(["-c", "sleep 0.3 & printf done"]);
             let child = spawn_query(&mut cmd).unwrap();
             let pid = child.id();
             let started = Instant::now();
             let (out, _, code, reason) = collect_query(child, Duration::from_secs(2)).unwrap();
             assert_eq!(out.text, "done");
             assert_eq!(code, Some(0));
-            assert_eq!(reason, "descendants_killed");
+            assert_eq!(reason, "inherited_pipes");
             assert!(started.elapsed() < Duration::from_secs(10));
             assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+            std::thread::sleep(Duration::from_millis(350));
         }
     }
 

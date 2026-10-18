@@ -62,12 +62,14 @@ complete empty result.
 On Unix, query subprocesses have owned process groups and a 30-second deadline.
 The coordinator drains both pipes with nonblocking reads and bounded prefixes;
 it starts no reader threads. A per-iteration read budget prevents chatty stdout
-from starving stderr or deadline checks. Normal exit kills any ordinary
-remaining descendants and reaps the child. Timeout, caller cancellation, and I/O/setup failures also
-kill/reap through the same owner. An exited child gets at most 100 milliseconds
+from starving stderr or deadline checks. Normal exit reaps the leaf search
+process and disarms every PID/group signal path. Timeout, caller cancellation,
+and I/O/setup failures signal only a verified owned, unreaped group and then
+reap through the same owner. An exited child gets at most 100 milliseconds
 to close inherited pipes before the coordinator closes its descriptors. Escaped
-process groups are outside containment, but cannot strand a query reader thread.
-`termination=deadline`, `cancelled`, `descendants_killed`, or `inherited_pipes` makes a
+process groups and holders surviving a normal leaf exit are outside containment,
+but cannot strand a query reader thread. Nondefault SIGCHLD reaping policies
+are rejected before spawning. `termination=deadline`, `cancelled`, or `inherited_pipes` makes a
 search incomplete. Only `termination=exited` can report complete. OS scheduling
 and uninterruptible kernel operations prevent a hard real-time guarantee.
 Non-Unix search fails before spawning until bounded pipe support is implemented.
