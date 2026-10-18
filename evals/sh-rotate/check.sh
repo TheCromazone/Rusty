@@ -6,7 +6,7 @@ d="$root/my backups"
 mkdir -p "$d"
 i=0
 for day in 20260105 20251231 20260301 20260110 20240229; do
-  touch -d "2020-01-0$((5 - i)) 00:00" "$d/backup-$day.tar.gz"; i=$((i + 1))
+  touch -t "2020010$((5 - i))0000" "$d/backup-$day.tar.gz"; i=$((i + 1))
 done
 touch "$d/notes.txt" "$d/backup-latest.tar.gz" "$d/backup-20260101.tar.gz.part"
 bash ./rotate.sh "$d" 2 || fail "exit status"
