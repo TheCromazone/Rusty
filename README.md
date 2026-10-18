@@ -715,19 +715,9 @@ rusty also plugs into Harbor benchmarks with `--goal`, `--trajectory` and
 
 ## Inside
 
-```
-  prompt · /goal · /loop
-            │
-  ┌─────────▼──────────── agent loop ───────────┐      ┌──────────────┐
-  │ mode     auto ▸ careful · standard · vibe   │ ◀──▶ │ model, SSE   │
-  │ context  budgets · elision · /compact       │      │ key rotation │
-  │ memory   BM25 recall                        │      └──────────────┘
-  └─────┬────────────────────────────────┬──────┘
-        ▼                                ▼
-  permissions ▸ infra ▸ tools        read-only workers
-  runs · asks   target   bash        subagent · swarm
-  · needs you   audit    files       careful checker
-```
+<img src="docs/architecture.svg" alt="The rusty CLI starts the agent loop (understand, inspect, edit, test). Context and rusty-memoryd advise it, read-only task and swarm workers report to it, every tool call passes permissions and the infra gate, and a goal closes only after the completion gate's --verify check passes." width="100%">
+
+<sub>Solid arrows execute; dashed ones only advise. Without <code>--verify</code>, a goal closes on the model's own evidence; see <a href="docs/VERIFICATION.md">docs/VERIFICATION.md</a>.</sub>
 
 ```
 src/
