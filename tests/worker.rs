@@ -65,7 +65,17 @@ impl Worker {
             command.args(["--agents", "off"]);
         }
         if let Some(point) = fault {
-            if point == "approval_expiry" {
+            if point == "inherited_sigint_ignore" {
+                use std::os::unix::process::CommandExt;
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::signal(libc::SIGINT, libc::SIG_IGN) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            } else if point == "approval_expiry" {
                 command.env("RUSTY_WORKER_TEST_APPROVAL_TTL_MS", "50");
             } else {
                 command.env("RUSTY_WORKER_ABORT_AT", point);
@@ -126,6 +136,31 @@ impl Drop for Worker {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn worker_preserves_the_launchers_ignored_terminal_interrupts() {
+    let tmp = support::TempDir::new("native-ignored-interrupt");
+    let root = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut worker = Worker::start_fault(&root, &home, "http://127.0.0.1:9/v1", &[], Some("inherited_sigint_ignore"));
+    worker.until("session.ready");
+    // A native launcher owns terminal signal disposition. In particular the
+    // CLI's first/second Ctrl-C handler must not replace inherited SIG_IGN.
+    for index in 0..3 {
+        assert_eq!(unsafe { libc::kill(worker.child.id() as i32, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(worker.child.try_wait().unwrap().is_none(), "terminal handler ended the native worker");
+        let id = format!("after-interrupt-{index}");
+        worker.send(&id, "snapshot", json!({}));
+        assert_eq!(worker.response(&id)["result"]["phase"], "idle");
+    }
+    worker.send("stop", "shutdown", json!({}));
+    assert_eq!(worker.response("stop")["ok"], true);
+    worker.until("worker.closing");
+    assert!(worker.child.wait().unwrap().success());
 }
 fn text(s: &str) -> Value {
     json!({"choices":[{"delta":{"content":s},"finish_reason":"stop"}]})

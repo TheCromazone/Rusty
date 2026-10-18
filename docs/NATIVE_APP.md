@@ -186,3 +186,8 @@ model requests, bounded frames, requests and retained diagnostics, and owned
 process/server cleanup on failure. It spends no provider credits. Run the Rust
 and Swift recorded-wire contract tests after refreshing the fixture. This is
 worker qualification, not a native-app or live-provider E2E result.
+
+Native session workers preserve their launcher's terminal signal disposition.
+They do not install the interactive CLI's first/second Ctrl-C handler or save
+terminal state; clients cancel through `run.cancel` and close through `shutdown`.
+The ordinary CLI and tool-RPC signal paths retain their existing behavior.

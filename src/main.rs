@@ -377,8 +377,12 @@ fn run_inner(
         return Ok(0);
     }
 
-    signal::install();
-    signal::save_terminal();
+    // Native launchers own terminal signal disposition; cancellation travels
+    // through the private protocol instead of the CLI's double-Ctrl-C handler.
+    if !session_worker::active() {
+        signal::install();
+        signal::save_terminal();
+    }
     let mode = if cli.yolo {
         Mode::Yolo
     } else {
