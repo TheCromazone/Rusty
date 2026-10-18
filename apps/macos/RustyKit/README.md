@@ -26,7 +26,11 @@ The supervisor must stop work when transport is lost. No stdout parsing is used.
 `protocol` is version 1. A hello event carries `instance_id`, `seq`, schema hash
 and capabilities; compare the hello hash with generated `protocolSchemaHash`
 before submitting controls. Sequence values are meaningful only within one host instance.
-A snapshot's watermark belongs to that instance. Unknown protocol versions or
+A snapshot's watermark belongs to that instance.
+Start buffering events before requesting a snapshot. After applying the reply,
+discard buffered events at or below its watermark and replay newer ones; they
+can arrive before the reply. Sequence gaps require another snapshot even before
+the next emission can deliver a resync marker. Unknown protocol versions or
 methods fail closed. Unknown envelope fields and event kinds are tolerated;
 security-sensitive command parameters stay strict in the Rust authority. New
 optional parameters must decode when missing or null. Request ids have 1..128 ASCII letters, digits, `.`, `_`, `:`, or `-`.

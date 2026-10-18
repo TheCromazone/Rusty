@@ -70,8 +70,14 @@ count/truncation fields, rather than a separate `tool.uncertain` event.
 
 Snapshots include session identity, worker epoch, sequence watermark, bounded
 history, current streamed text, last tool and the complete pending approval.
-Use the watermark to discard already covered events. Live text is capped at
-128 KiB per content/reasoning stream and explicitly labels truncation; completed
+Use the watermark to discard already covered events.
+Before sending a snapshot request, start buffering incoming events. Its reply
+has a later sequence than its watermark, so events newer than the snapshot may
+arrive before the reply; replay those buffered events after applying it.
+Sequences are allocated before queue admission, so dropped events leave gaps.
+The resync marker is emitted on the next available event emission; detect gaps
+even when no marker has arrived yet.
+Live text is capped at 128 KiB per content/reasoning stream and explicitly labels truncation; completed
 transcripts remain authoritative. Deltas coalesce to approximately 30 Hz.
 A bounded event queue marks any dropped event with a resync requirement.
 The client must fetch a snapshot after sequence gaps; receipt queries recover
