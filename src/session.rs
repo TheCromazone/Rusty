@@ -134,9 +134,21 @@ pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
 /// plain JSON. Level 3 costs about 2 ms for 200 KB, close to level 6's size.
 const COMPRESS_FROM: usize = 64 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    // Enabled only by the catalog I/O regression, on that test's thread.
+    static CATALOG_READ_PROBE: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A transcript's JSON text, whether it was saved plain or compressed. The
 /// file keeps its `.json` name either way; `gzip -dc` reads a compressed one.
 pub fn read(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    CATALOG_READ_PROBE.with(|probe| {
+        if let Some(paths) = probe.borrow_mut().as_mut() {
+            paths.push(path.to_path_buf());
+        }
+    });
     use std::io::Read;
     let bytes = std::fs::read(path)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
@@ -489,7 +501,11 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
     if let Ok(files) = std::fs::read_dir(dir) {
         for path in files.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with(".json") || name.ends_with(".trace.json") || name.ends_with(".changes.json") {
+            if !name.ends_with(".json")
+                || name.ends_with(".trace.json")
+                || name.ends_with(".changes.json")
+                || name.ends_with(".worker.json")
+            {
                 continue;
             }
             let id = id_of(&path);
@@ -910,6 +926,44 @@ mod tests {
         std::fs::write(dir.join(INDEX), b"not a sqlite database").unwrap();
         assert_eq!(search(&dir, "amber").unwrap().len(), 1);
         assert!(search(&dir, "turquoise").unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn catalog_never_reads_worker_ledgers_on_repeated_opens() {
+        use std::io::Write;
+        let dir = temp_dir("worker-ledger-exclusion");
+        let parent = dir.join("1700000000-abcdef.json");
+        rusty::privacy::write_json(
+            &parent,
+            serde_json::json!({
+                "history":[{"role":"user","content":"parent searchable amber phrase"}]
+            }),
+        )
+        .unwrap();
+        let ledger = dir.join("1700000000-abcdef.worker.json");
+        // A bounded, highly compressible 1 MiB ledger stands in for a long
+        // session's receipts. Accidental transcript decoding would inflate it
+        // on every open because it never gets a catalog row.
+        let body = serde_json::json!({"receipts":{},"padding":"x".repeat(1024 * 1024)}).to_string();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(body.as_bytes()).unwrap();
+        std::fs::write(&ledger, gzip.finish().unwrap()).unwrap();
+        assert_eq!(read(&ledger).unwrap(), body, "fixture exercises the compressed transcript decoder");
+
+        CATALOG_READ_PROBE.with(|probe| *probe.borrow_mut() = Some(Vec::new()));
+        for _ in 0..3 {
+            let entries = list(&dir).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, "1700000000-abcdef");
+            assert_eq!(search(&dir, "amber").unwrap().len(), 1);
+        }
+        let reads = CATALOG_READ_PROBE.with(|probe| probe.borrow_mut().take().unwrap());
+        assert_eq!(
+            reads,
+            vec![parent],
+            "only the first parent backfill may read/decode a transcript; worker ledgers are skipped before I/O"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
