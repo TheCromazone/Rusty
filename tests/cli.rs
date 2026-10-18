@@ -1031,7 +1031,8 @@ fn seed_calc(s: &Sandbox) {
 }
 
 fn fix_calc() -> serde_json::Value {
-    tool_reply(
+    read_then(
+        "calc.py",
         "edit_file",
         serde_json::json!({"path":"calc.py","old_string":"return a - b","new_string":"return a + b"}),
     )
@@ -1372,7 +1373,11 @@ fn careful_mode_refuses_an_apply_without_a_fresh_diff() {
             bash_reply("kubectl apply -f deploy.yaml"),
             bash_reply("kubectl diff -f deploy.yaml"),
             bash_reply("kubectl apply -f deploy.yaml"),
-            tool_reply("edit_file", serde_json::json!({"path": "deploy.yaml", "old_string": "1", "new_string": "2"})),
+            read_then(
+                "deploy.yaml",
+                "edit_file",
+                serde_json::json!({"path": "deploy.yaml", "old_string": "1", "new_string": "2"}),
+            ),
             bash_reply("kubectl apply -f deploy.yaml"),
             bash_reply("terraform apply"),
             bash_reply("terraform plan -out=rusty.tfplan"),
@@ -1734,6 +1739,17 @@ fn tool_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call", "type": "function",
         "function": {"name": name, "arguments": args.to_string()}}]}, "finish_reason": "tool_calls"}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+}
+
+/// One reply that reads `path` and then makes the call: rusty refuses to
+/// change an existing file the agent hasn't read.
+fn read_then(path: &str, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let mut reply = tool_reply("read_file", serde_json::json!({"path": path}));
+    let mut call = tool_reply(name, args)["choices"][0]["delta"]["tool_calls"][0].clone();
+    call["index"] = 1.into();
+    call["id"] = "then".into();
+    reply["choices"][0]["delta"]["tool_calls"].as_array_mut().unwrap().push(call);
+    reply
 }
 
 /// Several calls in one reply: reads may run side by side, but every result
@@ -5152,7 +5168,14 @@ fn a_file_missing_now_or_at_startup_is_never_reported_unchanged() {
     let (out, requests) = smart_run(
         &s,
         vec![
-            call("write_file", serde_json::json!({"path": "notes.txt", "content": "rewritten\n"})),
+            reported(
+                read_then(
+                    "notes.txt",
+                    "write_file",
+                    serde_json::json!({"path": "notes.txt", "content": "rewritten\n"}),
+                ),
+                50_000,
+            ),
             call("bash", serde_json::json!({"command": "rm notes.txt"})),
             call("read_file", serde_json::json!({"path": "a.txt"})),
             call("edit_file", serde_json::json!({"path": "a.txt", "old_string": "one", "new_string": "two"})),

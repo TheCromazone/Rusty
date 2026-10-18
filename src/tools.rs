@@ -29,11 +29,11 @@ fn build_definitions() -> Value {
             "offset": {"type": "integer", "description": "1-based line to start at (default 1)"},
             "limit": {"type": "integer", "description": "Max lines to return (default 800)"}
         }), &["path"]),
-        tool("write_file", "Create or overwrite a file with the given content. Creates parent directories.", json!({
+        tool("write_file", "Create or overwrite a file with the given content. Creates parent directories. Overwriting an existing file fails unless you read it with read_file first, and again if it changed since.", json!({
             "path": {"type": "string"},
             "content": {"type": "string", "description": "Full new file content"}
         }), &["path", "content"]),
-        tool("edit_file", "Replace an exact string in a file. old_string must match exactly once unless replace_all is true. Read the file first.", json!({
+        tool("edit_file", "Replace an exact string in a file. old_string must match exactly once unless replace_all is true. Fails unless you read the file with read_file first, and again if it changed since.", json!({
             "path": {"type": "string"},
             "old_string": {"type": "string", "description": "Exact text to replace, including whitespace"},
             "new_string": {"type": "string"},
