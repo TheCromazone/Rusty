@@ -533,6 +533,9 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd).arg("--yolo");
     if let Some((endpoint, home)) = endpoint {
+        // Memory lifecycle has its own tests; this terminal fixture must not
+        // autostart a service that intentionally outlives the CLI process.
+        cmd.args(["--memory", "off"]);
         offline(&mut cmd, endpoint, home);
     }
     let mut s = Session::spawn(cmd, 80, log, Duration::from_secs(90))?;
