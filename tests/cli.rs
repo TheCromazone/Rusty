@@ -291,6 +291,77 @@ fn resume_shows_saved_conversation_without_a_model_request() {
     assert!(out.contains("Earlier in this task") && out.contains("Parser fixed; tests pass."), "{out}");
 }
 
+#[test]
+fn clear_and_resume_without_trajectory_do_not_use_the_temp_archive() {
+    let s = Sandbox::new("archive-disabled");
+    scripted_run(&s, &["--memory", "off", "--mode", "standard", "FIRST"], vec![text_reply("first reply")]);
+    let id = sessions_listed(&s, &[])[0].0.clone();
+    let blocker = s.home.join("not-a-temp-directory");
+    std::fs::write(&blocker, b"preserve").unwrap();
+    let (url, server) = scripted_endpoint(vec![say("second reply")]);
+    let mut cmd = s.cmd();
+    cmd.env("TMPDIR", &blocker).env("RUSTY_BASE_URL", url).args(["--memory", "off", "--mode", "standard"]);
+    let out = s.repl_with(cmd, &["SECOND", &format!("/resume {id}"), "/clear", "/exit"]);
+    assert_eq!(server.join().unwrap().len(), 1);
+    assert!(out.contains("resumed") && out.contains("fresh context"), "{out}");
+    assert!(!out.contains("error:"), "clear/resume attempted unwanted archive IO: {out}");
+    assert_eq!(std::fs::read(&blocker).unwrap(), b"preserve");
+}
+
+#[test]
+fn explicit_trajectory_preserves_clear_resume_order_and_redaction_in_session_storage() {
+    let s = Sandbox::new("archive-export");
+    std::fs::write(s.project.join("fixture.txt"), "first tool result").unwrap();
+    scripted_run(
+        &s,
+        &["--memory", "off", "--mode", "standard", "FIRST"],
+        vec![tool_reply("read_file", serde_json::json!({"path":"fixture.txt"})), text_reply("first reply")],
+    );
+    let id = sessions_listed(&s, &[])[0].0.clone();
+    let blocker = s.home.join("not-a-temp-directory");
+    std::fs::write(&blocker, b"preserve").unwrap();
+    let export = s.home.join("trajectory.json");
+    let (url, server) = scripted_endpoint(vec![say("second reply"), say("third reply")]);
+    let mut cmd = s.cmd();
+    cmd.env("TMPDIR", &blocker)
+        .env("RUSTY_BASE_URL", url)
+        .args(["--memory", "off", "--mode", "standard", "--trajectory"])
+        .arg(&export);
+    let out = s.repl_with(
+        cmd,
+        &["SECOND password = ARCHIVE_EXPORT_CANARY", &format!("/resume {id}"), "/clear", "THIRD", "/exit"],
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+    assert!(!out.contains("error:"), "explicit export used global temporary storage: {out}");
+    let raw = std::fs::read_to_string(&export).unwrap();
+    assert!(!raw.contains("ARCHIVE_EXPORT_CANARY"));
+    let trajectory: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let saved_history = |marker: &str| -> Vec<serde_json::Value> {
+        std::fs::read_dir(sessions_dir(&s))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()?.to_str()? != "json" {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+                let history = value["history"].as_array()?;
+                history
+                    .iter()
+                    .any(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|t| t.starts_with(marker)))
+                    .then(|| history.clone())
+            })
+            .next()
+            .expect("saved session history")
+    };
+    let mut expected = saved_history("SECOND");
+    expected.extend(saved_history("FIRST"));
+    expected.extend(saved_history("THIRD"));
+    assert!(expected.iter().any(|m| m["role"] == "tool"), "fixture did not exercise tool history");
+    assert_eq!(trajectory["messages"], serde_json::Value::Array(expected));
+    assert_eq!(std::fs::read(&blocker).unwrap(), b"preserve");
+}
+
 /// `rusty --sessions [words]` as (id, "age  n msgs  title") pairs.
 fn sessions_listed(s: &Sandbox, words: &[&str]) -> Vec<(String, String)> {
     let out = s.cmd().arg("--sessions").args(words).stdin(Stdio::null()).output().unwrap();

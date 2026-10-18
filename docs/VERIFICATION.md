@@ -1309,3 +1309,24 @@ launcher with a detached pipe holder remains exit 0; its output is incomplete.
 Fixed verification rejects incomplete capture. Readers share a two-second EOF
 grace and are stopped and joined afterward; this does not prove containment of
 descendants that escape the owned process group.
+
+## Completed-session trajectory retention
+
+Without `--trajectory`, `/clear` and `/resume` release completed in-memory
+conversation buffers without allocating an export archive. Saved session
+transcripts remain available for later resume; clearing context does not erase
+them. Current-session compaction history is still retained in memory.
+
+With an explicit trajectory export, completed histories are spooled in order
+as redacted JSON under the actual saved session directory, in a mode-0600 file
+whose name is immediately unlinked. The agent owns one descriptor until drop;
+this avoids using global temporary storage for an unbounded optional export.
+The opt-in archive can still consume session-volume space. A failed archive
+write retains live history and rejects the transition rather than silently
+losing export data. A partial append is rolled back to the prior byte length.
+Reading a trajectory can allocate the complete exported history.
+
+Regression coverage includes clear/resume with an unusable global temporary
+directory, explicit-export order and redaction, failed transition/lease recovery,
+and a subprocess-enforced file-size limit asserting `EFBIG` and rollback.
+A file-size limit is not a claim of testing a genuinely full filesystem.

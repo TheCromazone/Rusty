@@ -356,6 +356,7 @@ pub struct Agent {
     /// Messages that compaction or clearing removed from `history`, oldest
     /// first. Only the exported trajectory reads them.
     pub archived: Vec<Value>,
+    past_sessions: crate::archive::Archive,
     /// Where the saved session starts in `archived`: what `/clear` or
     /// `/resume` archived belongs to the session before it.
     session_from: usize,
@@ -466,6 +467,7 @@ impl Agent {
             side_meta: None,
             side_receipts: Default::default(),
             archived: Vec::new(),
+            past_sessions: Default::default(),
             session_from: 0,
             trajectory_path: None,
             trajectory_saved: None,
@@ -633,18 +635,35 @@ impl Agent {
         Ok(())
     }
 
-    pub fn clear(&mut self) {
+    fn archive_finished_session(&mut self) -> Result<()> {
+        // Completed history is needed only for an explicitly requested export.
+        // Ordinary clear/resume must not depend on space for a second transcript.
+        if self.trajectory_path.is_some() && !(self.archived.is_empty() && self.history.is_empty()) {
+            let directory = self
+                .session_path
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .ok_or_else(|| anyhow::anyhow!("trajectory archive requires a saved session directory"))?;
+            self.past_sessions.append(directory, &self.archived, &self.history)?;
+        }
+        self.archived = Vec::new();
+        self.history = Vec::new();
+        self.session_from = 0;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.archive_finished_session()?;
         self.side_receipts.clear();
         crate::side::shutdown(&self.side_book);
         self.side_book = Default::default();
         self.aside_memory = Default::default();
-        self.archived.append(&mut self.history);
-        self.session_from = self.archived.len();
         self.plan.clear();
         self.goal = None;
         self.verification_records.clear();
         self.last_prompt_tokens = 0;
         self.meter.forget_last();
+        Ok(())
     }
 
     // ---------------------------------------------------------------- prompt
@@ -2916,8 +2935,8 @@ impl Agent {
             tokens_after: self.meter.fill(&self.history, fixed),
             calls_since_last: self.tool_calls_run - self.compactions.last().map_or(0, |c| c.calls_at),
             calls_at: self.tool_calls_run,
-            boundary: self.archived.len(),
-            resumes_at: self.archived.len() + self.history.len(),
+            boundary: self.past_sessions.len() + self.archived.len(),
+            resumes_at: self.past_sessions.len() + self.archived.len() + self.history.len(),
             reverted,
             model: writer,
         });
@@ -2947,9 +2966,10 @@ impl Agent {
 
     /// The whole run for benchmark harnesses and reviewers: every message in
     /// order, including the ones compaction summarised away.
-    pub fn trajectory(&self) -> Value {
+    pub fn trajectory(&self) -> Result<Value> {
         let t = &self.totals;
-        let mut messages = self.archived.clone();
+        let mut messages = self.past_sessions.messages()?;
+        messages.extend(self.archived.iter().cloned());
         messages.extend(self.history.iter().cloned());
         let mut mcp_outcomes = BTreeMap::<&str, usize>::new();
         for message in &messages {
@@ -2957,7 +2977,7 @@ impl Agent {
                 *mcp_outcomes.entry(outcome).or_default() += 1;
             }
         }
-        json!({
+        Ok(json!({
             "agent": "rusty",
             "version": env!("CARGO_PKG_VERSION"),
             "model": self.model,
@@ -2970,7 +2990,7 @@ impl Agent {
             "execution_mode": self.execution_mode.name(),
             "tools_location": self.backend.summary(),
             "messages": messages,
-            "archived_messages": self.archived.len(),
+            "archived_messages": self.past_sessions.len() + self.archived.len(),
             "goal": self.goal,
             "goal_end": self.goal_end,
             "goal_outcome": self.goal_outcome(),
@@ -2981,7 +3001,7 @@ impl Agent {
             "mcp_outcomes": mcp_outcomes,
             "model_budget": self.budget_snapshot(),
             "totals": {"requests": t.requests, "prompt_tokens": t.prompt, "completion_tokens": t.completion},
-        })
+        }))
     }
 
     pub fn write_trajectory(&self) -> Result<()> {
@@ -2991,7 +3011,7 @@ impl Agent {
         }
         // Write beside it and rename, so a run killed mid-write keeps the last good copy.
         let tmp = path.with_extension("partial");
-        rusty::privacy::write_json(&tmp, self.trajectory())?;
+        rusty::privacy::write_json(&tmp, self.trajectory()?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -3093,10 +3113,9 @@ impl Agent {
             .map_err(|e| anyhow::anyhow!("can't read session file {}: {e}", path.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("session file {} is damaged and can't be resumed ({e})", path.display()))?;
+        self.archive_finished_session()?;
         self.side_meta = serde_json::from_value(v["side"].clone()).ok();
         self.side_receipts = serde_json::from_value(v["side_receipts"].clone()).unwrap_or_default();
-        self.archived.append(&mut self.history);
-        self.session_from = self.archived.len();
         self.history = v["history"].as_array().cloned().unwrap_or_default();
         self.plan = serde_json::from_value(v["plan"].clone()).unwrap_or_default();
         self.goal = serde_json::from_value(v["goal"].clone()).unwrap_or(None);
@@ -3288,6 +3307,110 @@ mod stable_prompt_tests {
         Agent::new(client, "test-model".into(), std::env::temp_dir(), Policy::new(Mode::Yolo))
     }
 
+    struct SessionTestDir(PathBuf);
+
+    impl SessionTestDir {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("rusty-archive-agent-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for SessionTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn no_trajectory_clear_and_resume_release_history_without_archive_io() {
+        let dir = SessionTestDir::new();
+        let not_directory = dir.0.join("not-a-directory");
+        std::fs::write(&not_directory, b"keep").unwrap();
+        let mut agent = agent();
+        agent.session_path = Some(not_directory.join("current.json"));
+        for _ in 0..8 {
+            agent.history.push(json!({"role":"user","content":"x".repeat(64 * 1024)}));
+            agent.archived.push(json!({"role":"assistant","content":"old"}));
+            agent.clear().unwrap();
+            assert_eq!(agent.past_sessions.len(), 0);
+            assert_eq!(agent.history.capacity(), 0);
+            assert_eq!(agent.archived.capacity(), 0);
+        }
+        agent.history.push(json!({"role":"user","content":"leaving"}));
+        let incoming = dir.0.join("incoming.json");
+        rusty::privacy::write_json(&incoming, json!({"history":[{"role":"user","content":"resumed"}]})).unwrap();
+        agent.load_session(&incoming).unwrap();
+        assert_eq!(agent.history[0]["content"], "resumed");
+        assert_eq!(agent.past_sessions.len(), 0);
+        assert_eq!(std::fs::read(&not_directory).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn failed_archive_leaves_live_history_and_resume_lease_intact() {
+        let dir = SessionTestDir::new();
+        let session_directory = dir.0.join("session");
+        std::fs::create_dir(&session_directory).unwrap();
+        let original = session_directory.join("current.json");
+        rusty::privacy::write_json(&original, json!({"history":[]})).unwrap();
+        let mut agent = agent();
+        agent.session_lease = Some(crate::session::Lease::acquire(&original).unwrap());
+        agent.session_path = Some(original.clone());
+        // Keep the real lease descriptor, but make archive storage unavailable.
+        let moved_directory = dir.0.join("moved-session");
+        std::fs::rename(&session_directory, &moved_directory).unwrap();
+        std::fs::write(&session_directory, b"unavailable").unwrap();
+        let moved = moved_directory.join("current.json");
+        assert!(crate::session::Lease::acquire(&moved).is_err());
+        agent.trajectory_path = Some(dir.0.join("export.json"));
+        agent.history.push(json!({"role":"user","content":"keep live"}));
+        agent.archived.push(json!({"role":"assistant","content":"keep compacted"}));
+        let before = (agent.history.clone(), agent.archived.clone());
+        assert!(agent.clear().is_err());
+        assert_eq!((&agent.history, &agent.archived), (&before.0, &before.1));
+        let incoming = dir.0.join("incoming.json");
+        rusty::privacy::write_json(&incoming, json!({"history":[{"role":"user","content":"resumed"}]})).unwrap();
+        assert!(agent.load_session(&incoming).is_err());
+        assert_eq!((&agent.history, &agent.archived), (&before.0, &before.1));
+        assert_eq!(agent.session_path.as_ref(), Some(&original));
+        assert!(crate::session::Lease::acquire(&moved).is_err(), "existing lease was released on failure");
+        // Failed loading must release the incoming lease so a later attempt works.
+        agent.trajectory_path = None;
+        agent.load_session(&incoming).unwrap();
+        assert_eq!(agent.history[0]["content"], "resumed");
+        let _released = crate::session::Lease::acquire(&moved).expect("successful resume releases old lease");
+    }
+
+    #[test]
+    fn clearing_sessions_releases_messages_without_losing_trajectory() {
+        let dir = SessionTestDir::new();
+        let mut agent = agent();
+        agent.session_path = Some(dir.0.join("current.json"));
+        agent.trajectory_path = Some(dir.0.join("export.json"));
+        for n in 0..20 {
+            agent.history.push(json!({"role":"user","content":format!("session {n}: {}", "x".repeat(64 * 1024))}));
+            agent.clear().unwrap();
+            assert!(agent.history.is_empty() && agent.archived.is_empty());
+            assert_eq!(agent.history.capacity(), 0);
+            assert_eq!(agent.archived.capacity(), 0);
+            assert_eq!(agent.session_from, 0);
+        }
+        agent.history.push(json!({"role":"user","content":"current"}));
+        let trajectory = agent.trajectory().unwrap();
+        let messages = trajectory["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 21);
+        assert_eq!(trajectory["archived_messages"], 20);
+        for (n, message) in messages.iter().take(20).enumerate() {
+            assert!(message["content"].as_str().unwrap().starts_with(&format!("session {n}:")));
+        }
+        assert_eq!(messages[20]["content"], "current");
+        agent.write_trajectory().unwrap();
+        let exported: Value = serde_json::from_slice(&std::fs::read(dir.0.join("export.json")).unwrap()).unwrap();
+        assert_eq!(exported["messages"], trajectory["messages"]);
+    }
+
     #[test]
     fn mcp_result_metadata_is_private_for_every_provider_serializer() {
         let mut agent = agent();
@@ -3295,7 +3418,7 @@ mod stable_prompt_tests {
             json!({"role":"assistant","content":null,"tool_calls":[{"id":"mcp-1","type":"function","function":{"name":"mcp__fixture__apply","arguments":"{}"}}]}),
             json!({"role":"tool","tool_call_id":"mcp-1","content":"effect outcome unknown","_mcp_outcome":"unknown"}),
         ];
-        let trace = agent.trajectory();
+        let trace = agent.trajectory().unwrap();
         assert_eq!(trace["messages"][1]["_mcp_outcome"], "unknown");
         assert_eq!(trace["mcp_outcomes"]["unknown"], 1);
         let public = serde_json::to_value(crate::anthropic::Public(&agent.history)).unwrap();
@@ -3328,7 +3451,7 @@ mod stable_prompt_tests {
         assert!(activity_estimate > plan_estimate, "a running activity must be counted in the fixed context estimate");
         assert_eq!(agent.system_prompt(), system, "changing activities must not change the system prompt");
 
-        let persisted = agent.trajectory()["messages"].to_string();
+        let persisted = agent.trajectory().unwrap()["messages"].to_string();
         assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
         let aside = agent.aside_context().messages();
         let aside_state = aside.last().unwrap()["content"].as_str().unwrap();
