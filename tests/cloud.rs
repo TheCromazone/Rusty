@@ -889,7 +889,6 @@ fn hosted_swarm_journey_offline() {
         .env("RUSTY_API_KEY", "offline-test-key")
         .env("RUSTY_BASE_URL", format!("{}/v1", provider.url))
         .env("RUSTY_NO_DOTENV", "1")
-        .env("RUSTY_TEST_TIME_SCALE", "20")
         .args(["run", "--snapshot", "rusty-0123456789ab", "--mode", "standard", "--agents", "swarm"])
         .args(["--memory-mode", "learn", "--prompt", SWARM_PROMPT, "--repo"])
         .arg(&repo)

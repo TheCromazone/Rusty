@@ -76,13 +76,10 @@ impl Step {
     fn task(name: &'static str, args: Vec<String>) -> Self {
         Self { name, program: std::env::current_exe().unwrap().display().to_string(), args }
     }
-    fn run(&self, test_scale: u64) -> Result<()> {
+    fn run(&self) -> Result<()> {
         let mut command = Command::new(&self.program);
         if self.name == "evals" {
             command.env("EVAL_BINARY", super::target_dir().join("release/rusty"));
-        }
-        if matches!(self.name, "tests" | "memory" | "terminal") {
-            command.env("RUSTY_TEST_TIME_SCALE", test_scale.to_string());
         }
         let status = command
             .args(&self.args)
@@ -268,7 +265,6 @@ fn receipt(o: &Options, steps: &[Step]) -> Result<Value> {
         "RUSTY_MAX_REQUESTS",
         "RUSTY_MAX_BUDGET_TOKENS",
         "RUSTY_BUDGET_SECS",
-        "RUSTY_TEST_TIME_SCALE",
         "RUSTY_TEST_JOBS",
         "RUST_TEST_THREADS",
     ]
@@ -278,7 +274,7 @@ fn receipt(o: &Options, steps: &[Step]) -> Result<Value> {
     Ok(
         json!({"revision": source["revision"], "dirty": source["dirty"], "source_start":source, "source_end":null, "source_unchanged":null,
         "status": "running", "scope": if o.changed { "changed-only" } else { "full" }, "live": o.live, "perf": o.perf, "cloud": o.cloud,
-        "configuration": configuration, "test_time_scale":super::testing::time_scale()?,
+        "configuration": configuration,
         "steps": steps.iter().map(|s| json!({"name": s.name, "status": "not-run", "seconds": 0.0})).collect::<Vec<_>>()}),
     )
 }
@@ -450,8 +446,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
         save(&out, &report)?;
         return Err(e);
     }
-    let test_scale = report["test_time_scale"].as_u64().context("QA receipt lacks a timing profile")?;
-    execute(&steps, &out, &mut report, |step| step.run(test_scale), || source_identity(&super::root()))?;
+    execute(&steps, &out, &mut report, |step| step.run(), || source_identity(&super::root()))?;
     println!("\n✓ qa passed; receipt: {}", out.join("summary.md").display());
     Ok(ExitCode::SUCCESS)
 }
@@ -490,7 +485,7 @@ mod tests {
             },
         ];
         let mut r = receipt(&Options::default(), &steps).unwrap();
-        assert!(execute(&steps, &out, &mut r, |step| step.run(20), || source_identity(&super::super::root())).is_err());
+        assert!(execute(&steps, &out, &mut r, |step| step.run(), || source_identity(&super::super::root())).is_err());
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(out.join("summary.json")).unwrap()).unwrap();
         assert_eq!(saved["status"], "fail");
         assert_eq!(saved["steps"][0]["status"], "fail");

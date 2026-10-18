@@ -68,6 +68,8 @@ pub struct Budget {
     limits: Limits,
     enabled: bool,
     started: Instant,
+    #[cfg(test)]
+    clock: Option<Arc<dyn Fn() -> Duration + Send + Sync>>,
     /// Provider time spent by earlier processes on the same ledger.
     prior: Duration,
     ledger: Option<(PathBuf, File)>,
@@ -77,6 +79,12 @@ impl Budget {
     #[cfg(test)]
     pub fn new(limits: Limits) -> Arc<Self> {
         Self::open(Some(limits), None).expect("a budget without a ledger always opens")
+    }
+    #[cfg(test)]
+    pub(crate) fn new_with_clock(limits: Limits, clock: Arc<dyn Fn() -> Duration + Send + Sync>) -> Arc<Self> {
+        let mut budget = Self::new(limits);
+        Arc::get_mut(&mut budget).expect("new budget is uniquely owned").clock = Some(clock);
+        budget
     }
     /// Unbounded runs still collect accounting without enforcement.
     pub fn unbounded() -> Arc<Self> {
@@ -106,6 +114,8 @@ impl Budget {
             limits: limits.unwrap_or(Limits { requests: u64::MAX, tokens: u64::MAX, seconds: u64::MAX }),
             enabled: limits.is_some(),
             started: Instant::now(),
+            #[cfg(test)]
+            clock: None,
             prior: Duration::from_secs_f64(state.elapsed_seconds.max(0.0)),
             ledger,
             state: Mutex::new(state),
@@ -114,13 +124,9 @@ impl Budget {
         Ok(Arc::new(budget))
     }
     fn elapsed(&self) -> Duration {
-        // Integration fixtures advance provider time after observing a POST.
-        // Compiled out of release builds, including the environment lookup.
-        #[cfg(debug_assertions)]
-        if let Ok(path) = std::env::var("RUSTY_TEST_BUDGET_CLOCK") {
-            let ms =
-                std::fs::read_to_string(path).expect("test budget clock").trim().parse().expect("clock milliseconds");
-            return Duration::from_millis(ms);
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return self.prior + clock();
         }
         self.prior + self.started.elapsed()
     }
@@ -376,6 +382,26 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn injected_time_expires_reservations_without_wall_clock_delay() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let clock = elapsed.clone();
+        let budget = Budget::new_with_clock(
+            Limits { requests: 2, tokens: 1000, seconds: 60 },
+            Arc::new(move || Duration::from_millis(clock.load(Ordering::SeqCst))),
+        );
+        assert_eq!(budget.remaining().unwrap(), Duration::from_secs(60));
+        let pending = budget.reserve("lead", 5).unwrap();
+        elapsed.store(60_000, Ordering::SeqCst);
+        assert!(budget.remaining().unwrap_err().to_string().contains("provider deadline reached"));
+        drop(pending);
+        let snapshot = serde_json::to_value(budget.snapshot()).unwrap();
+        assert_eq!(snapshot["requests"], 1);
+        assert_eq!(snapshot["unknown_usage_requests"], 1);
+        assert_eq!(snapshot["deadline_reached"], true);
+    }
+
     use std::sync::Barrier;
     #[test]
     fn workers_race_for_one_root_without_overspending() {

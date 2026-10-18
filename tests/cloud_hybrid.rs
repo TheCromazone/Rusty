@@ -65,7 +65,6 @@ impl Hybrid {
             .env("HOME", &self.home)
             .env("RUSTY_HOME", &self.home)
             .env("RUSTY_NO_DOTENV", "1")
-            .env("RUSTY_TEST_TIME_SCALE", "20")
             .env("NVIDIA_API_KEY", "offline-model-key")
             .env("NO_COLOR", "1");
         c

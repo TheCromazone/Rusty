@@ -657,7 +657,7 @@ fn reasoning_item(item: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn auth_temp_dir() -> PathBuf {
+    pub(super) fn auth_temp_dir() -> PathBuf {
         use ring::rand::{SecureRandom, SystemRandom};
 
         for _ in 0..64 {
@@ -674,7 +674,7 @@ mod tests {
         panic!("could not allocate a unique auth fixture directory")
     }
 
-    fn jwt(claims: Value) -> String {
+    pub(super) fn jwt(claims: Value) -> String {
         let b64 = |b: &[u8]| {
             const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
             let mut s = String::new();
@@ -795,53 +795,6 @@ mod tests {
         // No refresh server is reachable here: the newer tokens on disk are used without one.
         auth.refresh(&reqwest::blocking::Client::new(), REFRESH_TIMEOUT).unwrap();
         assert_eq!((auth.access_token(), auth.refresh_token.as_str()), (newer.as_str(), "r1"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn stalled_refresh_is_bounded_by_its_request_timeout() {
-        use std::io::Write;
-        use std::net::TcpListener;
-
-        let dir = auth_temp_dir();
-        let path = dir.join("auth.json");
-        std::fs::write(
-            &path,
-            json!({"tokens": {"access_token": jwt(json!({"exp": rusty::unix_now() + 60})), "refresh_token": "offline-r0", "account_id": "a"}})
-                .to_string(),
-        )
-        .unwrap();
-        let mut auth = Auth::load_from(path).unwrap();
-        let scale = if cfg!(debug_assertions) {
-            std::env::var("RUSTY_TEST_TIME_SCALE")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|n| (1..=1000).contains(n))
-                .unwrap_or(1)
-        } else {
-            1
-        };
-        let (release, finished) = std::sync::mpsc::channel();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            // Simulate an OAuth server that accepts the refresh but never
-            // completes its body. The caller must not wait for the blocking
-            // client's former 30-second default (or indefinitely).
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
-            stream.flush().unwrap();
-            let _ = finished.recv_timeout(Duration::from_millis(500 * scale));
-        });
-
-        let http = reqwest::blocking::Client::builder().timeout(None).build().unwrap();
-        let started = std::time::Instant::now();
-        let result = auth.refresh_at(&http, Duration::from_millis(100 * scale), &url);
-        let elapsed = started.elapsed();
-        let _ = release.send(());
-        server.join().unwrap();
-        assert!(result.is_err(), "a refresh with no response must fail");
-        assert!(elapsed < Duration::from_millis(400 * scale), "refresh exceeded its scaled cap: {elapsed:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1004,3 +957,7 @@ mod tests {
         assert_ne!(a, b);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/codex_deadline.rs"]
+mod deadline_tests;

@@ -83,7 +83,6 @@ impl Sandbox {
             .env_remove("RUSTY_MAX_REQUESTS")
             .env_remove("RUSTY_MAX_BUDGET_TOKENS")
             .env_remove("RUSTY_BUDGET_SECS")
-            .env_remove("RUSTY_TEST_BUDGET_CLOCK")
             .env_remove("RUSTY_MODEL")
             .env_remove("RUSTY_MODE")
             .env_remove("RUSTY_CAREFUL_MODEL")
@@ -3679,49 +3678,23 @@ fn root_budget_error_cancels_owned_commands() {
     assert!(trace["goal"]["status"].get("Done").is_none());
 }
 
+// The silent-response deadline and worker cleanup are tested with an injected
+// clock in agent::budget_deadline_tests. Keep CLI flag-to-ledger wiring here.
 #[test]
-fn root_budget_deadline_stops_a_silent_response() {
-    use std::io::Read;
-    use std::net::TcpListener;
-    let s = Sandbox::new("budget-silent");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let clock = s.home.join("provider-clock");
-    std::fs::write(&clock, "0").unwrap();
-    let server_clock = clock.clone();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        sync::request(&mut stream);
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
-        stream.flush().unwrap();
-        // Startup consumes no provider time. Expire only after the real POST.
-        // The fake clock drives the deadline; the request's real timer is a
-        // full minute, so a slow scheduler cannot fire it and force a retry.
-        let next = server_clock.with_extension("next");
-        std::fs::write(&next, "60000").unwrap();
-        std::fs::rename(next, server_clock).unwrap();
-        let mut byte = [0];
-        assert!(matches!(stream.read(&mut byte), Ok(0)), "deadline must close the silent response");
-    });
-    let trajectory = s.project.join("trace.json");
-    let out = s
-        .cmd()
-        .env("RUSTY_BASE_URL", url)
-        .env("RUSTY_TEST_BUDGET_CLOCK", &clock)
-        .args(["--budget-secs", "60", "--mode", "standard", "--memory", "off", "--trajectory"])
-        .arg(&trajectory)
-        .arg("inspect")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map(|c| wait(c, Duration::from_secs(60)))
-        .unwrap();
-    assert!(!out.status.success());
-    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(trajectory).unwrap()).unwrap();
+fn root_budget_seconds_reach_the_model_ledger() {
+    let s = Sandbox::new("budget-seconds");
+    let response = sse_reply(serde_json::json!({
+        "choices":[{"delta":{"content":"inspected"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":5,"completion_tokens":1}
+    }));
+    let (out, requests, trace) = budget_run(&s, &["--budget-secs", "60", "inspect"], vec![response]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(requests.len(), 1);
+    assert_eq!(trace["model_budget"]["enabled"], true);
+    assert_eq!(trace["model_budget"]["limits"]["seconds"], 60);
     assert_eq!(trace["model_budget"]["requests"], 1);
-    assert_eq!(trace["model_budget"]["unknown_usage_requests"], 1);
-    assert_eq!(trace["model_budget"]["deadline_reached"], true);
-    server.join().unwrap();
+    assert_eq!(trace["model_budget"]["active_requests"], 0);
+    assert_eq!(trace["model_budget"]["deadline_reached"], false);
 }
 
 #[test]
