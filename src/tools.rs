@@ -16,7 +16,13 @@ const MAX_OUTPUT: usize = 30_000;
 const SKIP_DIRS: &[&str] =
     &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
 
-pub fn definitions() -> Value {
+/// The built-in tool schemas. They never change, so they are built once.
+pub fn definitions() -> &'static Value {
+    static DEFS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DEFS.get_or_init(build_definitions)
+}
+
+fn build_definitions() -> Value {
     json!([
         tool("read_file", "Read a text file. Returns numbered lines. For big files, outline or search first and read only the range you need.", json!({
             "path": {"type": "string", "description": "File path"},

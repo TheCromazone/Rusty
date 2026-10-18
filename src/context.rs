@@ -171,6 +171,29 @@ pub fn percent(used: usize, budget: usize) -> usize {
     used * 100 / budget.max(1)
 }
 
+/// History as a request sent it, shared with side questions and side chats
+/// instead of copied for each of them. `of` copies; `view` shares.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    messages: std::sync::Arc<Vec<Value>>,
+    range: std::ops::Range<usize>,
+}
+
+impl Snapshot {
+    pub fn of(history: &[Value]) -> Self {
+        Self { messages: std::sync::Arc::new(history.to_vec()), range: 0..history.len() }
+    }
+
+    /// `range` of a request's messages, without copying them.
+    pub fn view(messages: &std::sync::Arc<Vec<Value>>, range: std::ops::Range<usize>) -> Self {
+        Self { messages: messages.clone(), range }
+    }
+
+    pub fn messages(&self) -> &[Value] {
+        &self.messages[self.range.clone()]
+    }
+}
+
 /// Rough token count: about 4 characters per token for code and English.
 pub fn estimate(messages: &[Value]) -> usize {
     messages.iter().map(estimate_one).sum()

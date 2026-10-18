@@ -37,7 +37,7 @@ pub struct Parent {
     pub model: String,
     pub cwd: PathBuf,
     pub path: PathBuf,
-    pub history: Vec<Value>,
+    pub history: crate::context::Snapshot,
     pub notes: String,
     pub deny: Vec<String>,
     pub window: usize,
@@ -153,7 +153,7 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
             Meta {
                 title: arg.trim().chars().take(80).collect(),
                 parent_id: parent.id(),
-                base_len: parent.history.len(),
+                base_len: parent.history.messages().len(),
                 discussion: Vec::new(),
                 observations: BTreeMap::new(),
                 sent_heads: Vec::new(),

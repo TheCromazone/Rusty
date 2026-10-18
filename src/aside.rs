@@ -19,10 +19,30 @@ struct Pending {
     rx: Receiver<Event>,
     question: String,
 }
+/// What a side question sees: the system prompt, the main conversation as
+/// its last request saw it, and the live state note. Built into messages
+/// only when a question is asked.
+pub struct Conversation {
+    pub system: String,
+    pub history: crate::context::Snapshot,
+    pub note: Option<Value>,
+}
+
+impl Conversation {
+    pub fn messages(&self) -> Vec<Value> {
+        let history = self.history.messages();
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(json!({"role":"system","content":self.system}));
+        messages.extend_from_slice(history);
+        messages.extend(self.note.clone());
+        messages
+    }
+}
+
 struct Context {
     client: Arc<Client>,
     model: String,
-    snapshot: Vec<Value>,
+    snapshot: Conversation,
     memory: Shared,
     pending: Option<Pending>,
     side: Option<crate::side::Parent>,
@@ -30,7 +50,7 @@ struct Context {
 thread_local! { static ACTIVE: RefCell<Option<Context>> = const { RefCell::new(None) }; }
 pub struct Scope;
 impl Scope {
-    pub fn enter(client: Arc<Client>, model: String, snapshot: Vec<Value>, memory: Shared) -> Self {
+    pub fn enter(client: Arc<Client>, model: String, snapshot: Conversation, memory: Shared) -> Self {
         ACTIVE.with(|a| *a.borrow_mut() = Some(Context { client, model, snapshot, memory, pending: None, side: None }));
         Self
     }
@@ -42,7 +62,7 @@ impl Drop for Scope {
         });
     }
 }
-pub fn refresh(snapshot: Vec<Value>) {
+pub fn refresh(snapshot: Conversation) {
     ACTIVE.with(|a| {
         if let Some(c) = a.borrow_mut().as_mut() {
             c.snapshot = snapshot;
@@ -83,7 +103,7 @@ impl Context {
             display::notice(&format!("btw: {text}"));
             return;
         }
-        let mut messages = self.snapshot.clone();
+        let mut messages = self.snapshot.messages();
         messages.extend(self.memory.lock().unwrap().exchanges.clone());
         messages.push(json!({"role":"user","content":question}));
         let rx = self.client.start_chat(

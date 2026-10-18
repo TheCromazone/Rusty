@@ -37,6 +37,12 @@ impl Footer {
 /// Clips by terminal cells, removes control characters, and leaves the final
 /// terminal column unused so a frame cannot trigger automatic wrapping.
 fn fit(s: &str, cells: usize) -> String {
+    let text: String = s.chars().filter(|c| !c.is_control()).collect();
+    // Most rows fit as they are; measuring once is enough for those, and
+    // only a row that is too long is cut a character at a time.
+    if text.width() <= cells {
+        return text;
+    }
     let mut text = String::new();
     for c in s.chars().filter(|c| !c.is_control()) {
         text.push(c);
@@ -72,6 +78,27 @@ mod tests {
                     assert!(lines.iter().all(|line| !line.chars().any(char::is_control)));
                     assert_eq!(lines.len(), 1);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_matches_cutting_a_character_at_a_time() {
+        let slow = |s: &str, cells: usize| {
+            let mut text = String::new();
+            for c in s.chars().filter(|c| !c.is_control()) {
+                text.push(c);
+                if text.width() > cells {
+                    text.pop();
+                    break;
+                }
+            }
+            text
+        };
+        for s in ["", "reading src", "文件 🦀 very long status\r\n\x1b", "◇ rusty · 4s", "👨\u{200d}👩\u{200d}👧 ok"]
+        {
+            for cells in 0..40 {
+                assert_eq!(fit(s, cells), slow(s, cells), "{s:?} in {cells}");
             }
         }
     }

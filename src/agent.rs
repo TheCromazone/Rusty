@@ -888,12 +888,16 @@ impl Agent {
     }
 
     pub(crate) fn side_parent(&self) -> Result<crate::side::Parent> {
+        self.side_parent_with(context::Snapshot::of(&self.history))
+    }
+
+    fn side_parent_with(&self, history: context::Snapshot) -> Result<crate::side::Parent> {
         Ok(crate::side::Parent {
             client: self.client.clone(),
             model: self.model.clone(),
             cwd: self.cwd.clone(),
             path: self.session_path.clone().ok_or_else(|| anyhow::anyhow!("side chats need a saved parent session"))?,
-            history: self.history.clone(),
+            history,
             notes: self.project_notes.clone(),
             deny: self.policy.deny.clone(),
             window: self.meter.window,
@@ -904,7 +908,7 @@ impl Agent {
     }
 
     pub(crate) fn configure_side(&mut self, parent: &crate::side::Parent, meta: crate::side::Meta) {
-        self.history = parent.history.clone();
+        self.history = parent.history.messages().to_vec();
         self.project_notes = parent.notes.clone();
         self.policy.deny = parent.deny.clone();
         self.meter = context::Meter::new(parent.window, "parent session");
@@ -1003,15 +1007,16 @@ impl Agent {
         Ok(())
     }
 
-    fn aside_context(&self) -> Vec<Value> {
+    fn aside_context(&self) -> crate::aside::Conversation {
+        self.aside_context_with(context::Snapshot::of(&self.history))
+    }
+
+    fn aside_context_with(&self, history: context::Snapshot) -> crate::aside::Conversation {
         let mut system = self.system_prompt();
         system.push_str("\nYou are answering a side question, not carrying out the main task. Answer only from the supplied conversation. You have no tools. Do not claim new inspections or checks. The side answer is not added to the main conversation.");
-        let mut messages = vec![json!({"role":"system","content":system})];
-        messages.extend(self.history.clone());
-        if let Some(state) = self.live_state() {
-            messages.push(json!({"role":"user","content":format!("{}{}", context::NOTE, state)}));
-        }
-        messages
+        let note =
+            self.live_state().map(|state| json!({"role":"user","content":format!("{}{}", context::NOTE, state)}));
+        crate::aside::Conversation { system, history, note }
     }
 
     fn collect_aside_usage(&mut self) {
@@ -1049,17 +1054,18 @@ impl Agent {
         }
         let max_steps = if self.is_worker { WORKER_STEPS } else { MAX_STEPS };
         let mut d = Display::new(self.is_worker || self.side_meta.is_some());
+        // One copy of history serves both the side question and side chat views.
         let _aside_scope = (!self.is_worker && self.side_meta.is_none()).then(|| {
-            crate::aside::Scope::enter(
+            let history = context::Snapshot::of(&self.history);
+            let scope = crate::aside::Scope::enter(
                 self.client.clone(),
                 self.model.clone(),
-                self.aside_context(),
+                self.aside_context_with(history.clone()),
                 self.aside_memory.clone(),
-            )
+            );
+            crate::aside::attach_side(self.side_parent_with(history).ok());
+            scope
         });
-        if self.side_meta.is_none() && !self.is_worker {
-            crate::aside::attach_side(self.side_parent().ok());
-        }
         let before = self.totals.clone();
         // Only consecutive unchanged results count: an edit, a different call,
         // or new output is progress. Retain one call rather than a turn-sized map.
@@ -1106,34 +1112,46 @@ impl Agent {
                 }
             }
             self.meter.set_reply(self.execution_mode.max_tokens() as usize);
+            // Built and measured once per step: compaction below changes
+            // history and memory, never what tools are offered.
+            let tools = self.tool_defs();
+            let tools_chars = json_len(&tools);
             self.fixed_now = None;
-            self.fixed_now = Some(self.fixed_estimate());
+            self.fixed_now = Some(self.fixed_estimate_with(tools_chars));
             self.manage_context(&mut d);
             let mut system = self.system_prompt();
             if let Some(h) = &mut self.advisor {
                 system.push_str(&h.advice(self.meter.requests.len()));
             }
-            let mut messages = Vec::with_capacity(self.history.len() + 2);
-            messages.push(json!({"role": "system", "content": system}));
-            messages.extend(self.history.iter().cloned());
             // Last, so the cached prefix stays the same; never stored in history.
             let mut notes: Vec<String> = self.client.budget.status().filter(|_| !self.is_worker).into_iter().collect();
             notes.extend(self.live_state());
             if self.smart_compaction() {
                 notes.push(format!("Context in use: {}% of the context budget.", self.context_used()));
             }
-            if !notes.is_empty() {
-                messages.push(json!({"role": "user", "content": format!("{}{}", context::NOTE, notes.join("\n"))}));
-            }
+            let note = (!notes.is_empty())
+                .then(|| json!({"role": "user", "content": format!("{}{}", context::NOTE, notes.join("\n"))}));
 
             let started = Instant::now();
+            let cap = self.output_room(&self.model);
+            // History moves into the request and back out after it; side
+            // questions and side chats share the request's copy.
+            let history = std::mem::take(&mut self.history);
+            let kept = history.len();
+            let mut messages = Vec::with_capacity(kept + 2);
+            messages.push(json!({"role": "system", "content": system}));
+            messages.extend(history);
+            messages.extend(note);
+            let sent = context::estimate(&messages) + tools_chars / 4;
+            let messages = Arc::new(messages);
             if !self.is_worker && self.side_meta.is_none() {
-                crate::aside::refresh(self.aside_context());
-                crate::aside::attach_side(self.side_parent().ok());
+                let history = context::Snapshot::view(&messages, 1..kept + 1);
+                crate::aside::refresh(self.aside_context_with(history.clone()));
+                crate::aside::attach_side(self.side_parent_with(history).ok());
             }
-            let tools = self.tool_defs();
-            let sent = context::estimate(&messages) + tools.to_string().len() / 4;
-            let mut reply = match self.ask(&mut d, messages, tools) {
+            let asked = self.ask_model(self.model.clone(), &mut d, messages.clone(), tools, cap);
+            self.history = take_history(messages, kept);
+            let mut reply = match asked {
                 Ok(r) => r,
                 Err(e) if !overflow_retried && self.meter.overflow(&format!("{e:#}")) => {
                     overflow_retried = true;
@@ -1424,13 +1442,17 @@ impl Agent {
     }
 
     /// Sends one request on a background thread and renders it as it streams.
-    /// Ctrl-C returns at once with whatever text arrived.
-    fn ask(&mut self, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
-        self.ask_model(self.model.clone(), d, messages, tools)
-    }
-
-    fn ask_model(&mut self, model: String, d: &mut Display, messages: Vec<Value>, tools: Value) -> Result<Reply> {
-        let cap = self.output_room(&model);
+    /// Ctrl-C returns at once with whatever text arrived. `cap` is the
+    /// request's output room (see [`Agent::output_room`]), measured by the
+    /// caller while history is still in place.
+    fn ask_model(
+        &mut self,
+        model: String,
+        d: &mut Display,
+        messages: Arc<Vec<Value>>,
+        tools: Value,
+        cap: u32,
+    ) -> Result<Reply> {
         let rx = self.client.start_chat(
             model,
             messages,
@@ -2357,12 +2379,17 @@ impl Agent {
     }
 
     fn fixed_estimate(&self) -> usize {
-        if let Some(n) = self.fixed_now {
-            return n;
+        match self.fixed_now {
+            Some(n) => n,
+            None => self.fixed_estimate_with(json_len(&self.tool_defs())),
         }
+    }
+
+    /// [`Agent::fixed_estimate`] for tool schemas already measured at `tools_chars`.
+    fn fixed_estimate_with(&self, tools_chars: usize) -> usize {
         let advice = if self.advisor.is_some() { context::MEMORY_CHARS } else { 0 };
         let live = self.live_state().map_or(0, |s| s.len());
-        (self.system_prompt().len() + live + self.tool_defs().to_string().len() + advice) / 4
+        (self.system_prompt().len() + live + tools_chars + advice) / 4
     }
 
     /// Context tokens past which old tool output is trimmed, and past which
@@ -2604,7 +2631,9 @@ impl Agent {
         let role = self.request_role;
         self.request_role = "compaction";
         let mut writer = self.compaction_model.clone().unwrap_or_else(|| self.model.clone());
-        let mut reply = self.ask_model(writer.clone(), &mut Display::new(true), messages.clone(), json!([]));
+        let messages = Arc::new(messages);
+        let cap = self.output_room(&writer);
+        let mut reply = self.ask_model(writer.clone(), &mut Display::new(true), messages.clone(), json!([]), cap);
         if let Some(u) = reply.as_ref().ok().and_then(|r| r.usage) {
             self.totals.add_request(&writer, u.prompt, u.completion);
         }
@@ -2627,7 +2656,8 @@ impl Agent {
                 self.model
             )));
             writer = self.model.clone();
-            reply = self.ask_model(writer.clone(), &mut Display::new(true), messages, json!([]));
+            let cap = self.output_room(&writer);
+            reply = self.ask_model(writer.clone(), &mut Display::new(true), messages, json!([]), cap);
             if let Some(u) = reply.as_ref().ok().and_then(|r| r.usage) {
                 self.totals.add_request(&writer, u.prompt, u.completion);
             }
@@ -2875,6 +2905,36 @@ impl Agent {
     }
 }
 
+/// The length of `v` as compact JSON, without building the string.
+fn json_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
+}
+
+/// History back out of a request built as [system, history.., note]. The
+/// request thread lets go of its handle before it reports done, so this
+/// copies only while side question views share it, or a Ctrl-C left the
+/// request running.
+fn take_history(messages: Arc<Vec<Value>>, len: usize) -> Vec<Value> {
+    let mut all = Arc::try_unwrap(messages).unwrap_or_else(|shared| shared[1..=len].to_vec());
+    if all.len() > len {
+        all.truncate(len + 1);
+        all.remove(0);
+    }
+    all
+}
+
 fn job(v: &Value) -> (String, String) {
     (v["description"].as_str().unwrap_or("worker").to_string(), v["prompt"].as_str().unwrap_or("").to_string())
 }
@@ -3003,13 +3063,39 @@ mod stable_prompt_tests {
 
         let persisted = agent.trajectory()["messages"].to_string();
         assert!(!persisted.contains("Current plan:") && !persisted.contains("Owned shell activities"));
-        let aside = agent.aside_context();
+        let aside = agent.aside_context().messages();
         let aside_state = aside.last().unwrap()["content"].as_str().unwrap();
         assert!(aside_state.contains("Current plan:") && aside_state.contains("plan detail"));
         assert!(aside_state.contains("Owned shell activities") && aside_state.contains("activity detail"));
         assert_eq!(aside.len(), agent.history.len() + 2, "the aside note is ephemeral and follows the copied history");
         assert!(!serde_json::to_string(&agent.history).unwrap().contains("Owned shell activities"));
         agent.activities.cancel_all(false);
+    }
+
+    #[test]
+    fn history_comes_back_out_of_a_request_whether_or_not_it_is_shared() {
+        let history: Vec<Value> = (0..3).map(|i| json!({"role": "user", "content": format!("m{i}")})).collect();
+        let request = |note: bool| {
+            let mut m = vec![json!({"role": "system", "content": "s"})];
+            m.extend(history.iter().cloned());
+            m.extend(note.then(|| json!({"role": "user", "content": "note"})));
+            Arc::new(m)
+        };
+        for note in [false, true] {
+            assert_eq!(take_history(request(note), 3), history);
+            let shared = request(note);
+            let view = context::Snapshot::view(&shared, 1..4);
+            assert_eq!(take_history(shared, 3), history);
+            assert_eq!(view.messages(), &history[..], "a side view keeps what the request sent");
+        }
+        assert!(take_history(Arc::new(vec![json!({"role": "system", "content": "s"})]), 0).is_empty());
+    }
+
+    #[test]
+    fn json_len_is_the_compact_serialized_length() {
+        let agent = agent();
+        let tools = agent.tool_defs();
+        assert_eq!(json_len(&tools), tools.to_string().len());
     }
 }
 

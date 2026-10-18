@@ -372,17 +372,20 @@ impl Client {
 
     /// Runs a chat request on a background thread and streams events back, so
     /// the caller can animate and react to Ctrl-C while waiting. Dropping the
-    /// receiver stops the stream.
+    /// receiver stops the stream. The messages are shared rather than copied:
+    /// the thread lets go of them before it sends `Done`, so a caller that
+    /// holds the other handle can take them back without a copy.
     pub fn start_chat(
         self: &Arc<Self>,
         model: String,
-        messages: Vec<Value>,
+        messages: impl Into<Arc<Vec<Value>>>,
         tools: Value,
         temperature: f32,
         inference: (ExecutionMode, &'static str, Option<u32>),
     ) -> Receiver<Event> {
         let (tx, rx) = channel();
         let me = self.clone();
+        let messages = messages.into();
         std::thread::spawn(move || {
             STATUS.with(|s| *s.borrow_mut() = Some(tx.clone()));
             let held = Held { tx: tx.clone(), reasoning: false, text: String::new(), gone: false };
@@ -391,6 +394,7 @@ impl Client {
                 HELD.with(|h| h.borrow_mut().as_mut().is_none_or(|h| h.push(d)))
             });
             send_held();
+            drop(messages);
             let _ = tx.send(Event::Done(result));
         });
         rx
@@ -417,7 +421,7 @@ impl Client {
             clamp_output(&mut body, output_cap);
             let url = format!("{}/v1/messages", ep.base_url);
             return self.stream_with_retry(on, |on| {
-                let sent = self.send(ep, &url, Some(&body), beta.as_deref(), role)?;
+                let sent = self.send(ep, &url, Some(Payload::of(&body)), beta.as_deref(), role)?;
                 let result = anthropic::parse_stream(sent.response, on);
                 settle(sent.reservation, &result);
                 result
@@ -428,15 +432,17 @@ impl Client {
             clamp_output(&mut body, output_cap);
             let url = format!("{}/codex/responses", ep.base_url);
             return self.stream_with_retry(on, |on| {
-                let sent = self.send(ep, &url, Some(&body), None, role)?;
+                let sent = self.send(ep, &url, Some(Payload::of(&body)), None, role)?;
                 let result = codex::parse_stream(sent.response, on);
                 settle(sent.reservation, &result);
                 result
             });
         }
+        // The messages are written from history when the body is serialised;
+        // the placeholder keeps their place among the sorted keys.
         let mut body = json!({
             "model": model,
-            "messages": anthropic::strip_private(messages),
+            "messages": null,
             "stream": true,
             "stream_options": { "include_usage": true },
             "max_tokens": 16384,
@@ -454,7 +460,7 @@ impl Client {
         }
         let url = format!("{}/chat/completions", ep.base_url);
         self.stream_with_retry(on, |on| {
-            let sent = self.send(ep, &url, Some(&body), None, role)?;
+            let sent = self.send(ep, &url, Some(Payload { value: &body, messages: Some(messages) }), None, role)?;
             let result = parse_stream(sent.response, on);
             settle(sent.reservation, &result);
             result
@@ -570,7 +576,7 @@ impl Client {
     /// (`RUSTY_RETRY_SECS`, default five minutes). A key that is refused (401
     /// or 403) twice is not worth waiting on, so auth failures give up once
     /// every key has been refused twice. Ctrl-C ends a wait at once.
-    fn send(&self, ep: &Endpoint, url: &str, body: Option<&Value>, beta: Option<&str>, role: &str) -> Result<Sent> {
+    fn send(&self, ep: &Endpoint, url: &str, body: Option<Payload>, beta: Option<&str>, role: &str) -> Result<Sent> {
         self.send_with(ep, url, (body, role), beta, Retry::Patient)
     }
 
@@ -578,7 +584,7 @@ impl Client {
         &self,
         ep: &Endpoint,
         url: &str,
-        request: (Option<&Value>, &str),
+        request: (Option<Payload>, &str),
         beta: Option<&str>,
         retry: Retry,
     ) -> Result<Sent> {
@@ -587,7 +593,10 @@ impl Client {
         // same timer context as streamed and catalog responses.
         let _runtime = stream_runtime().enter();
         let (body, role) = request;
-        let reserve = body.map(reservation_tokens).transpose()?;
+        // Serialised once: the same bytes size the reservation and go out on
+        // every attempt.
+        let payload = body.map(|b| b.encode()).transpose()?;
+        let reserve = payload.as_ref().map(|(_, n)| *n);
         let keys = &ep.keys;
         // A sign-in is one slot that refreshes itself instead of rotating.
         let slots = keys.len().max(usize::from(ep.codex.is_some()));
@@ -602,8 +611,12 @@ impl Client {
             for _ in 0..slots {
                 ensure_request_watched()?;
                 let idx = ep.key_idx.load(Ordering::Relaxed) % slots;
-                let mut req = match body {
-                    Some(b) => self.http.post(url).json(b),
+                let mut req = match &payload {
+                    Some((bytes, _)) => self
+                        .http
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(bytes.clone()),
                     None => self.http.get(url),
                 };
                 req = match &ep.codex {
@@ -727,15 +740,53 @@ fn clamp_output(body: &mut Value, cap: Option<u32>) {
     }
 }
 
-fn reservation_tokens(body: &Value) -> Result<u64> {
-    let output = body["max_completion_tokens"]
-        .as_u64()
-        .or_else(|| body["max_tokens"].as_u64())
-        .or_else(|| body["max_output_tokens"].as_u64())
-        .ok_or_else(|| anyhow!("model request has no output token cap"))?;
-    (serde_json::to_vec(body)?.len() as u64)
-        .checked_add(output)
-        .ok_or_else(|| anyhow!("model budget exhausted: request reservation overflow"))
+/// A request body to send. `messages`, when set, are written in place of the
+/// body's `messages` key, without rusty's private keys (see
+/// [`anthropic::Public`]), so a long history is never copied to be sent.
+#[derive(Clone, Copy)]
+struct Payload<'a> {
+    value: &'a Value,
+    messages: Option<&'a [Value]>,
+}
+
+impl<'a> Payload<'a> {
+    fn of(value: &'a Value) -> Self {
+        Self { value, messages: None }
+    }
+
+    /// The JSON bytes and the tokens the budget reserves for them: their
+    /// length plus the output cap.
+    fn encode(self) -> Result<(Vec<u8>, u64)> {
+        let body = self.value;
+        let output = body["max_completion_tokens"]
+            .as_u64()
+            .or_else(|| body["max_tokens"].as_u64())
+            .or_else(|| body["max_output_tokens"].as_u64())
+            .ok_or_else(|| anyhow!("model request has no output token cap"))?;
+        let bytes = serde_json::to_vec(&self)?;
+        let reserve = (bytes.len() as u64)
+            .checked_add(output)
+            .ok_or_else(|| anyhow!("model budget exhausted: request reservation overflow"))?;
+        Ok((bytes, reserve))
+    }
+}
+
+impl serde::Serialize for Payload<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let (Some(map), Some(messages)) = (self.value.as_object(), self.messages) else {
+            return self.value.serialize(s);
+        };
+        let mut out = s.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            if k == "messages" {
+                out.serialize_entry(k, &anthropic::Public(messages))?;
+            } else {
+                out.serialize_entry(k, v)?;
+            }
+        }
+        out.end()
+    }
 }
 
 fn settle(reservation: Option<crate::budget::Reservation>, result: &Result<Reply>) {
