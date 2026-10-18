@@ -15,13 +15,34 @@ export CARGO_TARGET_DIR="$base/$key"
 mkdir -p "$CARGO_TARGET_DIR"
 exec python3 - "$CARGO_TARGET_DIR/.rusty-command.lock" "$@" <<'PYTHON'
 import fcntl
+import hashlib
+import os
+from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
 
 with open(sys.argv[1], "a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    child = subprocess.Popen(["cargo", *sys.argv[2:]])
+    workspace = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+    previous = os.environ.get("RUSTC_WORKSPACE_WRAPPER", "")
+    key = hashlib.sha256((workspace + "\0" + previous).encode()).hexdigest()[:20]
+    wrapper = Path(os.environ["CARGO_TARGET_DIR"]) / "workspaces" / key / "rustc"
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    if not wrapper.exists():
+        wrapper.write_text("#!/bin/sh\nexec " + (shlex.quote(previous) + " " if previous else "") + '"$@"\n')
+        wrapper.chmod(0o755)
+    # Cargo namespaces workspace artifacts by this path; dependencies stay shared.
+    os.environ["RUSTC_WORKSPACE_WRAPPER"] = str(wrapper)
+    args = sys.argv[2:]
+    if args and args[0] == "clippy":
+        # Clippy replaces the workspace wrapper. Its tracked arguments must
+        # distinguish checkouts too, without changing any compiler behavior.
+        if "--" not in args:
+            args.append("--")
+        args.append("--remap-path-prefix=" + workspace + "=" + workspace)
+    child = subprocess.Popen(["cargo", *args])
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda signum, frame: child.send_signal(signum))
     code = child.wait()
