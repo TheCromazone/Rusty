@@ -126,7 +126,7 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
             if path.extension().is_none_or(|x| x != "json") {
                 continue;
             }
-            let v: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+            let v: Value = serde_json::from_str(&crate::session::read(&path)?)?;
             if let Ok(meta) = serde_json::from_value::<Meta>(v["side"].clone()) {
                 if meta.parent_id == parent.id() {
                     display::notice(&format!("side {}: {}", path.file_stem().unwrap().to_string_lossy(), meta.title));
@@ -182,7 +182,7 @@ pub fn command(parent: &Parent, input: &str) -> Result<()> {
                 if path.extension().is_none_or(|x| x != "json") {
                     continue;
                 }
-                let value: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                let value: Value = serde_json::from_str(&crate::session::read(&path)?)?;
                 let Ok(meta) = serde_json::from_value::<Meta>(value["side"].clone()) else { continue };
                 if meta.parent_id == parent.id() && (meta.title == arg || path.file_stem().is_some_and(|s| s == arg)) {
                     matches.push((path, meta));

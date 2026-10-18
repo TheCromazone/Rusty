@@ -340,7 +340,7 @@ fn an_empty_repl_leaves_no_session_and_continue_takes_the_last_spoken_one() {
         .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
         .filter(|name| name.ends_with(".json") || name.ends_with(".lock") && name != "index.lock")
         .count();
-    assert_eq!(files, 2, "only the spoken session's file and lock remain");
+    assert_eq!(files, 1, "only the spoken session's file remains; released leases leave no lock file");
     let (out, _, requests) = scripted_run(&s, &["--memory", "off", "-c", "what did I ask?"], vec![text_reply("ok")]);
     assert!(out.contains(&format!("resumed {id}")), "{out}");
     assert!(requests[0]["messages"].to_string().contains("remember the walrus"));

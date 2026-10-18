@@ -362,6 +362,8 @@ pub struct Agent {
     pub start_blobs: Option<std::collections::HashMap<String, String>>,
     pub session_path: Option<PathBuf>,
     session_lease: Option<crate::session::Lease>,
+    /// `<session>.trace.jsonl`, opened once per session rather than per request.
+    trace_file: Option<(PathBuf, std::fs::File)>,
     /// Target, audit log and change record; inert for workers.
     pub infra: infra::Harness,
     /// MCP servers' tools, offered to the lead only.
@@ -456,6 +458,7 @@ impl Agent {
             start_blobs: None,
             session_path: None,
             session_lease: None,
+            trace_file: None,
             infra: infra::Harness::default(),
             mcp: crate::mcp::Mcp::default(),
             is_worker: false,
@@ -2786,7 +2789,9 @@ impl Agent {
         let archived = &self.archived[self.session_from.min(self.archived.len())..];
         if self.side_meta.is_none() && !(self.history.is_empty() && archived.is_empty()) {
             if let Some(dir) = path.parent() {
-                crate::session::publish_and_record(dir, path, body, &self.history, archived)?;
+                let lease =
+                    self.session_lease.as_ref().ok_or_else(|| anyhow::anyhow!("session is not open for writing"))?;
+                crate::session::publish_and_record(dir, lease, body, &self.history, archived)?;
             }
         } else {
             crate::session::save(path, body)?;
@@ -2813,13 +2818,12 @@ impl Agent {
             return Ok(spoken);
         }
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("lock"));
         Ok(false)
     }
 
     pub fn load_session(&mut self, path: &std::path::Path) -> Result<()> {
         let lease = crate::session::Lease::acquire(path)?;
-        let raw = std::fs::read_to_string(path)
+        let raw = crate::session::read(path)
             .map_err(|e| anyhow::anyhow!("can't read session file {}: {e}", path.display()))?;
         let v: Value = serde_json::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("session file {} is damaged and can't be resumed ({e})", path.display()))?;
@@ -2842,7 +2846,7 @@ impl Agent {
     }
 
     /// Appends one line per request to `<session>.trace.jsonl` for later analysis.
-    fn trace(&self, reply: &Reply, took: Duration) {
+    fn trace(&mut self, reply: &Reply, took: Duration) {
         if self.is_worker {
             return;
         }
@@ -2859,8 +2863,13 @@ impl Agent {
             "finish": reply.finish_reason,
         });
         use std::io::Write;
-        if let Ok(mut f) = rusty::privacy::private_file(&path.with_extension("trace.jsonl"), true) {
-            let _ = writeln!(f, "{line}");
+        let path = path.with_extension("trace.jsonl");
+        if self.trace_file.as_ref().is_none_or(|(open, _)| *open != path) {
+            self.trace_file = rusty::privacy::private_file(&path, true).ok().map(|file| (path, file));
+        }
+        if let Some((_, file)) = &mut self.trace_file {
+            // One write per line keeps appends from concurrent writers whole.
+            let _ = file.write_all(format!("{line}\n").as_bytes());
         }
     }
 }

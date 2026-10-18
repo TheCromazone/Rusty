@@ -7,6 +7,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const INDEX: &str = "index.sqlite";
@@ -16,7 +17,7 @@ const MAX_TEXT_CHARS: usize = 4000;
 const MAX_TITLE_CHARS: usize = 60;
 const MAX_MATCHES: usize = 20;
 const MAX_LIST: usize = 50;
-const INDEX_VERSION: i64 = 2;
+const INDEX_VERSION: i64 = 3;
 
 pub fn create(dir: &Path) -> Result<PathBuf> {
     rusty::privacy::private_dir(dir)?;
@@ -37,38 +38,88 @@ pub fn create(dir: &Path) -> Result<PathBuf> {
     bail!("could not reserve a new session")
 }
 
-pub struct Lease(File);
+/// The one writer of a transcript: an exclusive `flock` on `<id>.lock`.
+/// The lock file exists only while it is held, so a project's session
+/// directory does not collect one empty file per session ever opened.
+pub struct Lease {
+    file: File,
+    path: PathBuf,
+    transcript: PathBuf,
+    /// This writer created the transcript's catalog-recovery marker.
+    marked: AtomicBool,
+    /// The catalog matches the last transcript this writer published.
+    indexed: AtomicBool,
+}
 impl Lease {
     pub fn acquire(path: &Path) -> Result<Self> {
         Self::try_acquire(path)?
             .ok_or_else(|| anyhow::anyhow!("session is already open for writing: {}", path.display()))
     }
 
-    fn try_acquire(path: &Path) -> Result<Option<Self>> {
-        let file = rusty::privacy::private_file(&path.with_extension("lock"), true)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Ok(None);
+    fn try_acquire(transcript: &Path) -> Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt;
+        let path = transcript.with_extension("lock");
+        // A releasing holder unlinks the file before it unlocks. Whoever
+        // then locks that orphaned inode must not count as the writer, or a
+        // third process could lock a fresh file at the same path as well.
+        for _ in 0..64 {
+            let file = rusty::privacy::private_file(&path, true)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
+            let held = file.metadata()?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(current) if current.dev() == held.dev() && current.ino() == held.ino() => {
+                    return Ok(Some(Self {
+                        file,
+                        path,
+                        transcript: transcript.to_path_buf(),
+                        marked: AtomicBool::new(false),
+                        indexed: AtomicBool::new(false),
+                    }));
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(Some(Self(file)))
+        bail!("session lock keeps changing: {}", path.display())
     }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
+        // An unindexed publish keeps its marker for the next catalog open.
+        if self.marked.load(Ordering::Acquire) && self.indexed.load(Ordering::Acquire) {
+            if let Some(dir) = self.transcript.parent() {
+                let _ = std::fs::remove_file(dir.join(PENDING_DIR).join(id_of(&self.transcript)));
+            }
+        }
+        // Unlink while still holding the lock; see `try_acquire`.
+        let _ = std::fs::remove_file(&self.path);
         unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
 
-pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
+pub fn save(path: &Path, mut body: serde_json::Value) -> Result<()> {
+    scrub(&mut body);
     let tmp = path.with_extension("pending");
     let result = (|| {
-        rusty::privacy::write_json(&tmp, body)?;
-        File::open(&tmp)?.sync_all()?;
+        let json = serde_json::to_vec(&body)?;
+        let mut writer = std::io::BufWriter::new(rusty::privacy::private_file(&tmp, false)?);
+        if json.len() >= COMPRESS_FROM {
+            let mut gzip = flate2::write::GzEncoder::new(&mut writer, flate2::Compression::new(3));
+            gzip.write_all(&json)?;
+            gzip.finish()?;
+        } else {
+            writer.write_all(&json)?;
+        }
+        writer.into_inner().map_err(|error| error.into_error())?.sync_all()?;
         std::fs::rename(&tmp, path).context("publishing session")?;
         Ok(())
     })();
@@ -78,25 +129,86 @@ pub fn save(path: &Path, body: serde_json::Value) -> Result<()> {
     result
 }
 
-/// Publish a parent transcript only after recording a durable catalog-recovery
-/// marker. A crash between transcript rename and SQLite commit can then be
-/// repaired on the next catalog open without scanning the transcript directory.
+/// Transcripts this large are saved gzip-compressed. Tool output makes up
+/// most of a long session and compresses about 3x; small sessions stay
+/// plain JSON. Level 3 costs about 2 ms for 200 KB, close to level 6's size.
+const COMPRESS_FROM: usize = 64 * 1024;
+
+/// A transcript's JSON text, whether it was saved plain or compressed. The
+/// file keeps its `.json` name either way; `gzip -dc` reads a compressed one.
+pub fn read(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let bytes = std::fs::read(path)?;
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(bytes.as_slice()).read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    String::from_utf8(bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// How many clean history messages `scrub` remembers (32 bytes each).
+const MAX_CLEAN: usize = 1 << 16;
+
+/// `privacy::scrub`, without rescanning history messages it already found
+/// clean. Every save repeats the whole history, almost all of it unchanged
+/// since the last save, and redaction is a pure function of the text for
+/// the life of the process. A message is skipped only when the SHA-256 of
+/// its exact JSON is one that scrubbing left unchanged before.
+fn scrub(body: &mut serde_json::Value) {
+    static CLEAN: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let history = body.get_mut("history").map(serde_json::Value::take);
+    rusty::privacy::scrub(body);
+    let Some(mut history) = history else { return };
+    if let serde_json::Value::Array(items) = &mut history {
+        let mut clean = CLEAN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if clean.len() > MAX_CLEAN {
+            clean.clear();
+        }
+        for item in items {
+            let Ok(raw) = serde_json::to_vec(item) else {
+                rusty::privacy::scrub(item);
+                continue;
+            };
+            let mut digest = [0; 32];
+            digest.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, &raw).as_ref());
+            if clean.contains(&digest) {
+                continue;
+            }
+            rusty::privacy::scrub(item);
+            if serde_json::to_vec(item).is_ok_and(|after| after == raw) {
+                clean.insert(digest);
+            }
+        }
+    } else {
+        rusty::privacy::scrub(&mut history);
+    }
+    body["history"] = history;
+}
+
+/// Publish a parent transcript only once a durable catalog-recovery marker
+/// exists. A crash between transcript rename and SQLite commit can then be
+/// repaired on the next catalog open without scanning the transcript
+/// directory. One marker covers every save the writer makes: recovery skips
+/// it while the lease is held, and the lease clears it on release once the
+/// last save it published is in the catalog.
 pub fn publish_and_record(
     dir: &Path,
-    transcript: &Path,
+    lease: &Lease,
     body: serde_json::Value,
     history: &[serde_json::Value],
     archived: &[serde_json::Value],
 ) -> Result<()> {
-    let marker = pending_marker(dir, transcript)?;
-    save(transcript, body)?;
-    publish_marker(&marker)?;
-    record(dir, transcript, history, archived)?;
-    match std::fs::remove_file(&marker) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("clearing session index recovery marker"),
+    let transcript = lease.transcript.as_path();
+    if !lease.marked.load(Ordering::Acquire) {
+        pending_marker(dir, transcript)?;
+        lease.marked.store(true, Ordering::Release);
     }
+    lease.indexed.store(false, Ordering::Release);
+    save(transcript, body)?;
+    record(dir, transcript, history, archived)?;
+    lease.indexed.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -107,17 +219,6 @@ fn pending_marker(dir: &Path, transcript: &Path) -> Result<PathBuf> {
     file.sync_all()?;
     File::open(dir.join(PENDING_DIR))?.sync_all()?;
     Ok(marker)
-}
-
-fn publish_marker(marker: &Path) -> Result<()> {
-    let mut file = match OpenOptions::new().write(true).truncate(true).open(marker) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    file.write_all(b"published")?;
-    file.sync_all()?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -223,30 +324,58 @@ fn remove_index_files(dir: &Path) {
     }
 }
 
+/// One row per parent session, plus a contentless full-text index of its
+/// terms. Only the index of the terms is kept, never their text: the text
+/// is rebuilt from the transcript whenever it changes. The explicit integer
+/// key is what the full-text rows point at, so VACUUM cannot renumber it.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions(
+       n INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, title TEXT NOT NULL, started INTEGER NOT NULL,
+       updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL
+     );
+     CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_ns DESC, id DESC);
+     CREATE VIRTUAL TABLE IF NOT EXISTS session_terms
+       USING fts5(terms, content='', contentless_delete=1, tokenize='unicode61');";
+
 fn fresh_connection(dir: &Path) -> Result<Connection> {
     let path = dir.join(INDEX);
     drop(rusty::privacy::private_file(&path, true)?);
     let db = Connection::open(&path)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != INDEX_VERSION {
+    if version != 0 && version != 2 && version != INDEX_VERSION {
         bail!("unsupported session index version {version}");
     }
-    db.execute_batch(
-        "PRAGMA journal_mode=DELETE;
-         PRAGMA synchronous=FULL;
-         CREATE TABLE IF NOT EXISTS sessions(
-           id TEXT PRIMARY KEY, title TEXT NOT NULL, started INTEGER NOT NULL,
-           updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL,
-           text TEXT NOT NULL, terms TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_ns DESC, id DESC);
-         CREATE VIRTUAL TABLE IF NOT EXISTS session_terms USING fts5(id UNINDEXED, terms, tokenize='unicode61');
-         PRAGMA user_version=2;",
-    )?;
-    db.prepare("SELECT id,title,started,updated,updated_ns,messages,text,terms FROM sessions LIMIT 0")?;
-    db.prepare("SELECT id,terms FROM session_terms LIMIT 0")?;
+    db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;")?;
+    if version == 2 {
+        migrate_v2(&db)?;
+    }
+    db.execute_batch(SCHEMA)?;
+    db.pragma_update(None, "user_version", INDEX_VERSION)?;
+    db.prepare("SELECT n,id,title,started,updated,updated_ns,messages FROM sessions LIMIT 0")?;
+    db.prepare("SELECT rowid FROM session_terms LIMIT 0")?;
     Ok(db)
+}
+
+/// Version 2 stored each session's recent text and its terms in the row and
+/// a third copy inside the full-text table. Keep every row (a rebuild from
+/// the transcripts would lose titles a compaction has since dropped from the
+/// history) and its indexed terms, then hand the freed pages back.
+fn migrate_v2(db: &Connection) -> Result<()> {
+    db.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE sessions RENAME TO sessions_v2;
+         DROP INDEX IF EXISTS sessions_updated;
+         DROP TABLE session_terms;
+         {SCHEMA}
+         INSERT INTO sessions(n,id,title,started,updated,updated_ns,messages)
+           SELECT rowid,id,title,started,updated,updated_ns,messages FROM sessions_v2;
+         INSERT INTO session_terms(rowid,terms) SELECT rowid,terms FROM sessions_v2;
+         DROP TABLE sessions_v2;
+         PRAGMA user_version={INDEX_VERSION};
+         COMMIT;
+         VACUUM;"
+    ))
+    .context("upgrading the session index")
 }
 
 fn index_ready(dir: &Path, discover_unindexed: bool) -> Result<SessionIndex> {
@@ -311,7 +440,7 @@ fn recover_pending(db: &mut Connection, dir: &Path) -> Result<()> {
         // read and lose the marker for a newer transcript version.
         let Some(_writer_lease) = Lease::try_acquire(&transcript)? else { continue };
         let recovered = (|| -> Result<Option<(Entry, u64, String)>> {
-            let raw = match std::fs::read_to_string(&transcript) {
+            let raw = match read(&transcript) {
                 Ok(raw) => raw,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Ok(None);
@@ -340,7 +469,7 @@ fn recover_pending(db: &mut Connection, dir: &Path) -> Result<()> {
         })()?;
         if let Some((entry, updated_ns, text)) = recovered {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            upsert(&tx, &entry, updated_ns, &text)?;
+            upsert(&tx, &entry, updated_ns, Some(&text))?;
             tx.commit()?;
         }
         // The writer lease guarantees no concurrent publisher can need this
@@ -367,7 +496,7 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
             if id.is_empty() || id == "index" || known.contains(&id) {
                 continue;
             }
-            let Ok(value) = std::fs::read_to_string(&path)
+            let Ok(value) = read(&path)
                 .map_err(anyhow::Error::from)
                 .and_then(|source| serde_json::from_str::<serde_json::Value>(&source).map_err(anyhow::Error::from))
             else {
@@ -401,23 +530,28 @@ fn backfill(db: &mut Connection, dir: &Path) -> Result<()> {
     }
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (entry, updated_ns, text) in rows {
-        upsert(&tx, &entry, updated_ns, &text)?;
+        upsert(&tx, &entry, updated_ns, Some(&text))?;
     }
     tx.commit()?;
     Ok(())
 }
 
-fn upsert(tx: &rusqlite::Transaction<'_>, entry: &Entry, updated_ns: u64, text: &str) -> Result<()> {
-    let terms = rusty::recall::terms(&format!("{}\n{text}", entry.title)).join(" ");
-    tx.execute(
-        "INSERT INTO sessions(id,title,started,updated,updated_ns,messages,text,terms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+/// Writes a session's row. `text` is what its terms come from; `None` keeps
+/// the terms already indexed, for a history with nothing new to say.
+fn upsert(tx: &rusqlite::Transaction<'_>, entry: &Entry, updated_ns: u64, text: Option<&str>) -> Result<()> {
+    let n: i64 = tx.query_row(
+        "INSERT INTO sessions(id,title,started,updated,updated_ns,messages) VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(id) DO UPDATE SET title=excluded.title,started=excluded.started,
-           updated=excluded.updated,updated_ns=excluded.updated_ns,messages=excluded.messages,text=excluded.text,terms=excluded.terms",
-        params![entry.id, entry.title, entry.started, entry.updated, updated_ns, entry.messages, text, terms],
+           updated=excluded.updated,updated_ns=excluded.updated_ns,messages=excluded.messages
+         RETURNING n",
+        params![entry.id, entry.title, entry.started, entry.updated, updated_ns, entry.messages],
+        |row| row.get(0),
     )?;
-    let rowid: i64 = tx.query_row("SELECT rowid FROM sessions WHERE id=?1", [&entry.id], |row| row.get(0))?;
-    tx.execute("DELETE FROM session_terms WHERE rowid=?1", [rowid])?;
-    tx.execute("INSERT INTO session_terms(rowid,id,terms) VALUES(?1,?2,?3)", params![rowid, entry.id, terms])?;
+    if let Some(text) = text {
+        let terms = rusty::recall::terms(&format!("{}\n{text}", entry.title)).join(" ");
+        tx.execute("DELETE FROM session_terms WHERE rowid=?1", [n])?;
+        tx.execute("INSERT INTO session_terms(rowid,terms) VALUES(?1,?2)", params![n, terms])?;
+    }
     Ok(())
 }
 
@@ -448,23 +582,20 @@ pub fn record(
     // still retain the order in which saves were committed.
     let updated_ns = now_ns.max((last_updated_ns.max(0) as u64).saturating_add(1));
     let now = updated_ns / 1_000_000_000;
-    let previous: Option<(u64, String, String)> = tx
-        .query_row("SELECT started,title,text FROM sessions WHERE id=?1", [&id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
+    let previous: Option<(u64, String)> = tx
+        .query_row("SELECT started,title FROM sessions WHERE id=?1", [&id], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
     // The title is the session's first ask. A compacted or resumed history
-    // no longer starts with it, so the first title recorded stays.
+    // no longer starts with it, so the first title recorded stays. A history
+    // with nothing said in it keeps the terms already indexed.
     let (started, title, text) = match previous {
-        Some((started, old_title, old_text)) => (
-            started,
-            if old_title.is_empty() { title } else { old_title },
-            if text.is_empty() { old_text } else { text },
-        ),
-        None => (now, title, text),
+        Some((started, old_title)) => {
+            (started, if old_title.is_empty() { title } else { old_title }, Some(text).filter(|text| !text.is_empty()))
+        }
+        None => (now, title, Some(text)),
     };
     let entry = Entry { id, title, started, updated: now, messages: archived.len() + history.len() };
-    upsert(&tx, &entry, updated_ns, &text)?;
+    upsert(&tx, &entry, updated_ns, text.as_deref())?;
     tx.commit()?;
     Ok(())
 }
@@ -532,7 +663,7 @@ pub fn search(dir: &Path, query: &str) -> Result<Vec<Entry>> {
     with_index(dir, |db| {
         let mut stmt = db.prepare(
             "SELECT s.id,s.title,s.started,s.updated,s.messages
-             FROM session_terms f JOIN sessions s ON s.rowid=f.rowid
+             FROM session_terms f JOIN sessions s ON s.n=f.rowid
              WHERE session_terms MATCH ?1 ORDER BY bm25(session_terms) LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![expression, MAX_MATCHES], row_entry)?;
@@ -639,8 +770,83 @@ mod tests {
         assert!(std::fs::read_to_string(&b).unwrap().contains("second"));
         assert!(Lease::acquire(&a).is_err());
         drop(lease);
+        assert!(!a.with_extension("lock").exists(), "a released lease leaves no lock file behind");
         assert!(Lease::acquire(&a).is_ok());
         assert!(!a.with_extension("pending").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_lock_file_unlinked_by_its_releasing_holder_is_never_shared() {
+        let dir = temp_dir("lease-unlink");
+        let transcript = dir.join("raced.json");
+        let lease = Lease::acquire(&transcript).unwrap();
+        // A second process opened the lock file just before the holder left.
+        let stale = File::open(transcript.with_extension("lock")).unwrap();
+        drop(lease);
+        assert_eq!(unsafe { libc::flock(stale.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        // Locking the orphaned inode grants nothing: the writer is whoever
+        // holds the file at the path, and there is exactly one of those.
+        let writer = Lease::acquire(&transcript).unwrap();
+        assert!(Lease::acquire(&transcript).is_err());
+        drop(writer);
+        drop(stale);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_saves_skip_clean_messages_but_always_scrub_secrets() {
+        let dir = temp_dir("scrub-memo");
+        let path = dir.join("memo.json");
+        let clean = serde_json::json!({"role":"tool","content":"fn main() { println!(\"memo-clean\"); }"});
+        let secret = serde_json::json!({"role":"tool","content":"password = MEMO_SECRET_CANARY_41"});
+        let saved = |history: Vec<serde_json::Value>| {
+            save(&path, serde_json::json!({"history":history,"plan":["token = MEMO_PLAN_CANARY_77"]})).unwrap();
+            std::fs::read_to_string(&path).unwrap()
+        };
+        for _ in 0..2 {
+            let text = saved(vec![clean.clone(), secret.clone()]);
+            assert!(text.contains("memo-clean"), "{text}");
+            assert!(!text.contains("MEMO_SECRET_CANARY_41") && !text.contains("MEMO_PLAN_CANARY_77"), "{text}");
+        }
+        // A remembered clean message that changes is scanned again.
+        let mut leaked = clean.clone();
+        leaked["content"] = serde_json::json!("fn main() {}\napi_key = MEMO_CHANGED_CANARY_93");
+        let text = saved(vec![leaked, secret.clone()]);
+        assert!(!text.contains("MEMO_CHANGED_CANARY_93"), "{text}");
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["history"].as_array().unwrap().len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_transcripts_are_compressed_private_and_load_like_plain_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("compressed");
+        let path = dir.join("large.json");
+        let output = "fn compressed_tool_output() {}\n".repeat(COMPRESS_FROM / 16);
+        let history = vec![
+            serde_json::json!({"role":"user","content":"read the large file"}),
+            serde_json::json!({"role":"tool","content":format!("{output}secret = GZIP_SECRET_CANARY_58")}),
+        ];
+        save(&path, serde_json::json!({"history":history})).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]), "a large transcript is saved compressed");
+        assert!(bytes.len() < output.len() / 4);
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        let text = read(&path).unwrap();
+        assert!(!text.contains("GZIP_SECRET_CANARY_58") && text.contains("compressed_tool_output"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["history"].as_array().unwrap().len(), 2);
+        // Catalog discovery and recovery read compressed transcripts too.
+        assert_eq!(search(&dir, "large").unwrap().len(), 1);
+
+        // Plain transcripts, small or written by an older rusty, still load.
+        let plain = dir.join("plain.json");
+        save(&plain, serde_json::json!({"history":[{"role":"user","content":"small plain ask"}]})).unwrap();
+        assert!(std::fs::read_to_string(&plain).unwrap().starts_with('{'));
+        assert!(read(&plain).unwrap().contains("small plain ask"));
+        assert_eq!(search(&dir, "plain").unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -735,8 +941,9 @@ mod tests {
         .unwrap();
 
         let current = create(&dir).unwrap();
+        let lease = Lease::acquire(&current).unwrap();
         let history = vec![serde_json::json!({"role":"user","content":"current session ask"})];
-        publish_and_record(&dir, &current, serde_json::json!({"history":history}), &history, &[]).unwrap();
+        publish_and_record(&dir, &lease, serde_json::json!({"history":history}), &history, &[]).unwrap();
         let index = Connection::open(dir.join(INDEX)).unwrap();
         let imported: i64 =
             index.query_row("SELECT count(*) FROM sessions WHERE id='1700000001-42'", [], |row| row.get(0)).unwrap();
@@ -803,6 +1010,44 @@ mod tests {
     }
 
     #[test]
+    fn one_marker_covers_a_writers_saves_and_goes_when_it_leaves_indexed() {
+        let dir = temp_dir("writer-marker");
+        let transcript = create(&dir).unwrap();
+        let marker = dir.join(PENDING_DIR).join(id_of(&transcript));
+        let lease = Lease::acquire(&transcript).unwrap();
+        for word in ["first", "second"] {
+            let history = vec![serde_json::json!({"role":"user","content":format!("{word} marker save")})];
+            publish_and_record(&dir, &lease, serde_json::json!({"history":history}), &history, &[]).unwrap();
+            assert!(marker.exists(), "the marker stays while its writer holds the lease");
+        }
+        assert_eq!(search(&dir, "second").unwrap().len(), 1);
+        drop(lease);
+        assert!(!marker.exists(), "a writer whose last save is indexed clears its marker");
+        assert!(!transcript.with_extension("lock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_writer_that_dies_between_rename_and_commit_is_recovered() {
+        let dir = temp_dir("writer-crash");
+        let transcript = create(&dir).unwrap();
+        let lease = Lease::acquire(&transcript).unwrap();
+        let old = vec![serde_json::json!({"role":"user","content":"old granite phrase"})];
+        publish_and_record(&dir, &lease, serde_json::json!({"history":old}), &old, &[]).unwrap();
+        // The next save renames its transcript and dies before its commit.
+        lease.indexed.store(false, Ordering::Release);
+        let new = vec![serde_json::json!({"role":"user","content":"new basalt phrase"})];
+        save(&transcript, serde_json::json!({"history":new})).unwrap();
+        drop(lease);
+        assert!(dir.join(PENDING_DIR).join(id_of(&transcript)).exists());
+
+        assert_eq!(search(&dir, "basalt").unwrap().len(), 1);
+        assert!(search(&dir, "granite").unwrap().is_empty());
+        assert!(!dir.join(PENDING_DIR).join(id_of(&transcript)).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn recovery_clears_stale_and_side_markers_without_indexing_them() {
         let dir = temp_dir("pending-stale");
         let marker_dir = dir.join(PENDING_DIR);
@@ -852,7 +1097,6 @@ mod tests {
 
         let new = vec![serde_json::json!({"role":"user","content":"new crash-recovered phrase"})];
         save(&transcript, serde_json::json!({"history":new})).unwrap();
-        publish_marker(&marker).unwrap();
         let _ = list(&dir).unwrap();
         assert!(marker.exists(), "recovery must also skip an active writer after publication");
         drop(writer); // Crash before record() commits the new catalog row.
@@ -899,11 +1143,10 @@ mod tests {
             updated: newer_ns / 1_000_000_000,
             messages: 1,
         };
-        upsert(&tx, &entry, newer_ns, "newer existing row").unwrap();
+        upsert(&tx, &entry, newer_ns, Some("newer existing row")).unwrap();
         tx.commit().unwrap();
         drop(index);
-        let marker = pending_marker(&dir, &older).unwrap();
-        publish_marker(&marker).unwrap();
+        pending_marker(&dir, &older).unwrap();
 
         let newest = latest(&dir).unwrap().unwrap();
         assert_eq!(newest.id, id_of(&newer));
@@ -913,6 +1156,62 @@ mod tests {
             .query_row("SELECT updated_ns FROM sessions WHERE id='older-pending'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(older_indexed_ns, older_ns, "recovery preserves the transcript's actual mtime");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_version_2_index_upgrades_in_place_and_keeps_its_rows() {
+        let dir = temp_dir("index-v2");
+        // A transcript whose history no longer opens with the title the
+        // catalog kept: a rebuild from files would lose that title.
+        let kept = dir.join("kept.json");
+        rusty::privacy::write_json(&kept, serde_json::json!({"history":[{"role":"user","content":"later ask"}]}))
+            .unwrap();
+        let db = Connection::open(dir.join(INDEX)).unwrap();
+        db.execute_batch(
+            "CREATE TABLE sessions(
+               id TEXT PRIMARY KEY, title TEXT NOT NULL, started INTEGER NOT NULL,
+               updated INTEGER NOT NULL, updated_ns INTEGER NOT NULL, messages INTEGER NOT NULL,
+               text TEXT NOT NULL, terms TEXT NOT NULL
+             );
+             CREATE INDEX sessions_updated ON sessions(updated_ns DESC, id DESC);
+             CREATE VIRTUAL TABLE session_terms USING fts5(id UNINDEXED, terms, tokenize='unicode61');
+             INSERT INTO sessions VALUES('kept','fix the zebra bug',5,6,6000000000,3,'fix the zebra bug','fix zebra bug');
+             INSERT INTO session_terms(rowid,id,terms) SELECT rowid,id,terms FROM sessions;
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+        drop(db);
+
+        let listed = list(&dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].title.as_str(), listed[0].started, listed[0].updated, listed[0].messages),
+            ("fix the zebra bug", 5, 6, 3)
+        );
+        assert_eq!(search(&dir, "zebra").unwrap().len(), 1, "terms indexed by version 2 stay searchable");
+        let db = Connection::open(dir.join(INDEX)).unwrap();
+        let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, INDEX_VERSION);
+        assert!(db.prepare("SELECT text FROM sessions").is_err(), "the duplicated text column is gone");
+        drop(db);
+
+        // Later saves of the upgraded row replace its terms.
+        let history = vec![serde_json::json!({"role":"user","content":"now about the yak"})];
+        record(&dir, &kept, &history, &[]).unwrap();
+        assert!(search(&dir, "zebra").unwrap().len() == 1, "the kept title is still indexed");
+        assert_eq!(search(&dir, "yak").unwrap().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_save_with_nothing_said_keeps_the_indexed_terms() {
+        let dir = temp_dir("terms-kept");
+        let path = create(&dir).unwrap();
+        record(&dir, &path, &[serde_json::json!({"role":"user","content":"tune the walrus cache"})], &[]).unwrap();
+        // A compacted history can hold only notes and replies.
+        record(&dir, &path, &[serde_json::json!({"role":"assistant","content":"done"})], &[]).unwrap();
+        assert_eq!(search(&dir, "walrus").unwrap().len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -974,7 +1273,7 @@ mod tests {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let text = if n == 4_999 { "needle_unique_token searchable catalog" } else { "ordinary catalog entry" };
             let entry = Entry { id, title: text.to_owned(), started: 1, updated: n, messages: 2 };
-            upsert(&tx, &entry, n * 1_000_000_000, text).unwrap();
+            upsert(&tx, &entry, n * 1_000_000_000, Some(text)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1008,7 +1307,7 @@ mod tests {
         for (id, updated_ns) in [("older", 1_800_000_000_100_000_000), ("newer", 1_800_000_000_900_000_000)] {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: id.into(), started: 10, updated: 1_800_000_000, messages: 2 };
-            upsert(&tx, &entry, updated_ns, id).unwrap();
+            upsert(&tx, &entry, updated_ns, Some(id)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1027,7 +1326,7 @@ mod tests {
         for (n, id) in ["aa11", "aa22", "bb33"].into_iter().enumerate() {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: id.into(), started: 1, updated: 1, messages: 2 };
-            upsert(&tx, &entry, n as u64, id).unwrap();
+            upsert(&tx, &entry, n as u64, Some(id)).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1048,7 +1347,7 @@ mod tests {
         for (id, messages, ns) in [("spoken", 2, 1_000), ("silent", 0, 2_000)] {
             rusty::privacy::write_json(&dir.join(format!("{id}.json")), serde_json::json!({})).unwrap();
             let entry = Entry { id: id.into(), title: String::new(), started: 1, updated: 1, messages };
-            upsert(&tx, &entry, ns, "").unwrap();
+            upsert(&tx, &entry, ns, Some("")).unwrap();
         }
         tx.commit().unwrap();
         drop(index);
@@ -1070,14 +1369,12 @@ mod tests {
         record(&dir, &path, &history, &[]).unwrap();
 
         let index = Connection::open(dir.join(INDEX)).unwrap();
-        let (title, text, terms): (String, String, String) = index
-            .query_row("SELECT title,text,terms FROM sessions WHERE id=?1", [&id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
+        let title: String = index.query_row("SELECT title FROM sessions WHERE id=?1", [&id], |row| row.get(0)).unwrap();
+        // The indexed terms come from this redacted text.
+        let text = text_for(&[], &history);
         assert!(text.contains("let token = self.token.clone();"), "{text}");
         assert!(text.contains("password=[redacted]"), "{text}");
-        assert!(!title.contains(secret) && !text.contains(secret) && !terms.contains(secret));
+        assert!(!title.contains(secret) && !text.contains(secret));
         assert!(search(&dir, secret).unwrap().is_empty());
         assert!(search(&dir, "self.token.clone").unwrap().iter().any(|entry| entry.id == id));
         assert!(!render(&list(&dir).unwrap(), rusty::unix_now()).contains(secret));

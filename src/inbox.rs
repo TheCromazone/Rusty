@@ -118,7 +118,7 @@ mod tests {
         assert!(agent.verification_records.is_empty());
         assert_eq!(agent.completion.accepted, 0);
         assert_eq!(agent.history.len(), 1);
-        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&parent).unwrap()).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&crate::session::read(&parent).unwrap()).unwrap();
         assert_eq!(saved["side_receipts"].as_array().unwrap().len(), 1);
         drop(agent);
         std::fs::remove_dir_all(root).unwrap();
