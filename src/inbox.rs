@@ -51,7 +51,8 @@ pub fn pending(parent: &Path) -> Result<Vec<(PathBuf, Transfer)>> {
         .into_iter()
         .take(4)
         .map(|path| {
-            let transfer: Transfer = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+            // Written by session::save, which gzips large bodies under the same name.
+            let transfer: Transfer = serde_json::from_str(&crate::session::read(&path)?)?;
             if transfer.parent_id != id(parent) || transfer.id != id(&path) {
                 bail!("side-summary identity mismatch: {}", path.display());
             }
@@ -77,6 +78,32 @@ mod tests {
     use crate::llm::{Client, Endpoint};
     use crate::permissions::{Mode, Policy};
     use std::sync::Arc;
+
+    #[test]
+    fn a_large_queued_summary_reads_back_after_compression() {
+        let root = std::env::temp_dir().join(format!("rusty-inbox-big-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = sessions.join("ab".repeat(16) + ".json");
+        std::fs::write(&parent, "{}").unwrap();
+        let note = Transfer {
+            id: "ef".repeat(32),
+            parent_id: id(&parent),
+            source_id: "side".into(),
+            source_head: "head".into(),
+            title: "big review".into(),
+            // Over the size at which session::save gzips the file on disk.
+            summary: "finding line\n".repeat(8000),
+            observations: BTreeMap::new(),
+        };
+        enqueue(&parent, &note).unwrap();
+        let on_disk = std::fs::read(dir(&parent).join(format!("{}.json", note.id))).unwrap();
+        assert!(on_disk.starts_with(&[0x1f, 0x8b]), "the queued file is compressed");
+        let queued = pending(&parent).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].1.summary, note.summary);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn a_failed_parent_save_keeps_the_note_and_cannot_change_goal_authority() {
