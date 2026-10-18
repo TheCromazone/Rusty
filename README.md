@@ -16,90 +16,100 @@
 
 **A coding agent for your terminal. Written in Rust.**
 
-*All the good parts of modern coding agents. None of the stuff that wears you down.*
+*Inspect the code. Make the change. Run the check.*
 
 ![rust](https://img.shields.io/badge/rust-2021-b7410e?logo=rust)
 ![binary](https://img.shields.io/badge/one%20static%20binary-no%20runtime-a0a8b2)
-![evals](https://img.shields.io/badge/evals-10%E2%80%9312%20of%2012%20by%20mode-ec7a34)
-![tests](https://img.shields.io/badge/tests-130%20passing-ec7a34)
 ![models](https://img.shields.io/badge/models-NVIDIA%20%C2%B7%20Anthropic%20%C2%B7%20OpenAI%20%C2%B7%20any%20compatible-6c757d)
 ![license](https://img.shields.io/badge/license-MIT-6c757d)
 
-<img src="docs/demo/hero.gif" alt="rusty finds and fixes two bugs in a small shop app, then runs the tests" width="100%">
+<img src="docs/demo/mode-standard.gif" alt="rusty finds and fixes two bugs in a small shop app, then runs the tests" width="100%">
 
-<sub>A real session (idle pauses trimmed, played back a little faster). rusty finds two real bugs in a discount module, fixes both, and proves it by running the tests.</sub>
+<sub>A fresh terminal capture from the current CLI: inspect the failing discount tests, edit the source, and run the tests. Playback is 1.5×; idle gaps are capped at 1.5 seconds.</sub>
 
 </div>
 
 ---
 
-## Why rusty
+## See the modes in action
 
-Coding agents are great for the first twenty minutes of a task and shaky for
-the next three hours. They forget what you said once the context fills up.
-They announce "done" without running anything. They ask before `ls`, then wave
-through `rm -rf`. Their memory turns into a junk drawer pasted into every
-prompt. And you find out what they cost when the bill arrives.
+Rusty runs in your terminal, with local tools, streamed answers, saved sessions,
+and checks you can inspect. Choose how it works with `/mode`, how much it shows
+with `/view`, and what it may do with `/permissions`. These are separate settings.
 
-rusty is built around fixing exactly those problems. It's one static binary
-with no telemetry. It runs on open models hosted by NVIDIA by default, talks
-to Claude and GPT models directly, and works with any OpenAI-compatible
-endpoint.
+The recordings below use the real CLI and a live NVIDIA Nemotron provider.
+Each execution demo starts with a fresh copy of [`demo/shop`](demo/shop), including
+the same failing discount tests. They show observed runs, not a speed or model
+quality comparison. [Capture details and reproduction commands](docs/demo/README.md).
 
-## See it work
+### Standard: follow the failure through to a passing check
 
-Every clip below is a real session, recorded with
-`cargo xtask record` ([`xtask/src/record.rs`](xtask/src/record.rs)) against the toy store in
-[`demo/shop`](demo/shop) (or against rusty's own source). The only edits are trimmed idle pauses and
-faster playback. Run them yourself and you'll get the same kind of result.
+`/mode standard` → reproduce the failure → inspect the discount code → edit → test.
+The recording at the top of this page shows the full journey.
 
-### A swarm, when one pair of eyes isn't enough
+### Careful: a separate checker reviews the finished change
 
-<img src="docs/demo/swarm.gif" alt="four parallel workers audit four modules and return a ranked bug list" width="100%">
+<img src="docs/demo/mode-careful.gif" alt="Careful mode fixes the discount bug, runs tests, and invokes its read-only checker" width="100%">
 
-`/agents auto`, then one sentence. rusty starts four read-only workers, one per
-module, each with its own context. It shows each one finishing, then merges
-their reports into a ranked list. The two real bugs come out on top.
-<sub>(Sped up 2×.)</sub>
+The same bug fix with `/mode careful`. Watch the tool output and the separate
+read-only checker before the final answer. A checker report and a passing local
+test are evidence about this fixture; they do not establish production safety.
 
-### `/goal`: keep going until it's actually done
+### Vibe: a small iteration, with a real check
 
-<img src="docs/demo/goal.gif" alt="goal mode plans, writes a CLI and its tests, runs them, and closes with evidence" width="100%">
+<img src="docs/demo/mode-vibe.gif" alt="Vibe mode inspects the failing discount tests, edits the implementation, and checks the result" width="100%">
 
-Goal mode plans, writes `shop/cli.py` and its tests, and runs them. It also
-checks the edge cases by hand. It can only finish by calling `goal_done` with
-evidence, so "I think it works" doesn't count.
+`/mode vibe` takes a quick pass at the same task. It still runs a relevant check.
+Execution modes do not change permissions or grant access to additional tools.
 
-### `/compact`: a summary that doesn't forget
+### Auto: let the request choose the execution profile
 
-<img src="docs/demo/compact.gif" alt="compaction shrinks 12.6k tokens to 864 and the next answer still knows the details" width="100%">
+<img src="docs/demo/mode-auto.gif" alt="Auto mode routes a bug fix, quick prototype, and production-risk review to execution profiles" width="100%">
 
-rusty reads two of its own source files (12.6k tokens). `/compact keep how the
-working set is built` shrinks that to **864 tokens** and saves three lasting
-facts to memory. The follow-up question is answered correctly **without
-reading a single file again**. Your messages and a list of files changed and
-commands run are carried over verbatim, so the summary can't lose them.
+`/mode auto` handles a discount fix, a quick formatting prototype, and a read-only
+production-risk review. The terminal states the selected profile and why it was
+chosen. Everything runs against the local fixture.
 
-### Switch models mid-session for a second opinion
+### Default, verbose, ADHD: choose how much work you see
 
-<img src="docs/demo/models.gif" alt="doctor checks each provider, Nemotron Super fixes the discount bug, then Nemotron Ultra reviews the fix" width="100%">
+<img src="docs/demo/views.gif" alt="The same terminal switches between default grouped tools, verbose tool output, and the compact ADHD view" width="100%">
 
-`/doctor` checks every provider it has a key for and says where the current
-model goes. Nemotron Super finds and fixes the discount bug and runs the tests.
-Then `/model nvidia/nemotron-3-ultra-550b-a55b` switches mid-session, and the
-bigger model reviews the fix with the whole conversation in view. Claude and
-GPT models work the same way: rusty picks the provider from the model id on
-each request.
-<sub>(Sped up 2×.)</sub>
+`/view default` groups exploration and keeps edits and commands visible.
+`/view verbose` expands tool results and reasoning. `/view adhd` keeps a short
+status line and concise answers. Each view performs a real source read and test run.
 
-### Focus mode, memory, permissions and token honesty
+### Read-only, ask, auto, yolo: inspect permission decisions
 
-<img src="docs/demo/focus.gif" alt="adhd view gives a three-bullet answer; memory, permission check and token breakdown" width="100%">
+<img src="docs/demo/permissions.gif" alt="Permission checks across read-only, ask, auto, and yolo, including a force push that still needs confirmation" width="100%">
 
-`/view adhd` gets you one status line and an answer in three bullets.
-`/remember` saves a lesson for future sessions. `/memory list` shows saved entries; `/memory search <words>` searches them. The model can call `recall` without a query to inspect the same saved entries, including their IDs, source and confidence. `/permissions check` shows the
-classifier at work: `rm -rf` asks first while `cargo test` just runs.
-`/tokens` shows where every token went.
+This clip uses `/permissions check` to show the classifier's decisions for test
+commands and pushes in each mode. These are classification previews: the push
+commands are never executed. A force push still requires explicit confirmation
+in yolo. Execution profiles and permissions are independent.
+
+### A verified goal: the acceptance command decides whether it closes
+
+<img src="docs/demo/verified-goal.gif" alt="A goal fixes the discount module and closes only after its fixed unittest acceptance command passes" width="100%">
+
+`--goal` keeps the repair moving, and `--verify 'python3 -m unittest -q'` pins
+the acceptance command before the run. Watch the verification result and the
+final goal status. This establishes that the selected local check passed.
+
+### A swarm: parallel findings, one lead making changes
+
+<img src="docs/demo/swarm.gif" alt="Read-only swarm workers inspect shop modules and report findings to the lead" width="100%">
+
+`/agents swarm` lets the lead delegate module audits to read-only workers. The
+terminal shows the worker activity and the lead's consolidated report.
+
+### Sub, auto, off: control delegation explicitly
+
+<img src="docs/demo/delegation.gif" alt="A subagent reads the tax module, auto selects how to inspect the catalog, and off keeps the cart inspection with the lead" width="100%">
+
+`/agents sub` enables a read-only helper. `/agents auto` lets the lead choose
+whether to delegate. `/agents off` keeps the work with the lead. The recording
+shows each setting handling a source inspection; the separate swarm clip shows
+parallel module audits.
 
 ## Everything else
 
@@ -305,7 +315,7 @@ scripted stand-in for the model, so they're free and repeatable.
 
 | What | Result |
 |---|---|
-| `cargo xtask qa`: fmt, clippy `-D warnings`, 130 offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
+| `cargo xtask qa`: fmt, clippy `-D warnings`, offline Rust tests (including the real binary and memory service), 6 memory smoke cases, 7 cloud launcher tests | pass |
 | Live end-to-end against the model: bug fix, goal mode, swarm, Ctrl-C exit code | 4/4 |
 | Real pseudo-terminal: Ctrl-C during a streaming turn | stops in ~10-70 ms, next turn works, double Ctrl-C quits |
 | 12 evals in each mode: Python, Rust and JS fixes, code search, a cross-file rename, a CLI flag, a change of plan midway, memory across sessions, a rule surviving compaction, undo one step, a long `/goal`, `/compact` with a focus | careful 12/12 · standard 11/12 · vibe 11/12 · auto 10/12 |
@@ -346,7 +356,7 @@ Anything your endpoint serves, chosen with `--model`, `RUSTY_MODEL` or `/model`.
 
 | Model on NVIDIA's API | |
 |---|---|
-| `nvidia/nemotron-3-super-120b-a12b` | **default**, fast and dependable with tools (every demo above) |
+| `nvidia/nemotron-3-super-120b-a12b` | **default**, fast and dependable with tools (used in the live recordings above) |
 | `nvidia/nemotron-3-ultra-550b-a55b` | bigger, slower, thinks harder |
 | `z-ai/glm-5.3` | strong coder, slow to first token |
 | `openai/gpt-oss-20b` | small and quick; a good swarm worker |
