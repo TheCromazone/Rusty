@@ -1,5 +1,5 @@
 //! Offline correctness receipts: compare live queries with an unbounded direct rg reference.
-use rusty::workspace_query::{files_under, search, SearchResult};
+use rusty::workspace_query::{files_under, search, search_files, SearchResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -314,4 +314,23 @@ fn benchmark_query_reference_and_legacy() {
         "query_bench files=400 cold_us={cold:?} warm_n=15 legacy_median_us={} current_median_us={} cache=none",
         old[7], new[7]
     );
+}
+
+#[test]
+fn search_files_lists_what_ripgrep_would_search() {
+    let f = Fixture::new();
+    f.put("src/a.rs", "fn a() {}\n");
+    f.put(".hidden/b.rs", "fn b() {}\n");
+    f.put("ignored/c.rs", "fn c() {}\n");
+    f.put(".ignore", "ignored/\n");
+    let scan = search_files(&f.0);
+    let mut listed: Vec<String> = scan.files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    listed.sort();
+    let reference = Command::new("rg").args(["--no-config", "--files", "--"]).arg(&f.0).output().unwrap();
+    let mut expected: Vec<String> = String::from_utf8_lossy(&reference.stdout).lines().map(String::from).collect();
+    expected.sort();
+    assert_eq!(listed, expected);
+    assert!(listed.iter().any(|p| p.ends_with("src/a.rs")), "{listed:?}");
+    assert!(!listed.iter().any(|p| p.contains("ignored") || p.contains(".hidden")), "{listed:?}");
+    assert!(!scan.incomplete && scan.skipped == 0, "{:?}", scan.diagnostics);
 }

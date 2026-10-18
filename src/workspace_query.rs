@@ -168,12 +168,13 @@ impl Drop for QueryChild {
     }
 }
 
+/// `observe` sees every byte of stdout, including bytes past the retained prefix.
 #[cfg(unix)]
 fn collect_query_cancellable(
     child: Child,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
-    mut audit: Option<&mut RgAudit>,
+    observe: &mut dyn FnMut(&[u8]),
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     use std::os::fd::AsRawFd;
     let mut child = QueryChild { child, group_cleaned: false, reaped: false };
@@ -192,11 +193,7 @@ fn collect_query_cancellable(
     let mut exited_at = None;
     let mut termination = "exited";
     loop {
-        output.read_observed(&mut stdout, &mut |bytes| {
-            if let Some(audit) = audit.as_deref_mut() {
-                audit.feed(bytes);
-            }
-        })?;
+        output.read_observed(&mut stdout, &mut |bytes: &[u8]| observe(bytes))?;
         diagnostics.read_available(&mut stderr)?;
         if status.is_none() {
             status = child.child.try_wait()?;
@@ -235,7 +232,7 @@ fn collect_query_cancellable(
     child: Child,
     _: Duration,
     _: &dyn Fn() -> bool,
-    _: Option<&mut RgAudit>,
+    _: &mut dyn FnMut(&[u8]),
 ) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
     drop(QueryChild { child, group_cleaned: false, reaped: false });
     anyhow::bail!("bounded workspace search requires Unix pipes")
@@ -243,7 +240,7 @@ fn collect_query_cancellable(
 
 #[cfg(test)]
 fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
-    collect_query_cancellable(child, timeout, &|| false, None)
+    collect_query_cancellable(child, timeout, &|| false, &mut |_| {})
 }
 
 #[derive(Debug)]
@@ -392,12 +389,12 @@ fn search_with(
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
     let mut audit = RgAudit::new();
-    let (output, diagnostics, exit_code, termination) = collect_query_cancellable(
-        child,
-        QUERY_TIMEOUT,
-        cancelled,
-        if engine == "rg" { Some(&mut audit) } else { None },
-    )?;
+    let (output, diagnostics, exit_code, termination) =
+        collect_query_cancellable(child, QUERY_TIMEOUT, cancelled, &mut |bytes| {
+            if engine == "rg" {
+                audit.feed(bytes);
+            }
+        })?;
     audit.complete &= audit.pending.is_empty();
     let audit_complete = engine == "rg" && audit.complete;
     let match_limit_possible = audit.match_limit_possible;
@@ -539,6 +536,8 @@ pub struct Enumeration {
     pub diagnostics: Vec<String>,
     pub skipped: usize,
     visited: usize,
+    /// Listed by ripgrep's rules (`search_files`) rather than glob's.
+    search_rules: bool,
 }
 
 impl Enumeration {
@@ -563,7 +562,11 @@ impl Enumeration {
             "[query scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true skipped={}]\n",
             !self.incomplete, output_truncated, self.skipped
         );
-        let scope = "[scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n";
+        let scope = if self.search_rules {
+            "[scope: ripgrep's hidden and ignore rules, as search applies them; not an atomic snapshot]\n"
+        } else {
+            "[scope: build/dependency directories excluded; hidden files included; ignore files not applied; descendant directory symlinks skipped; not an atomic snapshot]\n"
+        };
         let mut diagnostics = String::new();
         for diagnostic in &self.diagnostics {
             let _ = write!(diagnostics, "\n[skipped] {diagnostic}");
@@ -577,6 +580,62 @@ impl Enumeration {
         }
         render_bounded(header, scope, body, &diagnostics)
     }
+}
+
+/// The files a search of `path` would read, by ripgrep's own hidden and
+/// ignore rules (`rg --files`), for a tool that reads and ranks content
+/// itself. It runs under the same deadline and process ownership as search
+/// and keeps at most 20,000 paths. Without ripgrep it falls back to
+/// [`files_under`] and says so, rather than pass glob's rules off as search's.
+pub fn search_files(path: &Path) -> Enumeration {
+    let mut scan = Enumeration { search_rules: true, ..Enumeration::default() };
+    let mut rg = Command::new("rg");
+    rg.args(["--no-config", "--files", "--null", "--"]).arg(path);
+    let child = match spawn_query(&mut rg) {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut scan = files_under(path);
+            scan.skip(path, "ripgrep not found; listed by glob's rules, ignore files not applied");
+            return scan;
+        }
+        Err(e) => {
+            scan.skip(path, format!("cannot start ripgrep: {e}"));
+            return scan;
+        }
+    };
+    let (mut name, mut full) = (Vec::new(), false);
+    let files = &mut scan.files;
+    let listed = collect_query_cancellable(child, QUERY_TIMEOUT, &|| false, &mut |bytes| {
+        for &b in bytes {
+            if b != 0 {
+                if !full {
+                    name.push(b);
+                }
+                continue;
+            }
+            if files.len() < ENTRY_LIMIT {
+                files.push(PathBuf::from(String::from_utf8_lossy(&name).into_owned()));
+            } else {
+                full = true;
+            }
+            name.clear();
+        }
+    });
+    match listed {
+        Err(e) => scan.skip(path, e),
+        Ok((_, diagnostics, code, termination)) => {
+            if full {
+                scan.skip(path, "listing budget reached; remaining files not listed");
+            }
+            if termination != "exited" || !matches!(code, Some(0 | 1)) {
+                scan.skip(path, format!("ripgrep listing ended: {termination}, exit {code:?}"));
+            }
+            if let Some(line) = diagnostics.text.lines().next() {
+                scan.skip(path, line);
+            }
+        }
+    }
+    scan
 }
 
 pub fn files_under(root: &Path) -> Enumeration {
@@ -879,7 +938,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
             child,
             Duration::from_secs(5),
             &|| started.elapsed() >= Duration::from_millis(50),
-            None,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(reason, "cancelled");
@@ -930,7 +989,7 @@ printf 'z.rs\000%s\na.rs\000%s\n' '10:needle' '2:needle'
                 std::thread::sleep(Duration::from_millis(1));
             }
             let timeout = if cancel { Duration::from_secs(5) } else { Duration::ZERO };
-            let (out, _, status, reason) = collect_query_cancellable(child, timeout, &|| cancel, None).unwrap();
+            let (out, _, status, reason) = collect_query_cancellable(child, timeout, &|| cancel, &mut |_| {}).unwrap();
             assert_eq!(status, Some(0));
             assert_eq!(out.text, "done");
             assert_eq!(reason, if cancel { "cancelled" } else { "deadline" });
