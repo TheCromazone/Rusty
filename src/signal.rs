@@ -29,15 +29,58 @@ impl Drop for CancelScope {
     }
 }
 
+/// Write end of the self-pipe the SIGINT handler wakes the handler thread through.
+static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_sigint(_: libc::c_int) {
+    // Only write(2) here: it is async-signal-safe. A full pipe means a press
+    // is already waiting to be handled.
+    let fd = WAKE.load(Ordering::Relaxed);
+    unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+}
+
+fn on_press() {
+    if cancel_focused() {
+        return;
+    }
+    if INTERRUPTED.swap(true, Ordering::SeqCst) {
+        eprintln!("\nbye");
+        std::process::exit(130);
+    }
+}
+
+/// Handles Ctrl-C on a thread of its own, so the handler may lock and print.
+/// It replaces whatever SIGINT did before, even when the shell ignored it
+/// for a background job.
 pub fn install() {
-    let _ = ctrlc::set_handler(|| {
-        if cancel_focused() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut fds = [0; 2];
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
             return;
         }
-        if INTERRUPTED.swap(true, Ordering::SeqCst) {
-            eprintln!("\nbye");
-            std::process::exit(130);
+        let [read, write] = fds;
+        libc::fcntl(read, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(write, libc::F_SETFD, libc::FD_CLOEXEC);
+        libc::fcntl(write, libc::F_SETFL, libc::fcntl(write, libc::F_GETFL) | libc::O_NONBLOCK);
+        WAKE.store(write, Ordering::Relaxed);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0 {
+            return;
         }
+        let _ = std::thread::Builder::new().name("ctrl-c".into()).spawn(move || {
+            let mut byte = 0u8;
+            loop {
+                match libc::read(read, (&mut byte as *mut u8).cast(), 1) {
+                    1 => on_press(),
+                    -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => return,
+                }
+            }
+        });
     });
 }
 

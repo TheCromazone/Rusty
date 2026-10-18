@@ -140,6 +140,11 @@ pub fn looks_production(name: &str) -> bool {
 }
 
 fn probe_kube() -> Option<(String, String)> {
+    // kubectl takes ~100 ms to start; with no kubeconfig it has no context
+    // to report, so it is not worth asking.
+    if !kubeconfig_exists() {
+        return None;
+    }
     let out = run(
         "kubectl",
         &["config", "view", "--minify", "-o", "jsonpath={.current-context}|{.contexts[0].context.namespace}"],
@@ -149,6 +154,14 @@ fn probe_kube() -> Option<(String, String)> {
         return None;
     }
     Some((ctx.to_string(), if ns.is_empty() { "default".into() } else { ns.to_string() }))
+}
+
+/// Any of the files kubectl would read: `$KUBECONFIG`, else ~/.kube/config.
+fn kubeconfig_exists() -> bool {
+    match std::env::var_os("KUBECONFIG").filter(|v| !v.is_empty()) {
+        Some(list) => std::env::split_paths(&list).any(|p| p.exists()),
+        None => std::env::var_os("HOME").is_some_and(|h| Path::new(&h).join(".kube/config").exists()),
+    }
 }
 
 /// (profile, account, region). The region comes from the environment or
@@ -253,22 +266,26 @@ fn run(bin: &str, args: &[&str]) -> Option<String> {
     let mut child =
         Command::new(bin).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
+    let (done, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = String::new();
         let _ = std::io::Read::read_to_string(&mut stdout, &mut buf);
-        buf
+        let _ = done.send(buf);
     });
-    let start = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(PROBE_SECS);
+    // Output ends when the probe exits (or closes stdout), so wake then
+    // rather than on a polling tick.
+    let out = output.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return reader.join().ok(),
+            Ok(Some(status)) if status.success() => return out,
             Ok(Some(_)) | Err(_) => return None,
-            Ok(None) if start.elapsed() > Duration::from_secs(PROBE_SECS) => {
+            Ok(None) if out.is_none() || Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
 }

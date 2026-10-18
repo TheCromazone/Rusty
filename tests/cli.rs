@@ -45,6 +45,11 @@ impl Sandbox {
         std::fs::write(&path, format!("#!/usr/bin/env bash\necho \"{name} $*\" >> \"$RUSTY_TEST_CALLS\"\n{body}\n"))
             .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if name == "kubectl" {
+            // rusty only asks kubectl about a cluster when one is configured.
+            std::fs::create_dir_all(self.home.join(".kube")).unwrap();
+            std::fs::write(self.home.join(".kube/config"), "").unwrap();
+        }
     }
 
     fn calls(&self) -> String {
@@ -604,6 +609,28 @@ fn target_is_detected_shown_and_production_starts_careful() {
     writeln!(child.stdin.take().unwrap(), "/mode").unwrap();
     let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
     assert!(text.contains("execution vibe") && text.contains("production"), "{text}");
+}
+
+#[test]
+fn kubectl_is_not_started_without_a_kubeconfig() {
+    let s = Sandbox::new("no-kubeconfig");
+    s.fake("kubectl", "printf 'prod-eu|payments'");
+    std::fs::remove_file(s.home.join(".kube/config")).unwrap();
+    let out = s.repl(&["/mode"]);
+    assert!(!out.contains("production") && !out.contains("kube "), "{out}");
+    assert!(!s.calls().contains("kubectl"), "{}", s.calls());
+    // A kubeconfig named by KUBECONFIG counts.
+    std::fs::write(s.project.join("kubeconfig"), "").unwrap();
+    let mut child = s
+        .cmd()
+        .env("KUBECONFIG", s.project.join("kubeconfig"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/mode").unwrap();
+    let text = String::from_utf8_lossy(&wait(child, Duration::from_secs(20)).stdout).to_string();
+    assert!(text.contains("target looks like production: kube prod-eu/payments"), "{text}");
 }
 
 #[test]

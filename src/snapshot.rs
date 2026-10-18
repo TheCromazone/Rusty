@@ -78,9 +78,16 @@ fn git(cwd: &Path) -> Option<String> {
         let out = Command::new("git").arg("-C").arg(cwd).args(args).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
-    let branch = run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let dirty = run(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
-    let log = run(&["log", "--oneline", "-3", "--no-decorate"]).unwrap_or_default();
+    // Independent reads, so they run together: `status` alone can take
+    // longer than the other two in a large tree.
+    let (branch, dirty, log) = std::thread::scope(|s| {
+        let dirty = s.spawn(|| run(&["status", "--porcelain"]));
+        let log = s.spawn(|| run(&["log", "--oneline", "-3", "--no-decorate"]));
+        (run(&["rev-parse", "--abbrev-ref", "HEAD"]), dirty.join().unwrap(), log.join().unwrap())
+    });
+    let branch = branch?;
+    let dirty = dirty.is_some_and(|s| !s.is_empty());
+    let log = log.unwrap_or_default();
     let recent: Vec<&str> = log.lines().collect();
     Some(format!(
         "branch {branch}{}; recent: {}",
@@ -108,19 +115,19 @@ pub fn blobs(cwd: &Path) -> Option<HashMap<String, String>> {
         let out = Command::new("git").args(args).current_dir(cwd).output().ok()?;
         out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     };
+    let (listed, dirty) = std::thread::scope(|s| {
+        let dirty = s.spawn(|| git(&["diff", "--name-only", "--relative", "-z"]));
+        (git(&["ls-files", "-s", "-z"]), dirty.join().unwrap())
+    });
     let mut map = HashMap::new();
-    for entry in git(&["ls-files", "-s", "-z"])?.split('\0') {
+    for entry in listed?.split('\0') {
         if let Some((meta, path)) = entry.split_once('\t') {
             if let Some(blob) = meta.split_whitespace().nth(1) {
                 map.insert(path.to_string(), blob.to_string());
             }
         }
     }
-    let dirty: Vec<String> = git(&["diff", "--name-only", "--relative", "-z"])?
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(String::from)
-        .collect();
+    let dirty: Vec<String> = dirty?.split('\0').filter(|p| !p.is_empty()).map(String::from).collect();
     for (path, blob) in hash_now(cwd, &dirty) {
         match blob {
             Some(b) => map.insert(path, b),

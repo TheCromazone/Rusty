@@ -290,29 +290,45 @@ fn run() -> Result<i32> {
     } else {
         Mode::parse(&cli.permissions).ok_or_else(|| anyhow!("unknown permission mode `{}`", cli.permissions))?
     };
-    let pdir = project_dir(&PathBuf::from(backend.identity(&cwd)));
+    let identity = PathBuf::from(backend.identity(&cwd));
+    let pdir = project_dir(&identity);
     let global = config::config_dir().unwrap_or_default();
     let policy = Policy::load(pdir.join("permissions.json"), mode);
 
+    // Each startup probe waits on something outside rusty (git, kubectl,
+    // the memory daemon, the endpoint's model list) and none needs another,
+    // so they run side by side; each result is still used where it was.
+    use rusty::advisor::Level;
+    let memory_level = Level::parse(&cli.memory);
+    let advisor_probe = memory_level
+        .filter(|level| level.advises())
+        .map(|level| std::thread::spawn(move || rusty::advisor::Hooks::connect(&global, &identity, level)));
+    let window_probe = cli.context_tokens.is_none().then(|| {
+        let (client, model) = (client.clone(), model.clone());
+        std::thread::spawn(move || client.context_window(&model))
+    });
+    let local = backend.name() == "local";
+    let target_probe = local.then(|| probe(&cwd, infra::Target::detect));
+    let snapshot_probe = local.then(|| probe(&cwd, snapshot::take));
+    let blobs_probe = local.then(|| probe(&cwd, snapshot::blobs));
+
     let mut agent = Agent::new(client.clone(), model, cwd.clone(), policy);
-    if backend.name() == "local" {
-        agent.infra.target = infra::Target::detect(&cwd);
+    if let Some(target) = target_probe {
+        agent.infra.target = joined(target);
     }
     agent.set_backend(backend)?;
     if agent.backend.name() == "local" {
-        agent.snapshot = snapshot::take(&cwd);
-        agent.start_blobs = snapshot::blobs(&cwd);
+        agent.snapshot = snapshot_probe.map(joined).unwrap_or_default();
+        agent.start_blobs = blobs_probe.and_then(joined);
         agent.mcp = mcp::Mcp::load(&cwd)?;
         if !agent.mcp.is_empty() {
             println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));
         }
     }
-    use rusty::advisor::Level;
     agent.memory_level =
-        Level::parse(&cli.memory).ok_or_else(|| anyhow!("unknown memory level `{}` ({})", cli.memory, Level::NAMES))?;
-    if agent.memory_level.advises() {
-        match rusty::advisor::Hooks::connect(&global, &PathBuf::from(agent.backend.identity(&cwd)), agent.memory_level)
-        {
+        memory_level.ok_or_else(|| anyhow!("unknown memory level `{}` ({})", cli.memory, Level::NAMES))?;
+    if let Some(advisor) = advisor_probe {
+        match joined(advisor) {
             Ok(h) => agent.advisor = Some(h),
             Err(e) => {
                 eprintln!("memory advisor unavailable ({e:#}); continuing with memory off");
@@ -322,7 +338,7 @@ fn run() -> Result<i32> {
     }
     agent.meter = match cli.context_tokens {
         Some(n) => context::Meter::new(n as usize, "flag"),
-        None => match client.context_window(&agent.model) {
+        None => match window_probe.and_then(joined) {
             Some(n) => context::Meter::new(n, "endpoint"),
             None => match settings.context_windows.get(&agent.model) {
                 Some(&n) => context::Meter::new(n, "table"),
@@ -489,6 +505,17 @@ fn run() -> Result<i32> {
     }
     agent.write_trajectory()?;
     Ok(0)
+}
+
+/// Runs a startup probe of the working directory on its own thread.
+fn probe<T: Send + 'static>(cwd: &Path, run: fn(&Path) -> T) -> std::thread::JoinHandle<T> {
+    let cwd = cwd.to_owned();
+    std::thread::spawn(move || run(&cwd))
+}
+
+/// A probe's result; a probe that panicked panics here, as it did inline.
+fn joined<T>(probe: std::thread::JoinHandle<T>) -> T {
+    probe.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Bumped when a harness-facing flag, exit code or `--stats` key changes

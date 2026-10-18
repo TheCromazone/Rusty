@@ -429,6 +429,10 @@ esac
         let mut path = h.machine().path.lock().unwrap();
         *path = format!("{}:{path}", bindir.display());
     }
+    // The sandbox has a cluster configured, so its kubectl is asked.
+    let kube = h.tmp.path().join("remote-home/.kube");
+    std::fs::create_dir_all(&kube).unwrap();
+    std::fs::write(kube.join("config"), "").unwrap();
     std::fs::write(h.remote.join("deployment.yaml"), "replicas: 1\n").unwrap();
     std::fs::write(h.remote.join("source.py"), "def add(a,b):\n    return a + b\n").unwrap();
     let (server, shared) = model();
