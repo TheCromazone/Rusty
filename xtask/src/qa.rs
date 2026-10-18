@@ -292,6 +292,12 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
     for name in ["summary.json", "summary.md", "memory.json", "memory-live.json", "bench.json"] {
         let _ = std::fs::remove_file(out.join(name));
     }
+    // Captures contain mutable fixture workspaces (including approved writes).
+    // A rerun must neither pass nor fail because an earlier fixture left data.
+    let terminal = out.join("terminal");
+    if terminal.exists() {
+        std::fs::remove_dir_all(&terminal).context("resetting QA-owned terminal fixtures")?;
+    }
     let mut report = receipt(&o, &steps);
     if let Err(e) = o.preflight() {
         report["status"] = json!("fail");
