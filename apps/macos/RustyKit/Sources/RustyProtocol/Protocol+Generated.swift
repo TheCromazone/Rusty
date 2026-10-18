@@ -366,6 +366,72 @@ public struct ResyncPayload: Codable, Equatable, Sendable {
     }
 }
 
+public struct MessageDeltaPayload: Codable, Equatable, Sendable {
+    public var `text`: String
+    public init(`text`: String) {
+        self.text = `text`
+    }
+}
+
+public struct ReasoningDeltaPayload: Codable, Equatable, Sendable {
+    public var `text`: String
+    public init(`text`: String) {
+        self.text = `text`
+    }
+}
+
+public struct MessageCompletedPayload: Codable, Equatable, Sendable {
+    public init() {
+    }
+}
+
+public struct UsagePayload: Codable, Equatable, Sendable {
+    public var `prompt_tokens`: UInt64
+    public var `completion_tokens`: UInt64
+    public var `context_pct`: Int
+    public var `interrupted`: Bool
+    public init(`prompt_tokens`: UInt64, `completion_tokens`: UInt64, `context_pct`: Int, `interrupted`: Bool) {
+        self.prompt_tokens = `prompt_tokens`
+        self.completion_tokens = `completion_tokens`
+        self.context_pct = `context_pct`
+        self.interrupted = `interrupted`
+    }
+}
+
+public struct StatusPayload: Codable, Equatable, Sendable {
+    public var `text`: String
+    public init(`text`: String) {
+        self.text = `text`
+    }
+}
+
+public struct NoticePayload: Codable, Equatable, Sendable {
+    public var `text`: String
+    public init(`text`: String) {
+        self.text = `text`
+    }
+}
+
+public struct TruncatedPayload: Codable, Equatable, Sendable {
+    public var `original_kind`: String
+    public var `name`: String?
+    public var `truncated`: Bool
+    public var `summary`: String
+    public init(`original_kind`: String, `name`: String?, `truncated`: Bool, `summary`: String) {
+        self.original_kind = `original_kind`
+        self.name = `name`
+        self.truncated = `truncated`
+        self.summary = `summary`
+    }
+}
+
+public struct ProtocolErrorPayload: Codable, Equatable, Sendable {
+    public var `error`: String
+    public init(`error`: String) {
+        self.error = `error`
+    }
+}
+
 public enum EventPayload: Equatable, Sendable {
     case HelloPayload(HelloPayload)
     case ReadyPayload(ReadyPayload)
@@ -382,6 +448,14 @@ public enum EventPayload: Equatable, Sendable {
     case ToolCompletedPayload(ToolCompletedPayload)
     case ReplyPayload(ReplyPayload)
     case ResyncPayload(ResyncPayload)
+    case MessageDeltaPayload(MessageDeltaPayload)
+    case ReasoningDeltaPayload(ReasoningDeltaPayload)
+    case MessageCompletedPayload(MessageCompletedPayload)
+    case UsagePayload(UsagePayload)
+    case StatusPayload(StatusPayload)
+    case NoticePayload(NoticePayload)
+    case TruncatedPayload(TruncatedPayload)
+    case ProtocolErrorPayload(ProtocolErrorPayload)
     case unknown(String, JSONValue)
 }
 
@@ -405,6 +479,14 @@ public extension Event {
         case "tool.completed": return .ToolCompletedPayload(try decoder.decode(ToolCompletedPayload.self, from: data))
         case "reply": return .ReplyPayload(try decoder.decode(ReplyPayload.self, from: data))
         case "resync_required": return .ResyncPayload(try decoder.decode(ResyncPayload.self, from: data))
+        case "message.delta": return .MessageDeltaPayload(try decoder.decode(MessageDeltaPayload.self, from: data))
+        case "reasoning.delta": return .ReasoningDeltaPayload(try decoder.decode(ReasoningDeltaPayload.self, from: data))
+        case "message.completed": return .MessageCompletedPayload(try decoder.decode(MessageCompletedPayload.self, from: data))
+        case "run.usage": return .UsagePayload(try decoder.decode(UsagePayload.self, from: data))
+        case "run.status": return .StatusPayload(try decoder.decode(StatusPayload.self, from: data))
+        case "notice": return .NoticePayload(try decoder.decode(NoticePayload.self, from: data))
+        case "event.truncated": return .TruncatedPayload(try decoder.decode(TruncatedPayload.self, from: data))
+        case "protocol.error": return .ProtocolErrorPayload(try decoder.decode(ProtocolErrorPayload.self, from: data))
         default: return .unknown(kind, payload)
         }
     }
@@ -438,4 +520,4 @@ public enum JSONValue: Codable, Equatable, Sendable {
     }
 }
 
-public let protocolSchemaHash = "d23086cb0d459c05f8dd8f5d731a0e768edd87ea69b89088becf566c8bd4c0ad"
+public let protocolSchemaHash = "aaff2e880ffd13a88ffda4e263beddb78c15518a97905387de5fe2b1fe38d9ff"

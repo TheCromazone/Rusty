@@ -165,3 +165,24 @@ Worker startup uses a flag/local context-window table or the conservative
 default, without a provider models probe. Memory-advisor connection is lazy on
 the first run. `RUSTY_WORKER_TRACE=1` writes measured per-phase and total startup
 times to diagnostics; it creates no provider requests.
+
+### Reproduce the recorded worker journey
+
+Use a fresh output directory and an already built candidate binary:
+
+```sh
+python3 scripts/native_worker_journey.py /absolute/path/to/rusty \
+  --out /absolute/path/to/new-journey-evidence \
+  --record-fixture apps/macos/RustyKit/Tests/RustyProtocolTests/Fixtures/recorded-worker.ndjson
+```
+
+The standard-library script starts a loopback-only scripted SSE provider, edits
+`calc.py` through the worker, approves the exact operations, executes an assertion,
+and inspects the resulting Git diff through a separate provider-free worker.
+It records actual wire events; the optional fixture replaces temporary-directory
+strings with `<TEMP>` while retaining unnormalized evidence separately. Receipts
+include source and binary hashes. The journey has a 90-second deadline, three
+model requests, bounded frames, requests and retained diagnostics, and owned
+process/server cleanup on failure. It spends no provider credits. Run the Rust
+and Swift recorded-wire contract tests after refreshing the fixture. This is
+worker qualification, not a native-app or live-provider E2E result.

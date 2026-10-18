@@ -86,8 +86,14 @@ final class ProtocolTests: XCTestCase {
                 XCTAssertEqual(hello.schema_hash, protocolSchemaHash)
                 XCTAssertEqual(event.seq, 1)
             }
+            if event.kind == "message.delta" {
+                guard case .MessageDeltaPayload(let delta) = try event.decodedPayload() else {
+                    return XCTFail("typed message delta required")
+                }
+                XCTAssertFalse(delta.text.isEmpty)
+            }
         }
-        for kind in ["session.ready", "session.snapshot", "approval.requested", "approval.resolved", "tool.proposed", "tool.started", "tool.completed", "run.completed"] {
+        for kind in ["session.ready", "session.snapshot", "approval.requested", "approval.resolved", "tool.proposed", "tool.started", "tool.completed", "message.delta", "message.completed", "run.usage", "run.completed"] {
             XCTAssertTrue(kinds.contains(kind), "missing \(kind)")
         }
     }
