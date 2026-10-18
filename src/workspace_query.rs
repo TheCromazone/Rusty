@@ -6,13 +6,15 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const SKIP_DIRS: &[&str] =
     &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next"];
 pub const OUTPUT_BYTES: usize = 28_000;
 const DIAGNOSTIC_BYTES: usize = 2_000;
 const ENTRY_LIMIT: usize = 20_000;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A bounded prefix, drained to EOF so presentation limits never stop the scan.
 #[derive(Debug)]
@@ -21,20 +23,147 @@ pub struct Capture {
     pub truncated: bool,
 }
 
-fn capture(mut input: impl Read, limit: usize) -> std::io::Result<Capture> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0; 8192];
-    let mut truncated = false;
+/// No reader threads: nonblocking reads retain only the bounded prefixes.
+struct BoundedPipe {
+    bytes: Vec<u8>,
+    limit: usize,
+    truncated: bool,
+    eof: bool,
+}
+
+impl BoundedPipe {
+    fn new(limit: usize) -> Self {
+        Self { bytes: Vec::new(), limit, truncated: false, eof: false }
+    }
+
+    fn read_available(&mut self, input: &mut impl Read) -> std::io::Result<()> {
+        if self.eof {
+            return Ok(());
+        }
+        let mut buffer = [0; 8192];
+        // A continuously writing process must not starve stderr or deadline checks.
+        for _ in 0..8 {
+            match input.read(&mut buffer) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    let keep = n.min(self.limit.saturating_sub(self.bytes.len()));
+                    self.bytes.extend_from_slice(&buffer[..keep]);
+                    self.truncated |= keep < n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Capture {
+        Capture { text: String::from_utf8_lossy(&self.bytes).into_owned(), truncated: self.truncated }
+    }
+}
+
+fn spawn_query(cmd: &mut Command) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "bounded workspace search requires Unix pipes"))
+    }
+}
+
+/// Always reap the owned child and kill its ordinary descendants, including error paths.
+struct QueryChild {
+    child: Child,
+    group_cleaned: bool,
+}
+impl QueryChild {
+    fn kill_group(&mut self) -> bool {
+        if self.group_cleaned {
+            return false;
+        }
+        self.group_cleaned = true;
+        #[cfg(unix)]
+        {
+            unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.kill().is_ok()
+        }
+    }
+}
+impl Drop for QueryChild {
+    fn drop(&mut self) {
+        self.kill_group();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn collect_query(child: Child, timeout: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
+    use std::os::fd::AsRawFd;
+    let mut child = QueryChild { child, group_cleaned: false };
+    let mut stdout = child.child.stdout.take().expect("piped stdout");
+    let mut stderr = child.child.stderr.take().expect("piped stderr");
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+            return Err(std::io::Error::last_os_error()).context("cannot set query pipe nonblocking");
+        }
+    }
+    let mut output = BoundedPipe::new(OUTPUT_BYTES);
+    let mut diagnostics = BoundedPipe::new(DIAGNOSTIC_BYTES);
+    let started = Instant::now();
+    let mut status = None;
+    let mut exited_at = None;
+    let mut termination = "exited";
     loop {
-        let n = input.read(&mut buffer)?;
-        if n == 0 {
+        output.read_available(&mut stdout)?;
+        diagnostics.read_available(&mut stderr)?;
+        if status.is_none() {
+            status = child.child.try_wait()?;
+            if status.is_some() {
+                exited_at = Some(Instant::now());
+                if child.kill_group() {
+                    termination = "descendants_killed";
+                }
+            }
+        }
+        if status.is_some() && output.eof && diagnostics.eof {
             break;
         }
-        let keep = n.min(limit.saturating_sub(bytes.len()));
-        bytes.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < n;
+        if started.elapsed() >= timeout {
+            termination = "deadline";
+            child.kill_group();
+            let _ = child.child.kill();
+            status = Some(child.child.wait()?);
+            break;
+        }
+        // An escaped descendant can hold a pipe without belonging to our group.
+        // Close our descriptors rather than leave a reader thread behind.
+        if exited_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(100)) {
+            termination = "inherited_pipes";
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    Ok(Capture { text: String::from_utf8_lossy(&bytes).into_owned(), truncated })
+    Ok((output.finish(), diagnostics.finish(), status.and_then(|s| s.code()), termination))
+}
+
+#[cfg(not(unix))]
+fn collect_query(child: Child, _: Duration) -> Result<(Capture, Capture, Option<i32>, &'static str)> {
+    drop(QueryChild { child, group_cleaned: false });
+    anyhow::bail!("bounded workspace search requires Unix pipes")
 }
 
 #[derive(Debug)]
@@ -44,13 +173,14 @@ pub struct SearchResult {
     pub output: Capture,
     pub diagnostics: Capture,
     pub exit_code: Option<i32>,
+    pub termination: &'static str,
 }
 
 impl SearchResult {
     pub fn render(&self) -> String {
         let mut out = format!(
-            "[query engine={} scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true exit={:?}]\n",
-            self.engine, self.scan_complete, self.output.truncated, self.exit_code
+            "[query engine={} scan_complete={} output_truncated={} freshness=live_observation cache=none retrieval_only=true exit={:?} termination={}]\n",
+            self.engine, self.scan_complete, self.output.truncated, self.exit_code, self.termination
         );
         if self.engine == "rg" {
             out.push_str("[scope: ripgrep default ignore/hidden/binary rules with explicit glob overrides, smart case; not an atomic snapshot]\n");
@@ -98,7 +228,7 @@ fn search_with(program: &str, pattern: &str, path: &str, glob: Option<&str>, con
         rg.args(["-g", g]);
     }
     rg.args(["-e", pattern, "--", path]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let (mut child, engine) = match rg.spawn() {
+    let (child, engine) = match spawn_query(&mut rg) {
         Ok(child) => (child, "rg"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut grep = Command::new("grep");
@@ -111,24 +241,14 @@ fn search_with(program: &str, pattern: &str, path: &str, glob: Option<&str>, con
             }
             grep.args(["-e", pattern, "--", path]);
             grep.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            (grep.spawn().context("cannot start grep fallback")?, "grep")
+            (spawn_query(&mut grep).context("cannot start grep fallback")?, "grep")
         }
         Err(e) => return Err(e).context("cannot start ripgrep"),
     };
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    // Drain both streams concurrently, including after output fills up.
-    let err_reader = std::thread::spawn(move || capture(stderr, DIAGNOSTIC_BYTES));
-    let output = capture(stdout, OUTPUT_BYTES);
-    if output.is_err() {
-        // A failed reader must not leave a child blocked on a full stdout pipe.
-        let _ = child.kill();
-    }
-    let status = child.wait()?;
-    let diagnostics = err_reader.join().expect("diagnostic reader panicked")?;
-    let exit_code = status.code();
-    let scan_complete = engine == "rg" && matches!(exit_code, Some(0 | 1)) && diagnostics.text.is_empty();
-    Ok(SearchResult { engine, scan_complete, output: output?, diagnostics, exit_code })
+    let (output, diagnostics, exit_code, termination) = collect_query(child, QUERY_TIMEOUT)?;
+    let scan_complete =
+        engine == "rg" && termination == "exited" && matches!(exit_code, Some(0 | 1)) && diagnostics.text.is_empty();
+    Ok(SearchResult { engine, scan_complete, output, diagnostics, exit_code, termination })
 }
 
 #[derive(Default, Debug)]
@@ -186,11 +306,12 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
     };
     let mut items = Vec::new();
     for entry in rd {
-        // Bound enumeration memory even for a single enormous directory.
-        if items.len() >= limit.saturating_sub(scan.visited) {
+        // Charge discovery globally, bounding pending vectors across nested traversal.
+        if scan.visited >= limit {
             scan.skip(dir, "enumeration budget reached; remaining entries not scanned");
             break;
         }
+        scan.visited += 1;
         match entry {
             Ok(entry) => items.push(entry),
             Err(e) => scan.skip(dir, e),
@@ -199,11 +320,6 @@ fn enumerate(dir: &Path, depth: usize, limit: usize, scan: &mut Enumeration) {
     items.sort_by_key(|e| e.file_name());
     for entry in items {
         let path = entry.path();
-        if scan.visited >= limit {
-            scan.skip(dir, "enumeration budget reached; remaining entries not scanned");
-            break;
-        }
-        scan.visited += 1;
         let metadata = match fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
@@ -237,7 +353,12 @@ mod tests {
     fn display_limits_drain_without_changing_scan_completeness() {
         let bytes = [b"start".as_slice(), &vec![b'x'; 100_000]].concat();
         let mut reader = Cursor::new(&bytes);
-        let output = capture(&mut reader, 40).unwrap();
+        let mut bounded = BoundedPipe::new(40);
+        while !bounded.eof {
+            bounded.read_available(&mut reader).unwrap();
+            assert!(bounded.bytes.len() <= 40);
+        }
+        let output = bounded.finish();
         assert_eq!(reader.position(), bytes.len() as u64);
         assert!(output.truncated);
         assert_eq!(output.text.len(), 40);
@@ -247,6 +368,7 @@ mod tests {
             output,
             diagnostics: Capture { text: String::new(), truncated: false },
             exit_code: Some(0),
+            termination: "exited",
         };
         let rendered = result.render();
         assert!(rendered.contains("scan_complete=true output_truncated=true"));
@@ -260,6 +382,7 @@ mod tests {
             output: Capture { text: "good.rs:1:needle".into(), truncated: false },
             diagnostics: Capture { text: "private.rs: Permission denied".into(), truncated: true },
             exit_code: Some(2),
+            termination: "exited",
         };
         let rendered = result.render();
         assert!(rendered.contains("scan_complete=false output_truncated=false"));
@@ -276,6 +399,89 @@ mod tests {
         assert!(result.render().contains("parity unavailable"));
         let empty = search_with("/rusty/nonexistent-rg", "a^", file!(), None, 0).unwrap();
         assert!(empty.render().contains("no matches observed; search incomplete"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deadline_reaps_a_chatty_child_with_bounded_retention() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "while :; do printf '%1000s\\n' x; printf '%1000s\\n' y >&2; done"]);
+        let child = spawn_query(&mut cmd).unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let (out, err, _, reason) = collect_query(child, Duration::from_millis(200)).unwrap();
+        assert_eq!(reason, "deadline");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // UTF-8 replacement can add at most two bytes at the prefix boundary.
+        assert!(out.text.len() <= OUTPUT_BYTES + 2 && err.text.len() <= DIAGNOSTIC_BYTES + 2);
+        assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        let result = SearchResult {
+            engine: "rg",
+            scan_complete: false,
+            output: out,
+            diagnostics: err,
+            exit_code: None,
+            termination: reason,
+        };
+        assert!(result.render().contains("termination=deadline"));
+        assert!(result.render().contains("scan_complete=false"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_child_cannot_leave_descendants_holding_output_pipes() {
+        for _ in 0..5 {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "sleep 30 & printf done"]);
+            let child = spawn_query(&mut cmd).unwrap();
+            let pid = child.id();
+            let started = Instant::now();
+            let (out, _, code, reason) = collect_query(child, Duration::from_secs(2)).unwrap();
+            assert_eq!(out.text, "done");
+            assert_eq!(code, Some(0));
+            assert_eq!(reason, "descendants_killed");
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_pipe_holder_does_not_leave_a_reader_thread_behind() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let mut cmd = Command::new("python3");
+        cmd.args([
+            "-c",
+            r#"import os,time
+r,w=os.pipe()
+pid=os.fork()
+if pid == 0:
+    os.close(r)
+    os.setsid()
+    os.write(w,b'ready')
+    os.close(w)
+    time.sleep(30)
+    os._exit(0)
+os.close(w)
+os.read(r,5)
+print(pid,flush=True)
+os._exit(0)
+"#,
+        ]);
+        let child = spawn_query(&mut cmd).unwrap();
+        let started = Instant::now();
+        let (out, _, _, reason) = collect_query(child, Duration::from_secs(5)).unwrap();
+        let escaped: i32 = out.text.trim().parse().unwrap();
+        // Escaping our group is outside containment; this fixture owns that process.
+        unsafe {
+            libc::kill(escaped, libc::SIGKILL);
+        }
+        assert_eq!(reason, "inherited_pipes");
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

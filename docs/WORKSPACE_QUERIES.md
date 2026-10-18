@@ -37,7 +37,20 @@ fallback uses case-insensitive extended regex and build-directory exclusions;
 it cannot promise ripgrep ignore, glob, or regex parity. Its results always say
 `scan_complete=false`, including when grep exits successfully or finds nothing.
 An invalid regex, unreadable path, or failed ripgrep process never becomes a
-complete empty result. This implementation does not add a query timeout.
+complete empty result.
+
+On Unix, query subprocesses have owned process groups and a 30-second deadline.
+The coordinator drains both pipes with nonblocking reads and bounded prefixes;
+it starts no reader threads. A per-iteration read budget prevents chatty stdout
+from starving stderr or deadline checks. Normal exit kills any ordinary
+remaining descendants and reaps the child. Timeout and I/O/setup failures also
+kill/reap through the same owner. An exited child gets at most 100 milliseconds
+to close inherited pipes before the coordinator closes its descriptors. Escaped
+process groups are outside containment, but cannot strand a query reader thread.
+`termination=deadline`, `descendants_killed`, or `inherited_pipes` always makes a
+search incomplete. Only `termination=exited` can report complete. OS scheduling
+and uninterruptible kernel operations prevent a hard real-time guarantee.
+Non-Unix search fails before spawning until bounded pipe support is implemented.
 
 Glob and outline retain their separate existing policy: include hidden files,
 do not apply ignore files, and exclude `.git`, `target`, `node_modules`, `.venv`,
@@ -48,6 +61,8 @@ used. Descendant directory symlinks are reported as skipped rather than
 followed into cycles. Regular-file symlinks are read normally.
 
 Enumeration is bounded to 20,000 visited entries and 128 directory levels.
+The global budget is charged during directory enumeration, bounding retained
+pending entries across nested traversal as well as returned paths.
 Exhausted budgets identify the omitted directory/subtree. Read and metadata
 errors identify skipped paths. At most eight diagnostic paths are displayed;
 the skipped count includes omitted entries/subtrees, not an exact count of
@@ -77,7 +92,9 @@ renames, deletion, ignore-file edits, failed shell commands that write, and
 separate Git worktrees. Error fixtures cover partial results with unreadable
 files, missing roots, invalid regex, directory symlinks, dangling symlinks,
 enumeration budgets, and grep fallback. Tool checks exercise glob mutation and
-outline/listing completeness at their integration point.
+outline/listing completeness at their integration point. Cleanup checks exercise
+a chatty deadline, repeated child reaping, ordinary descendant pipe holders,
+and escaped pipe holders without background reader threads.
 
 The opt-in benchmark alternates old and current execution order over the same
 400-file fixture. Every pair must return the same match set. It reports one
@@ -93,7 +110,7 @@ after an empty result. Repeating a cached retrieval must never create fresh
 acceptance evidence. Any future cache must preserve these fixtures and add
 explicit hit/miss, validation, eviction and fallback receipts.
 
-### Initial same-machine receipt
+### Initial same-machine receipt (before subprocess cleanup)
 
 On October 17, 2026, the exact query source passed the standalone module and
 reference fixtures on a 10-core, 16 GiB macOS machine while other builds were
