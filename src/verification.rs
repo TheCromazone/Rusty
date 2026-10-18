@@ -47,7 +47,8 @@ impl CheckSpec {
 
     pub fn pin_files(mut self, root: &Path, paths: &[PathBuf]) -> Result<Self> {
         for path in paths {
-            let sha256 = pinned_file_hash(root, path)?;
+            let sha256 = pinned_file_hash(root, path)
+                .with_context(|| format!("pinned verification file unavailable: {}", path.display()))?;
             self.pinned_files.push(PinnedFile { path: path.clone(), sha256 });
         }
         Ok(self)
@@ -98,6 +99,7 @@ pub enum CheckOutcome {
     TimedOut,
     Interrupted,
     WorkspaceChanged,
+    EvidenceUnavailable,
 }
 
 #[derive(Debug, Serialize)]
@@ -112,6 +114,7 @@ pub struct CheckRecord {
     output_sha256: String,
     /// Redacted and bounded by the caller; exported for diagnosis, not proof.
     output: String,
+    observation_error: Option<String>,
 }
 
 impl CheckRecord {
@@ -145,7 +148,13 @@ impl CheckRecord {
             seconds,
             output_sha256: hash(output.as_bytes()),
             output,
+            observation_error: None,
         }
+    }
+
+    pub fn invalidate(&mut self, reason: String) {
+        self.outcome = CheckOutcome::EvidenceUnavailable;
+        self.observation_error = Some(reason);
     }
 
     pub fn passed(&self) -> bool {
@@ -164,8 +173,12 @@ impl CheckRecord {
 
     pub fn summary(&self) -> String {
         format!(
-            "fixed verification: {:?} (exit {:?}, {:.2}s)\n{}",
-            self.outcome, self.exit_code, self.seconds, self.output
+            "fixed verification: {:?} (exit {:?}, {:.2}s)\n{}\n{}",
+            self.outcome,
+            self.exit_code,
+            self.seconds,
+            self.output,
+            self.observation_error.as_deref().unwrap_or("")
         )
     }
 }

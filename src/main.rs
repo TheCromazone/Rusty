@@ -497,7 +497,7 @@ fn run() -> Result<i32> {
         return Ok(if signal::interrupted() {
             130
         } else if agent.goal_end == Some("stalled")
-            || cli.verify.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
+            || cli.goal.is_some() && !agent.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_)))
         {
             2
         } else {
@@ -559,7 +559,7 @@ fn capabilities() -> serde_json::Value {
         "mcp": {"transports": ["stdio"], "features": ["tools"], "check": true},
         "budget": ["max-requests", "max-budget-tokens", "budget-secs", "ledger"],
         // Records a harness may read from --stats and the trajectory.
-        "stats": ["model_budget", "claims", "safety", "goal", "goal_end", "context", "compactions"],
+        "stats": ["model_budget", "claims", "safety", "goal", "goal_end", "goal_outcome", "context", "compactions"],
     })
 }
 
@@ -580,6 +580,7 @@ fn print_stats(agent: &Agent, started: Instant) {
             "model_budget": agent.budget_snapshot(),
             "secs": started.elapsed().as_secs_f32(), "interrupted": signal::interrupted(), "goal": goal,
             "goal_end": agent.goal_end,
+            "goal_outcome": agent.goal_outcome(),
             "claims": agent.completion,
             "safety": agent.safety,
             "memory_mode": agent.memory_level.name(),
@@ -1018,11 +1019,27 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
             }
         }
         "/goal" => match rest {
+            "verify off" => {
+                agent.goal_check = None;
+                println!("  future goals have no fixed check; the current goal is unchanged");
+            }
+            value if value.starts_with("verify ") => {
+                let check = verification::CheckSpec::new(&value[7..], 120)?;
+                agent.goal_check = Some(check);
+                println!("  fixed check set for future goals; /goal pin <path> pins an acceptance file");
+            }
+            value if value.starts_with("pin ") => {
+                let check = agent.goal_check.clone().ok_or_else(|| anyhow!("set /goal verify <command> first"))?;
+                agent.goal_check = Some(check.pin_files(cwd, &[PathBuf::from(&value[4..])])?);
+                println!("  acceptance file pinned for future goals");
+            }
             "" | "status" => match &agent.goal {
                 Some(g) => {
                     let status = match &g.status {
                         GoalStatus::Active => "active".to_string(),
-                        GoalStatus::Done(e) => format!("done: {e}"),
+                        GoalStatus::Done(e) => {
+                            format!("{}: {e}", agent.goal_outcome().unwrap_or("completed_unverified"))
+                        }
                         GoalStatus::Blocked(e) => format!("blocked: {e}"),
                     };
                     println!(

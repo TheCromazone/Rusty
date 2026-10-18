@@ -1775,17 +1775,24 @@ impl Agent {
         let started = Instant::now();
         let (status, stdout, stderr) = self.backend.shell(check.command(), check.timeout())?;
         let output = infra::redact(&format!("stdout:\n{stdout}\nstderr:\n{stderr}")).0;
-        let after = verification::fingerprint(&self.cwd)?;
-        check.validate_files(&self.cwd)?;
-        let record = CheckRecord::observed(
+        let after = verification::fingerprint(&self.cwd);
+        let observation_error = after
+            .as_ref()
+            .err()
+            .map(|e| format!("workspace observation failed: {e:#}"))
+            .or_else(|| check.validate_files(&self.cwd).err().map(|e| format!("{e:#}")));
+        let mut record = CheckRecord::observed(
             check,
             before,
-            after,
+            after.unwrap_or_default(),
             status,
             signal::interrupted(),
             started.elapsed().as_secs_f64(),
             output,
         );
+        if let Some(reason) = observation_error {
+            record.invalidate(reason);
+        }
         let summary = record.summary();
         d.tool_result("bash", &args, &summary, record.passed());
         self.history.push(
@@ -2694,6 +2701,21 @@ impl Agent {
         Ok(())
     }
 
+    /// Runtime classification; restored claims cannot recreate executed evidence.
+    pub fn goal_outcome(&self) -> Option<&'static str> {
+        let goal = self.goal.as_ref()?;
+        Some(match &goal.status {
+            GoalStatus::Done(_)
+                if goal.check.is_some() && self.verification_records.last().is_some_and(CheckRecord::passed) =>
+            {
+                "verified"
+            }
+            GoalStatus::Done(_) => "completed_unverified",
+            GoalStatus::Blocked(_) => "blocked",
+            GoalStatus::Active => "incomplete",
+        })
+    }
+
     /// The whole run for benchmark harnesses and reviewers: every message in
     /// order, including the ones compaction summarised away.
     pub fn trajectory(&self) -> Value {
@@ -2716,6 +2738,7 @@ impl Agent {
             "archived_messages": self.archived.len(),
             "goal": self.goal,
             "goal_end": self.goal_end,
+            "goal_outcome": self.goal_outcome(),
             "verification": self.verification_records,
             "claims": self.completion,
             "safety": self.safety,
