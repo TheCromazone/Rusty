@@ -16,7 +16,8 @@ for diagnosis; CI invokes the same QA command developers run locally.
 
 ## CI policy
 
-`.github/workflows/ci.yml` is the only workflow. Opened, reopened and synchronized PRs
+`.github/workflows/ci.yml` is the canonical workflow, including the scoped
+OpenSSH and container gates. Opened, reopened and synchronized PRs
 and main pushes run `check` and the full offline gate. Superseded code runs
 cancel; title/body edits do not trigger CI. The cache includes compiler
 identity and the lockfile. Main publishes caches; PRs restore them. Conventions
@@ -27,7 +28,13 @@ separate baseline/candidate targets, exact read/tar/context equivalence, and
 CPU/RSS tables. It runs only for relevant PR paths, once per workflow; no
 second cloud-memory workflow builds those releases. An unselected comparison
 is reported as such. Documentation keeps its separately owned `documentation`
-job when that feature is integrated.
+job when that feature is integrated. The `openssh` gate preserves the disposable
+strict-limit server, authenticated readiness, real concurrency/tool/timeout/
+revoked-auth checks and always-run cleanup. The `build` gate preserves runtime
+image and three exported binaries, packaged SSH smoke, and a source-change
+rebuild. That rebuild is a behavior smoke, not evidence of cache effectiveness;
+no cross-run Docker cache improvement is claimed. Superseded code runs cancel
+these gates through the workflow concurrency policy.
 
 Use Run workflow to select offline, perf, live or cloud. macOS is available
 explicitly for platform qualification; no automatic OS/model/memory matrix,
@@ -117,6 +124,7 @@ ignored tests run only in the explicit extensions.
 | MCP discovery/pagination/names, required tools, permissions, usable secrets | `src/mcp.rs`, `tests/cli.rs` | Real external MCP service receipts |
 | MCP frame/queue bounds, dispatch outcomes, cancel, reconnect without replay, reader/child cleanup | Focused `src/mcp.rs` regressions on the delivered MCP branch, then exact-binary effect/cancel/reconnect RSS/FD/process observations | Keep pipe SIGINT, raw TTY Ctrl-C/aside and native durable recovery separate; fake-CLI checker tests qualify only the checker, and bounded observations do not prove arbitrary servers leak-free |
 | Infra target, fresh plan, snapshots, audit, rollout checks | `src/infra.rs`, `tests/cli.rs`, `tests/cloud_hybrid.rs` | Disposable real infra and independently observed state |
+| SSH transport and packaged runtime | `cloud::ssh::tests::real_openssh_network` in scoped `openssh`; runtime image and three-binary export/SSH smoke in scoped `build` | Disposable local OpenSSH proves its fixture only; live user hosts and production deployment remain separate. Cache reuse needs separate measured evidence |
 | Local/hybrid/full-cloud placement, bridge auth, no uncertain-write replay | `tests/cloud.rs`, `tests/cloud_hybrid.rs` | Explicit cloud lane plus real hybrid/rollback failure journeys |
 | Shared budgets across retries/review/workers/compaction/sides/restart | `src/budget.rs`, `tests/cli.rs` | Bounded live accounting, not exact billing |
 | Stats, claims vs acceptance, trajectories, refusal counters | `tests/cli.rs`, `xtask/src/report.rs` | Independent provider/tool observers |
