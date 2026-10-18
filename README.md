@@ -149,9 +149,10 @@ flowchart LR
     Summarize --> Continue["Continue with room to work"]
 ```
 
-The goal and plan stay outside ordinary history. User instructions and useful
-working-set details are carried forward within their budgets. A summary can
-lose detail, so name anything especially important when you compact manually:
+The goal and plan stay outside ordinary history. Your messages, each with the
+reply that ended its turn, and useful working-set details are carried forward
+within their budgets. A summary can lose detail, so name anything especially
+important when you compact manually:
 
 ```text
 /compact keep the rounding rules and the failing test cases
@@ -223,7 +224,12 @@ work. `/clear` starts a fresh conversation while keeping long-term memory.
 
 `/goal fix the discount tests` keeps an objective open across turns. A plan
 breaks it into smaller steps; `/plan` shows that checklist. The lead performs
-the work through tools and proposes completion with evidence.
+the work through tools and proposes completion with evidence. In careful
+mode, a plan step also says which check it will run and what result to expect
+before running it; while the step is in the plan, the goal needs a passing
+result for it to close, and the closed goal lists each expectation beside what
+was observed. Rewording or dropping such a step is allowed but counted and
+named, not refused.
 
 To have the runtime decide completion using a check you chose beforehand:
 
@@ -264,7 +270,9 @@ keeps a short display and concise answers. [Execution details](#execution-modes)
 A subagent takes one focused question, reads in its own context, and returns
 a report. A swarm runs several jobs through a pool. Workers can share short
 findings while they work. They are read-only; the lead assesses their reports,
-makes the changes, and verifies the result.
+makes the changes, and verifies the result. A brief can name a scope and the
+answer that ends the job. Reports open with `path:start-end` references, and
+the lead is told which of them name a missing file or lines past its end.
 
 ```text
 /agents sub

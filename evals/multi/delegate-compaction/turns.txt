@@ -1,0 +1,3 @@
+## run cp -R "$EVAL_DIR/../../../src" src
+## env RUSTY_AGENTS=sub
+Use the task tool once to find the function in src/ that decides whether a requested compaction is refused right now. Read what you need to confirm it, then write only that function's name to ANSWER.txt.

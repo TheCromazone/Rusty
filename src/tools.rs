@@ -751,7 +751,7 @@ pub fn wildcard(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-const SOURCE_EXT: &[&str] = &[
+pub(crate) const SOURCE_EXT: &[&str] = &[
     "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "kt", "swift", "c", "h", "cc", "cpp", "hpp", "rb", "php", "cs",
     "scala", "ex", "exs", "lua", "sh", "zig",
 ];

@@ -123,6 +123,11 @@ flowchart TD
 the pinned check after the required work and review. A failed check, timeout,
 interruption, denied permission, or changed check inputs keeps the goal open.
 Owned commands must finish before a successful completion can be accepted.
+In careful mode a plan step records its check and expected result before the
+check runs; a completion proposal then needs a passing result for that step,
+and any result marked failed keeps the goal open. A step reworded or dropped
+from the plan takes its expectation with it; that is counted and named, not
+refused.
 
 A goal can also report that it is blocked, pause at a limit, or be interrupted.
 Those outcomes do not mean success. `/goal resume` continues it; `/goal clear`
@@ -233,8 +238,11 @@ flowchart TD
     Reports --> Edit["Lead checks findings, edits, and verifies"]
 ```
 
-Workers are read-only. They get the task, project rules, and relevant user
-constraints. Their findings are suggestions the lead must assess. The lead
+Workers are read-only. They get the task (with its scope and stopping point,
+when the lead gives them), project rules, and relevant user constraints.
+Reports open with `path:start-end` references; before the lead reads a report,
+rusty checks those against the files and lists any that point at nothing.
+Their findings are suggestions the lead must assess. The lead
 owns integration and changes. More workers also mean more model requests.
 
 | Delegation setting | What it makes available |
