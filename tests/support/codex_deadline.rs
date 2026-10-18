@@ -1,3 +1,5 @@
+use super::tests::{auth_temp_dir, jwt};
+use super::*;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{

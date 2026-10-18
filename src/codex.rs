@@ -657,7 +657,7 @@ fn reasoning_item(item: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn auth_temp_dir() -> PathBuf {
+    pub(super) fn auth_temp_dir() -> PathBuf {
         use ring::rand::{SecureRandom, SystemRandom};
 
         for _ in 0..64 {
@@ -674,7 +674,7 @@ mod tests {
         panic!("could not allocate a unique auth fixture directory")
     }
 
-    fn jwt(claims: Value) -> String {
+    pub(super) fn jwt(claims: Value) -> String {
         let b64 = |b: &[u8]| {
             const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
             let mut s = String::new();
@@ -797,8 +797,6 @@ mod tests {
         assert_eq!((auth.access_token(), auth.refresh_token.as_str()), (newer.as_str(), "r1"));
         let _ = std::fs::remove_dir_all(dir);
     }
-
-    include!("../tests/support/codex_deadline.rs");
 
     #[test]
     fn history_becomes_instructions_and_items() {
@@ -959,3 +957,7 @@ mod tests {
         assert_ne!(a, b);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/codex_deadline.rs"]
+mod deadline_tests;
