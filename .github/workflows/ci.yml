@@ -4,58 +4,150 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    # edited: a fixed title or description is checked again without a push.
     types: [opened, synchronize, reopened, edited]
-
-concurrency:
-  # An edit must not cancel the code checks of the same push.
-  group: ci-${{ github.ref }}-${{ github.event.action == 'edited' && 'edited' || 'code' }}
-  cancel-in-progress: true
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Offline is free; live/cloud consume provider credits'
+        type: choice
+        options: [offline, perf, live, cloud]
+        default: offline
+      runner:
+        description: 'Use macOS only when qualifying that platform'
+        type: choice
+        options: [ubuntu-latest, macos-latest]
+        default: ubuntu-latest
+      tasks:
+        description: 'Live evals: comma-separated names, multi, or empty for all'
+        default: verified-repair,py-pagination,rename-refactor
+      models:
+        description: 'Live eval model IDs (space-separated)'
+        default: nvidia/nemotron-3-super-120b-a12b
+      memory:
+        description: 'Live eval memory levels (space-separated)'
+        default: 'off'
+      repeats:
+        description: 'Live eval repeats per configuration (1–5)'
+        default: '1'
+      cloud_snapshot:
+        description: 'Cloud suite only: existing qualified Daytona snapshot'
+      cloud_ref:
+        description: 'Cloud suite only: immutable source commit in that snapshot'
 
 permissions:
   contents: read
+concurrency:
+  # Metadata edits cannot cancel code checks. Explicit paid runs are never
+  # cancelled by a later push; cancelling a cloud controller can strand compute.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || (github.event.action == 'edited' && 'metadata' || 'code') }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # Standard 2-vCPU hosted runners: the smallest GitHub offers.
   check:
-    if: github.event.action != 'edited'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - name: memory hooks, real CLI and offline provider
-        run: |
-          cargo build --bins --locked
-          cargo xtask memory-smoke --report memory-offline.json
-
-  messages:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: ${{ github.event.action == 'edited' && 'metadata' || 'check' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.suite == 'live' && 45 || inputs.suite == 'cloud' && 30 || 15 }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Select work
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            echo runtime=true >> "$GITHUB_OUTPUT"
+          elif [[ "$ACTION" == edited ]]; then
+            echo runtime=false >> "$GITHUB_OUTPUT"
+          else
+            bash .github/ci-scope.sh "$BASE" HEAD >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.runtime == 'true' || github.event_name == 'pull_request'
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --package xtask --locked
-      - name: PR title follows Conventional Commits
+        if: steps.scope.outputs.runtime == 'true' || github.event_name == 'pull_request'
+        with:
+          # PRs restore caches; main alone publishes them.
+          save-if: ${{ github.event_name == 'push' }}
+      - name: Pull request conventions
+        if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
-        run: printf '%s' "$TITLE" | cargo xtask check-message -
-      - name: PR description has no tool attribution
-        env:
           BODY: ${{ github.event.pull_request.body }}
-        run: printf '%s' "$BODY" | cargo xtask check-body
-      - name: every commit follows Conventional Commits
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        shell: bash
         run: |
-          for sha in $(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
-            git log -1 --format=%B "$sha" | cargo xtask check-message - || { echo "in commit $sha"; exit 1; }
-          done
+          cargo build --package xtask --locked
+          printf '%s' "$TITLE" | target/debug/xtask check-message -
+          printf '%s' "$BODY" | target/debug/xtask check-body
+          while IFS= read -r sha; do
+            git log -1 --format=%B "$sha" | target/debug/xtask check-message -
+          done < <(git rev-list "$BASE..$HEAD")
+      - name: Offline quality
+        if: steps.scope.outputs.runtime == 'true' && (inputs.suite == '' || inputs.suite == 'offline')
+        run: cargo xtask qa
+      - name: Performance qualification
+        if: inputs.suite == 'perf'
+        run: cargo xtask qa --perf
+      - name: Live model qualification
+        if: inputs.suite == 'live'
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_MODELS: ${{ inputs.models }}
+          EVAL_TASKS: ${{ inputs.tasks }}
+          EVAL_MEMORY: ${{ inputs.memory }}
+          EVAL_REPEATS: ${{ inputs.repeats }}
+          EVAL_JOBS: '1'
+          EVAL_TIMEOUT: '300'
+          RUSTY_MAX_REQUESTS: '50'
+          RUSTY_MAX_BUDGET_TOKENS: '2000000'
+          RUSTY_BUDGET_SECS: '300'
+        shell: bash
+        run: |
+          case "$EVAL_REPEATS" in [1-5]) ;; *) echo 'repeats must be 1–5' >&2; exit 1 ;; esac
+          cargo xtask qa --live
+      - name: Hosted cloud qualification
+        if: inputs.suite == 'cloud'
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
+          RUSTY_CLOUD_SNAPSHOT: ${{ inputs.cloud_snapshot }}
+          RUSTY_CLOUD_REF: ${{ inputs.cloud_ref }}
+        run: cargo xtask qa --cloud
+      - name: Summary
+        if: always()
+        env:
+          RUNTIME: ${{ steps.scope.outputs.runtime }}
+        shell: bash
+        run: |
+          if [[ -f target/qa/summary.md ]]; then
+            cat target/qa/summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RUNTIME" == false ]]; then
+            echo 'Runtime unchanged; compilation and E2E journeys not repeated.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Quality gate did not finish; inspect the failed step.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Evidence
+        if: always() && steps.scope.outputs.runtime == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-${{ runner.os }}-${{ github.run_attempt }}
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            target/qa/summary.json
+            target/qa/summary.md
+            target/qa/memory*.json
+            target/qa/bench.json
+            target/qa/terminal/**/alignment.json
+            target/evals/*.jsonl
+            target/evals/*.md

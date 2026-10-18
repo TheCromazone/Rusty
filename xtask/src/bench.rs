@@ -16,17 +16,19 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: cargo xtask bench [--binary PATH] [--json PATH] [--runs N] [--only GROUP,...]\n\
+const USAGE: &str = "usage: cargo xtask bench [--check] [--binary PATH] [--json PATH] [--runs N] [--only GROUP,...]\n\
     Builds release rusty (unless --binary) and the perf example, then prints one table.\n\
     Groups: startup, sessions, redact, recall, turn, stream, size.";
 
 pub fn command(args: &[String]) -> Result<ExitCode> {
     let (mut binary, mut out, mut runs) = (None, super::target_dir().join("bench.json"), 11usize);
     let mut only = Vec::new();
+    let mut check = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || it.next().cloned().with_context(|| format!("{arg} needs a value"));
         match arg.as_str() {
+            "--check" => check = true,
             "--binary" => binary = Some(PathBuf::from(value()?)),
             "--json" => out = PathBuf::from(value()?),
             "--runs" => runs = value()?.parse().context("--runs")?,
@@ -37,6 +39,9 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    if check && !only.is_empty() {
+        bail!("--check requires all groups; omit --only");
+    }
     let binary = match binary {
         Some(b) => std::fs::canonicalize(&b).with_context(|| format!("{}", b.display()))?,
         None => {
@@ -44,7 +49,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             super::target_dir().join("release/rusty")
         }
     };
-    super::sh("cargo", &["build", "--release", "--example", "perf"])?;
+    super::sh("cargo", &["build", "--release", "--example", "perf", "--locked"])?;
     let perf = super::target_dir().join("release/examples/perf");
     let mut bench = Bench { binary, runs: runs.max(1), only, rows: Vec::new(), report: serde_json::Map::new() };
     bench.run_all(&perf)?;
@@ -52,10 +57,46 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let report = json!({"binary": bench.binary, "runs": bench.runs, "results": bench.report});
+    let problems = if check { budget_problems(&bench.report) } else { Vec::new() };
+    let report = json!({"binary": bench.binary, "runs": bench.runs, "results": bench.report,
+        "budgets_checked": check, "budget_failures": problems});
     std::fs::write(&out, serde_json::to_string_pretty(&report)? + "\n")?;
     println!("\nwrote {}", out.display());
+    if !problems.is_empty() {
+        bail!("performance budgets failed:\n{}", problems.join("\n"));
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// AGENTS.md's budgets. Missing measurements fail closed; wall time is
+/// diagnostic only because a shared runner can pause a process arbitrarily.
+fn budget_problems(results: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut bound =
+        |name: &str, field: &str, limit: f64, minimum: bool| match results.get(name).and_then(|v| v[field].as_f64()) {
+            Some(v) if v.is_finite() && if minimum { v >= limit } else { v <= limit } => (),
+            value => problems
+                .push(format!("{name}.{field}: {value:?}; expected {} {limit}", if minimum { ">=" } else { "<=" })),
+        };
+    for name in ["startup --help", "startup --version", "startup --sessions (none)"] {
+        bound(name, "cpu_ms", 10.0, false);
+        bound(name, "rss_bytes", 10_000_000.0, false);
+    }
+    for name in ["sessions list (5000)", "sessions search (5000)"] {
+        bound(name, "cpu_ms", 30.0, false);
+        bound(name, "rss_bytes", 15_000_000.0, false);
+    }
+    bound("turn, 300-message history", "turn_ms", 3.0, false);
+    bound("redact 10 MB", "mb_per_s", 30.0, true);
+    bound("redact 10 MB", "handles_mb_per_s", 30.0, true);
+    bound("stream 5 MB answer", "rss_bytes", 50_000_000.0, false);
+    bound("binary_bytes", "rusty", 8_000_000.0, false);
+    let catalog = results.get("sessions list (5000)");
+    match catalog.and_then(|v| Some((v["index_bytes"].as_u64()?, v["transcript_bytes"].as_u64()?))) {
+        Some((index, text)) if text > 0 && index < text.saturating_mul(2) => (),
+        _ => problems.push("session catalog must be smaller than twice its transcripts".into()),
+    }
+    problems
 }
 
 struct Bench {
@@ -562,5 +603,34 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn budgets_reject_regressions_and_incomplete_measurements() {
+        let mut v = serde_json::Map::new();
+        for name in [
+            "startup --help",
+            "startup --version",
+            "startup --sessions (none)",
+            "sessions list (5000)",
+            "sessions search (5000)",
+        ] {
+            v.insert(name.into(), json!({"cpu_ms": 1, "rss_bytes": 1, "index_bytes": 10, "transcript_bytes": 100}));
+        }
+        v.insert("turn, 300-message history".into(), json!({"turn_ms": 1}));
+        v.insert("redact 10 MB".into(), json!({"mb_per_s": 100, "handles_mb_per_s": 100}));
+        v.insert("stream 5 MB answer".into(), json!({"rss_bytes": 1}));
+        v.insert("binary_bytes".into(), json!({"rusty": 1}));
+        assert!(budget_problems(&v).is_empty());
+        v.get_mut("startup --help").unwrap()["cpu_ms"] = json!(11);
+        assert_eq!(budget_problems(&v).len(), 1);
+        v.remove("stream 5 MB answer");
+        assert_eq!(budget_problems(&v).len(), 2);
+        v.get_mut("sessions list (5000)").unwrap()["index_bytes"] = json!(300);
+        assert_eq!(budget_problems(&v).len(), 3);
     }
 }
