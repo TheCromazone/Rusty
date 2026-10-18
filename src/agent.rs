@@ -1928,7 +1928,8 @@ impl Agent {
         d.tool("bash", &args);
         let started = Instant::now();
         let cache = verification::CheckCache::new()?;
-        let (status, stdout, stderr) = self.backend.shell(&cache.command(check.command()), check.timeout())?;
+        let tools::ShellCapture { status, stdout, stderr, capture_complete } =
+            tools::run_capture(&cache.command(check.command()), check.timeout())?;
         let output = infra::redact(&format!("stdout:\n{stdout}\nstderr:\n{stderr}")).0;
         let after = verification::fingerprint(&self.cwd);
         let observation_error = after
@@ -1945,6 +1946,9 @@ impl Agent {
             started.elapsed().as_secs_f64(),
             output,
         );
+        if !capture_complete {
+            record.invalidate("fixed check output capture was incomplete".into());
+        }
         if let Some(reason) = observation_error {
             record.invalidate(reason);
         }

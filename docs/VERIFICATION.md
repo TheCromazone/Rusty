@@ -1287,3 +1287,9 @@ Fixed checks use a fresh private `PYTHONPYCACHEPREFIX` directory for each execut
 removed afterward. This prevents Python from loading planted workspace bytecode;
 `-B` alone only disables writing bytecode. `/goal verify` requires local tools
 and accepts `--timeout SECONDS` from 1 to 600 (default 120).
+
+Shell exit status and `capture_complete` are separate observations. An exit-0
+launcher with a detached pipe holder remains exit 0; its output is incomplete.
+Fixed verification rejects incomplete capture. Readers share a two-second EOF
+grace and are stopped and joined afterward; this does not prove containment of
+descendants that escape the owned process group.
