@@ -1,6 +1,7 @@
 mod activity;
 mod agent;
 mod anthropic;
+mod archive;
 mod aside;
 mod backend;
 mod budget;
@@ -793,7 +794,7 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
         "/help" | "/?" => print_help(cwd),
         "/clear" | "/new" => {
             agent.end_session()?;
-            agent.clear();
+            agent.clear()?;
             if let Some(p) = &agent.session_path {
                 if let Some(dir) = p.parent().map(Path::to_path_buf) {
                     agent.new_session(&dir)?;

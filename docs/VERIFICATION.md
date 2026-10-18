@@ -351,6 +351,16 @@ outcome, elapsed check time, and bounded redacted output with a digest of that
 captured output. The enclosing goal supplies the objective. Missing manifests
 or failed reads do not create passing records.
 
+Completed sessions left by `/clear` or `/resume` are spooled as redacted JSON to
+a mode-0600 temporary file whose directory entry is immediately removed. The
+agent owns one descriptor and releases it on drop. A failed archive write leaves
+live history intact and fails the transition. Explicit trajectory export reads
+those messages back in order; it may allocate the full exported transcript.
+Current-session compaction history is still retained in memory. This bounds
+retention across completed sessions, not every source of memory growth in a
+long-running active session.
+
+
 Shell output readers are owned and joined. After process-group cleanup they have
 a bounded drain interval; an escaped descendant holding a pipe cannot keep the
 check alive indefinitely. If capture does not reach EOF, the receipt retains an
