@@ -13,6 +13,7 @@ pub mod hybrid;
 pub mod image;
 pub mod launcher;
 pub mod shell;
+pub mod ssh;
 
 use anyhow::Result;
 use std::collections::BTreeMap;

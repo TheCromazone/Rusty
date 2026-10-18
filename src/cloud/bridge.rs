@@ -22,8 +22,21 @@ pub const MAX_RPC: usize = 1024 * 1024;
 const SLOTS: usize = 9;
 const MAX_HEADER: usize = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
-const TRANSPORT_FAILED: &str = "Daytona tool transport failed; remote outcome may be unknown. \
-    Inspect the sandbox before retrying; no local fallback.";
+const TRANSPORT_FAILED: &str = "Remote tool transport failed; remote outcome may be unknown. \
+    Inspect the remote workspace before retrying; no local fallback.";
+
+#[derive(Debug)]
+struct EndpointExit(i32);
+impl std::fmt::Display for EndpointExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            127 => f.write_str("remote tool endpoint exited 127: install Rusty on the remote PATH"),
+            124 => f.write_str("remote tool endpoint exited 124: command timed out; remote outcome may be unknown"),
+            code => write!(f, "remote tool endpoint exited {code}; verify the remote Rusty supports tool protocol v1"),
+        }
+    }
+}
+impl std::error::Error for EndpointExit {}
 
 fn timeout_of(v: &Value, default: i64) -> Result<i64> {
     match v {
@@ -56,13 +69,14 @@ pub fn remote_rpc(remote: &dyn Remote, workspace: &str, request: &Value) -> Resu
     );
     let (code, out) = remote.sh(&command, timeout)?;
     if code != 0 {
-        bail!("sandbox tool endpoint failed; rebuild the snapshot with tool protocol v1");
+        return Err(EndpointExit(code).into());
     }
     if out.len() > MAX_RPC {
         bail!("tool response exceeds 1 MiB");
     }
-    let mut response: Value = serde_json::from_str(&out)
-        .map_err(|_| anyhow::anyhow!("sandbox did not return tool protocol JSON; rebuild its Rusty snapshot"))?;
+    let mut response: Value = serde_json::from_str(&out).map_err(|_| {
+        anyhow::anyhow!("remote endpoint did not return tool protocol JSON; update the remote Rusty binary")
+    })?;
     if request["op"] == "describe" && response["ok"] == true {
         if let Some(data) = response["data"].as_object_mut() {
             data.insert("sandbox".into(), json!(remote.id()));
@@ -226,7 +240,15 @@ impl Shared {
         })();
         // Transport errors may contain credentials or URLs; keep them generic
         // and never retry an uncertain write.
-        Ok(result.unwrap_or_else(|_| json!({"ok": false, "error": TRANSPORT_FAILED})))
+        Ok(result.unwrap_or_else(|error| {
+            // Only our own status diagnostics may cross the bridge, never raw
+            // provider errors or command output that could contain secrets.
+            let message = match error.downcast_ref::<EndpointExit>() {
+                Some(exit) => format!("{exit}. {TRANSPORT_FAILED}"),
+                None => TRANSPORT_FAILED.into(),
+            };
+            json!({"ok": false, "error": message})
+        }))
     }
 }
 

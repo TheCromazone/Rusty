@@ -143,7 +143,7 @@ pub const COMMANDS: &[Command] = &[
         "[place]",
         "where tools run; saved for the next session",
         "work",
-        &[("local", "on this machine"), ("daytona", "in a Daytona sandbox")],
+        &[("local", "on this machine"), ("daytona", "in a Daytona sandbox"), ("ssh", "on a Linux SSH host")],
     ),
     cmd("/plan", "", "the current plan", "work"),
     cmd("/target", "", "the kube context, cloud account, workspace and branch commands will hit", "setup"),

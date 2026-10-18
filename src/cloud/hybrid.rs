@@ -59,7 +59,7 @@ fn absolute(p: &std::path::Path) -> PathBuf {
 }
 
 /// The local rusty command line; validated before any API call.
-pub fn command(args: &HybridArgs) -> Result<Vec<String>> {
+pub fn command(args: &HybridArgs, placement: &str) -> Result<Vec<String>> {
     let binary = absolute(&args.local_binary);
     if !binary.is_file() {
         bail!("local Rusty binary not found: {}; run cargo build --bins", binary.display());
@@ -67,7 +67,7 @@ pub fn command(args: &HybridArgs) -> Result<Vec<String>> {
     let mut words: Vec<String> = vec![
         binary.display().to_string(),
         "--tools".into(),
-        "daytona".into(),
+        placement.into(),
         "--mode".into(),
         args.mode.clone(),
         "--agents".into(),
@@ -137,7 +137,17 @@ pub type Spawn<'a> = dyn FnMut(&[String], &[(String, String)]) -> Result<i32> + 
 /// local rusty, and returns its exit code. Never creates, wakes, stops or
 /// deletes the sandbox.
 pub fn attach(state: &str, remote: Arc<dyn Remote>, args: &HybridArgs, spawn: &mut Spawn) -> Result<i32> {
-    let command = command(args)?;
+    attach_backend(state, remote, args, "daytona", spawn)
+}
+
+pub fn attach_backend(
+    state: &str,
+    remote: Arc<dyn Remote>,
+    args: &HybridArgs,
+    placement: &str,
+    spawn: &mut Spawn,
+) -> Result<i32> {
+    let command = command(args, placement)?;
     if !state.eq_ignore_ascii_case("started") {
         bail!(
             "hybrid attaches only to a started sandbox; it never creates or wakes one. \
@@ -149,7 +159,7 @@ pub fn attach(state: &str, remote: Arc<dyn Remote>, args: &HybridArgs, spawn: &m
         remote.id(),
         args.workspace
     );
-    eprintln!("☾ attached sandbox stays running after exit; this command never creates, stops or deletes it");
+    eprintln!("☾ attached host stays running after exit; this command never creates, stops or deletes it");
     let bridge = Bridge::start(remote, &args.workspace)?;
     let mut env = bridge.env();
     if let Some(id) = args.project_id.as_deref().filter(|p| !p.is_empty()) {

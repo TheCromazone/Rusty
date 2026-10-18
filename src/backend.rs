@@ -22,10 +22,11 @@ pub type ShellResult = (Option<Option<i32>>, String, String);
 pub enum Backend {
     #[default]
     Local,
-    Daytona(std::sync::Arc<Bridge>),
+    Remote(std::sync::Arc<Bridge>),
 }
 
 pub struct Bridge {
+    placement: &'static str,
     client: reqwest::blocking::Client,
     url: String,
     token: String,
@@ -38,9 +39,13 @@ impl Backend {
     pub fn connect(placement: &str) -> Result<Self> {
         match placement {
             "local" => Ok(Self::Local),
-            "daytona" => {
+            "daytona" | "ssh" => {
                 let missing = || {
-                    anyhow::anyhow!("Daytona tools need the tool bridge. Run: rusty-cloud hybrid --sandbox ID --workspace /home/daytona/work --local-binary PATH")
+                    if placement == "ssh" {
+                        anyhow::anyhow!("SSH tools need the tool bridge. Run: rusty-cloud ssh --host HOST --workspace /path/to/project --local-binary PATH")
+                    } else {
+                        anyhow::anyhow!("Daytona tools need the tool bridge. Run: rusty-cloud hybrid --sandbox ID --workspace /home/daytona/work --local-binary PATH")
+                    }
                 };
                 let raw = std::env::var("RUSTY_TOOL_BRIDGE_URL").map_err(|_| missing())?;
                 let url = reqwest::Url::parse(&raw).context("invalid tool bridge URL")?;
@@ -62,6 +67,7 @@ impl Backend {
                     bail!("tool bridge token is too short");
                 }
                 let bridge = Bridge {
+                    placement: if placement == "ssh" { "ssh" } else { "daytona" },
                     client: reqwest::blocking::Client::builder()
                         .no_proxy()
                         .redirect(reqwest::redirect::Policy::none())
@@ -82,63 +88,63 @@ impl Backend {
                     bail!("bridge workspace must be absolute");
                 }
                 let sandbox = description["sandbox"].as_str().context("bridge did not return its sandbox")?;
-                Ok(Self::Daytona(std::sync::Arc::new(Bridge {
+                Ok(Self::Remote(std::sync::Arc::new(Bridge {
                     cwd: cwd.into(),
                     sandbox: sandbox.into(),
                     description: description.clone(),
                     ..bridge
                 })))
             }
-            _ => bail!("unknown tool placement `{placement}` (local, daytona)"),
+            _ => bail!("unknown tool placement `{placement}` (local, daytona, ssh)"),
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::Daytona(_) => "daytona",
+            Self::Remote(b) => b.placement,
         }
     }
 
     pub fn summary(&self) -> String {
         match self {
             Self::Local => "local".into(),
-            Self::Daytona(b) => format!("daytona · {} · {}", b.sandbox, b.cwd.display()),
+            Self::Remote(b) => format!("{} · {} · {}", b.placement, b.sandbox, b.cwd.display()),
         }
     }
 
     pub fn cwd(&self, local: &std::path::Path) -> PathBuf {
         match self {
             Self::Local => local.into(),
-            Self::Daytona(b) => b.cwd.clone(),
+            Self::Remote(b) => b.cwd.clone(),
         }
     }
 
     pub fn identity(&self, local: &std::path::Path) -> String {
         match self {
             Self::Local => local.display().to_string(),
-            Self::Daytona(b) => format!("daytona:{}:{}", b.sandbox, b.cwd.display()),
+            Self::Remote(b) => format!("{}:{}:{}", b.placement, b.sandbox, b.cwd.display()),
         }
     }
 
     pub fn describe(&self, identity: bool) -> Result<Value> {
         match self {
             Self::Local => bail!("local tools have no bridge"),
-            Self::Daytona(b) => b.rpc(json!({"op":"describe", "identity":identity}), 30),
+            Self::Remote(b) => b.rpc(json!({"op":"describe", "identity":identity}), 30),
         }
     }
 
     pub fn initial_description(&self) -> Value {
         match self {
             Self::Local => Value::Null,
-            Self::Daytona(b) => b.description.clone(),
+            Self::Remote(b) => b.description.clone(),
         }
     }
 
     pub fn decide(&self, name: &str, args: &Value, policy: &Policy, cwd: &std::path::Path) -> Result<Verdict> {
         match self {
             Self::Local => Ok(policy.decide(name, args, cwd)),
-            Self::Daytona(b) => {
+            Self::Remote(b) => {
                 Ok(serde_json::from_value(b.rpc(json!({"op":"decide","name":name,"args":args,"policy":policy}), 30)?)?)
             }
         }
@@ -147,7 +153,7 @@ impl Backend {
     pub fn execute(&self, name: &str, args: &Value, policy: &Policy, approval: &Verdict) -> Result<String> {
         match self {
             Self::Local => tools::execute(name, args),
-            Self::Daytona(b) => {
+            Self::Remote(b) => {
                 let timeout =
                     if name == "bash" { args["timeout_secs"].as_u64().unwrap_or(120).clamp(1, 600) } else { 120 };
                 let data = b.rpc(
@@ -163,7 +169,7 @@ impl Backend {
     pub fn shell(&self, command: &str, timeout: Duration) -> Result<ShellResult> {
         match self {
             Self::Local => tools::run(command, timeout),
-            Self::Daytona(b) => Ok(serde_json::from_value(b.rpc(
+            Self::Remote(b) => Ok(serde_json::from_value(b.rpc(
                 json!({"op":"shell","command":command,"timeout":timeout.as_secs().clamp(1,600)}),
                 timeout.as_secs().clamp(1, 600) + 20,
             )?)?),
@@ -178,7 +184,7 @@ impl Backend {
     ) -> std::result::Result<PathBuf, String> {
         match self {
             Self::Local => harness.snapshot(action, command),
-            Self::Daytona(b) => {
+            Self::Remote(b) => {
                 let local = harness.snapshot_with(action, command, |cmd, timeout| self.shell(cmd, timeout))?;
                 let result = (|| -> Result<PathBuf> {
                     let mut files = serde_json::Map::new();

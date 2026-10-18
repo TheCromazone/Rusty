@@ -1,0 +1,64 @@
+name: ssh-network
+on:
+  pull_request:
+    branches: [main]
+    paths: ['src/cloud/**', 'src/backend.rs', 'tests/cloud_hybrid.rs', '.github/workflows/ssh-network.yml']
+permissions:
+  contents: read
+jobs:
+  openssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --bins --locked
+      - name: Disposable SSH server with a strict four-connection startup limit
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+          sudo install target/debug/rusty /usr/local/bin/rusty
+          fixture="$RUNNER_TEMP/rusty-ssh"
+          mkdir -m 700 "$fixture" "$fixture/workspace"
+          ssh-keygen -q -t ed25519 -N '' -f "$fixture/identity"
+          ssh-keygen -q -t ed25519 -N '' -f "$fixture/host"
+          cp "$fixture/identity.pub" "$fixture/authorized_keys"
+          printf '[127.0.0.1]:2222 ' > "$fixture/known_hosts"
+          cat "$fixture/host.pub" >> "$fixture/known_hosts"
+          cat > "$fixture/server" <<CONFIG
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey $fixture/host
+          PidFile $fixture/sshd.pid
+          AuthorizedKeysFile $fixture/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          UsePAM no
+          StrictModes no
+          MaxStartups 4:100:4
+          AllowUsers $(id -un)
+          CONFIG
+          cat > "$fixture/client" <<CONFIG
+          Host rusty-ci
+            HostName 127.0.0.1
+            Port 2222
+            User $(id -un)
+            IdentityFile $fixture/identity
+            IdentitiesOnly yes
+            UserKnownHostsFile $fixture/known_hosts
+            ControlMaster no
+          CONFIG
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -f "$fixture/server" -E "$fixture/server.log"
+          echo "RUSTY_TEST_SSH_CONFIG=$fixture/client" >> "$GITHUB_ENV"
+          echo "RUSTY_TEST_SSH_WORKSPACE=$fixture/workspace" >> "$GITHUB_ENV"
+          echo "RUSTY_TEST_SSH_AUTHORIZED_KEYS=$fixture/authorized_keys" >> "$GITHUB_ENV"
+      - name: Real network concurrency, tools, timeout and revoked authentication
+        run: cargo test --lib --locked cloud::ssh::tests::real_openssh_network -- --ignored --exact --nocapture
+      - name: Stop disposable server
+        if: always()
+        run: |
+          fixture="$RUNNER_TEMP/rusty-ssh"
+          if test -f "$fixture/sshd.pid"; then sudo kill "$(cat "$fixture/sshd.pid")"; fi
+          rm -f "$fixture/identity" "$fixture/host"

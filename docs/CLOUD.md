@@ -263,6 +263,59 @@ and verifies files, memory hooks meet their deadline, and exports are
 hash-verified before deletion. It is not evidence of live model quality, and
 live qualification remains blocked until endpoint access and credentials work.
 
+## Existing Linux boxes over SSH
+
+`rusty-cloud ssh` keeps model calls and memory on your computer and runs tools
+on an existing Linux host. This works with SSH-accessible VMs or development
+boxes without a provider SDK or a Daytona account. Provision the box yourself,
+install this version of the Linux `rusty` binary on its PATH, and clone the
+project there. The host needs Bash and GNU `timeout` (coreutils).
+
+First connect with `ssh your-box` to authenticate and verify the host key.
+Then, from your local Rusty checkout:
+
+```bash
+cargo build --release --bins --locked
+target/release/rusty-cloud ssh --host your-box --workspace /home/user/project \
+    --local-binary target/release/rusty --memory-mode learn
+# Add --prompt or --goal for a headless run; --trajectory saves a local receipt.
+```
+
+Use an alias in `~/.ssh/config` for a custom port, identity, or jump host,
+or pass `--ssh-config PATH` for an isolated OpenSSH configuration.
+Each attachment allows at most four SSH connections at once; additional tool
+requests wait for a slot within their deadline. OpenSSH connection sharing
+can also be configured on that alias to avoid reconnecting for each tool call.
+Authentication is noninteractive and host-key checking remains strict. Agent
+and port forwarding are disabled; model credentials are removed from the SSH
+child's environment. Scripts travel on stdin, not in command-line arguments.
+The same authenticated localhost bridge, remote permission recheck, output
+bounds, read-only workers, and workspace-scoped session identity used by
+Daytona apply here. `/tools ssh` saves this placement for a future session,
+which must also be launched through `rusty-cloud ssh`.
+
+SSH only attaches tools: it does not create, stop, delete, or export the box.
+Changes stay in the remote checkout. A lost connection or local interruption
+can leave a remote operation's outcome unknown; inspect it before retrying.
+Remote commands have a timeout, but an SSH failure is not proof that all
+remote work was cancelled. The transport never automatically retries a write.
+
+The controller needs network access to the configured SSH host and port
+(default 22), or a reachable jump host configured in OpenSSH. HTTP proxy
+environment variables do not configure SSH; use the alias's `ProxyJump` or
+`ProxyCommand` when required. The destination's host key must already be in
+the configured known-hosts file. Connection setup and keepalives are bounded,
+but a disconnect does not roll back a command that already reached the box.
+
+For Daytona, allow HTTPS access to its control plane and toolbox; snapshot
+preparation also needs its object store. Local reasoning in `hybrid` and
+`ssh` needs model-provider access from the controller, while a fully remote
+`run` needs that access from the sandbox. A firewall or provider egress policy
+can still block those endpoints; transport support cannot bypass that policy.
+
+Exit 255 reports an SSH connection or command failure, 127 means Rusty is
+missing from the remote PATH, and 124 means the remote timeout expired.
+
 ## Docker (any cloud, CI, Kubernetes)
 
 ```bash
