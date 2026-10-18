@@ -435,6 +435,86 @@ pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Exercise the visible busy draft and typeahead reader, not just rustyline.
+fn typeahead_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: bool) -> Result<()> {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &dest.join("home"));
+    cmd.env("RUSTY_PROVIDER", "compatible");
+    if plain {
+        cmd.env("NO_COLOR", "1");
+    }
+    let log = File::create(dest.join("typeahead.ansi"))?;
+    let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(30))?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "input prompt missing")?;
+    s.drain(0.2)?;
+    s.send("Unix\r")?;
+    s.wait_for(&[Lit("A long streamed reply")], "stream did not start")?;
+    // The emoji begins at byte 511, crossing read_keys' 512-byte buffer.
+    let input = crate::provider::typeahead_input();
+    s.send("\x1b[200~")?;
+    s.drain(0.1)?;
+    s.pty.send(&input.as_bytes()[..512])?;
+    s.drain(0.15)?;
+    s.pty.send(&input.as_bytes()[512..])?;
+    s.send("\x1b[201~\r")?;
+    match s.expect(&[&[Lit("TYPEAHEAD_EXACT_MATCH")], &[Lit("TYPEAHEAD_MISMATCH")]], s.timeout)? {
+        Some(0) => {}
+        Some(_) => bail!("provider did not receive exact multiline Unicode typeahead"),
+        None => bail!("queued Unicode input did not reach the provider"),
+    }
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "prompt did not recover after typeahead",
+    )?;
+    s.drain(0.3)?;
+    // A pasted absolute path plus unfinished second line stays one editable
+    // draft after stopping, and is never routed as a slash command.
+    s.send("Unix\r")?;
+    s.wait_for(&[Lit("A long streamed reply")], "second stream did not start")?;
+    let path = crate::provider::typeahead_path_input();
+    s.send(&format!("\x1b[200~{path}\x1b[201~"))?;
+    if plain {
+        // No terminal echo is enabled while busy: this text must come from
+        // the visible draft renderer, even when color styling is disabled.
+        s.wait_for(&[Lit("PATH_END")], "NO_COLOR busy draft was invisible")?;
+        s.wait_for(&[Lit("A long streamed reply")], "stream did not continue after drafting")?;
+        s.drain(0.3)?;
+        let mut screen = Screen::new(ROWS as usize, cols as usize);
+        screen.feed(&s.text, |_, _| {});
+        if !screen.lines().iter().any(|line| line.contains("PATH_END")) {
+            bail!("NO_COLOR draft disappeared after streamed output");
+        }
+    }
+    s.drain(0.3)?;
+    s.send("\x03")?;
+    s.wait_for(&[Lit("stopped")], "turn did not stop with a pasted draft")?;
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "stopped draft editor did not recover",
+    )?;
+    let mark = s.text.len();
+    s.drain(0.3)?;
+    if s.text[mark..].contains("TYPEAHEAD_PATH_") {
+        bail!("unfinished pasted draft was sent without Enter");
+    }
+    s.send(" EDITED\r")?;
+    match s.expect(&[&[Lit("TYPEAHEAD_PATH_EXACT_MATCH")], &[Lit("TYPEAHEAD_PATH_MISMATCH")]], s.timeout)? {
+        Some(0) => {}
+        Some(_) => bail!("provider did not receive exact edited path and multiline draft"),
+        None => bail!("pasted path draft was lost, split or routed as a command"),
+    }
+    s.wait_for(
+        &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+        "prompt did not recover after pasted draft",
+    )?;
+    s.drain(0.3)?;
+    s.send("/exit\r")?;
+    s.finish()?;
+    println!("PASS: exact multiline Unicode typeahead at {cols} columns (NO_COLOR={plain})");
+    Ok(())
+}
+
 pub enum Interrupt {
     Stopped(u128),
     /// The model finished before the keypress.
@@ -559,6 +639,8 @@ enum Check {
     Steady,
     Owned,
     Input,
+    Typeahead,
+    TypeaheadPlain,
     Menu,
     Shell,
     Aside,
@@ -596,6 +678,36 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
             };
             tools_capture(&binary, &provider.endpoint, cols, &dest, prompt).map_err(fail(format!("{cols} columns")))?;
         }
+    }
+    if checks.contains(&Check::Input) {
+        for cols in WIDTHS {
+            let dest = out.join(format!("input-{cols}"));
+            std::fs::create_dir_all(&dest)?;
+            input_capture(&binary, &provider.endpoint, cols, &dest, false, false)?;
+        }
+        let dest = out.join("input-plain");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, true, false)?;
+        let dest = out.join("input-indexed");
+        std::fs::create_dir_all(&dest)?;
+        input_capture(&binary, &provider.endpoint, 80, &dest, false, true)?;
+    }
+    if checks.contains(&Check::Shell) {
+        let dest = out.join("direct-shell");
+        std::fs::create_dir_all(&dest)?;
+        shell_capture(&binary, &dest)?;
+    }
+    if checks.contains(&Check::Typeahead) {
+        for cols in WIDTHS {
+            let dest = out.join(format!("typeahead-{cols}"));
+            std::fs::create_dir_all(&dest)?;
+            typeahead_capture(&binary, &provider.endpoint, cols, &dest, false)?;
+        }
+    }
+    if checks.contains(&Check::Typeahead) || checks.contains(&Check::TypeaheadPlain) {
+        let dest = out.join("typeahead-plain");
+        std::fs::create_dir_all(&dest)?;
+        typeahead_capture(&binary, &provider.endpoint, 80, &dest, true)?;
     }
     if checks.contains(&Check::Input) {
         for cols in WIDTHS {
@@ -659,6 +771,8 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "steady" => checks.push(Check::Steady),
             "owned" => checks.push(Check::Owned),
             "input" => checks.push(Check::Input),
+            "typeahead" => checks.push(Check::Typeahead),
+            "typeahead-plain" => checks.push(Check::TypeaheadPlain),
             "menu" => checks.push(Check::Menu),
             "shell" => checks.push(Check::Shell),
             "aside" => checks.push(Check::Aside),
@@ -703,8 +817,12 @@ pub fn capture(args: &[String]) -> Result<ExitCode> {
     } else {
         Check::Steady
     };
-    if !run(&binary, &output, &[width, Check::Input, Check::Menu, Check::Shell, Check::Approval, Check::CtrlC], false)?
-    {
+    if !run(
+        &binary,
+        &output,
+        &[width, Check::Input, Check::Menu, Check::Typeahead, Check::Shell, Check::Approval, Check::CtrlC],
+        false,
+    )? {
         bail!("the ctrl-c capture was inconclusive");
     }
     Ok(ExitCode::SUCCESS)

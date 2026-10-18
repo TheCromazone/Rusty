@@ -152,7 +152,7 @@ impl Display {
 
     /// Refreshes elapsed time; completed output stays in scrollback.
     pub fn tick(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::interactive() || self.in_reasoning {
             return;
         }
         let cadence = 1000;
@@ -167,7 +167,7 @@ impl Display {
     }
 
     fn paint(&mut self) {
-        if self.quiet || !ui::tty() || self.in_reasoning {
+        if self.quiet || !ui::interactive() || self.in_reasoning {
             return;
         }
         let extra = if !self.status.is_empty() {
@@ -196,7 +196,7 @@ impl Display {
         let mut buf = Vec::new();
         self.footer.borrow_mut().clear(&mut buf);
         let _ = writeln!(buf, "{s}");
-        if ui::tty() && !self.in_reasoning {
+        if ui::interactive() && !self.in_reasoning {
             let extra = if self.status.is_empty() { String::new() } else { self.status.clone() };
             let verb = if self.in_content { "Responding" } else { self.verb };
             self.footer.borrow_mut().draw(&mut buf, self.frame, verb, &extra, self.started.elapsed().as_secs());
