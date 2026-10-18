@@ -194,3 +194,9 @@ Native session workers preserve their launcher's terminal signal disposition.
 They do not install the interactive CLI's first/second Ctrl-C handler or save
 terminal state; clients cancel through `run.cancel` and close through `shutdown`.
 The ordinary CLI and tool-RPC signal paths retain their existing behavior.
+
+## Task notifications
+
+Built-in completion and attention notifications are a required native product
+feature. The current Stage 0 prototype does not implement delivery or task
+navigation. See [the behavior and E2E acceptance contract](NATIVE_NOTIFICATIONS.md).
