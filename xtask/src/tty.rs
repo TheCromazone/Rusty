@@ -389,6 +389,68 @@ fn tools_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, prompt: 
 /// approved write lets the turn resume, and the terminal can still be resized
 /// and used afterwards: a second line editor at the prompt used to replace the
 /// REPL's resize handler, so the next resize aborted rusty.
+/// `/ping`: off by default; once on, a finished turn sends exactly one OSC 9
+/// frame made of fixed words and the folder name, and the setting is saved;
+/// a turn the user stopped with ctrl-c sends nothing. `RUSTY_PING_AFTER=0`
+/// removes the minimum turn length so the stand-in's quick turns count.
+/// This proves the bytes, not that a terminal showed a notification.
+fn ping(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(dest).args(["--mode", "standard", "--agents", "off", "--memory", "off"]);
+    offline(&mut cmd, endpoint, &dest.join("home"));
+    cmd.env("RUSTY_PING_AFTER", "0");
+    let log = File::create(dest.join("ping.ansi"))?;
+    let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(30))?;
+    let prompt = &[Lit("?2004h")];
+    let frames = |text: &str| text.matches("\x1b]9;").count();
+    s.wait_for(prompt, "no prompt")?;
+    s.drain(0.3)?;
+    s.send("reply with just the word pong\r")?;
+    s.wait_for(&[Lit("pong"), Space], "the first turn did not run")?;
+    s.wait_for(prompt, "no prompt after the first turn")?;
+    s.drain(0.4)?;
+    if frames(&s.text) != 0 {
+        bail!("a ping went out while pings were off");
+    }
+    s.send("/ping on\r")?;
+    s.wait_for(prompt, "no prompt after /ping on")?;
+    s.drain(0.3)?;
+    let saved = std::fs::read_to_string(dest.join("home/settings.json")).unwrap_or_default();
+    if !saved.contains("\"ping\":\"on\"") {
+        bail!("/ping on was not saved: {saved}");
+    }
+    s.send("reply with just the word pong\r")?;
+    s.wait_for(&[Lit("pong"), Space], "the second turn did not run")?;
+    s.wait_for(prompt, "no prompt after the second turn")?;
+    s.drain(0.4)?;
+    let want = "\x1b]9;rusty · ping: response ready\x07";
+    if frames(&s.text) != 1 || !s.text.contains(want) {
+        bail!("expected one {want:?} frame, saw {} frames", frames(&s.text));
+    }
+    // More than the spacing between pings, so only the stop can suppress it.
+    s.drain(3.5)?;
+    s.send("Write a 1500 word essay on the history of Unix, in plain prose. Do not use any tools.\r")?;
+    s.wait_for(&[Lit("ctrl-c to stop")], "the slow turn never showed its panel")?;
+    s.drain(1.0)?;
+    s.send("\x03")?;
+    match s.expect(&[&[Lit("stopped")], &[Lit("✓ ")]], s.timeout)? {
+        Some(0) => {}
+        Some(_) => bail!("the slow turn finished before ctrl-c; inconclusive"),
+        None => bail!("ctrl-c did not stop the turn"),
+    }
+    s.wait_for(prompt, "no prompt after the stop")?;
+    s.drain(0.4)?;
+    if frames(&s.text) != 1 {
+        bail!("a turn stopped with ctrl-c sent a ping");
+    }
+    s.send("/quit\r")?;
+    s.finish()?;
+    println!(
+        "PASS: /ping is off by default, saves on, sends one fixed OSC 9 frame per finished turn and none after ctrl-c"
+    );
+    Ok(())
+}
+
 pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     let approved = dest.join("approved.txt");
     let mut cmd = Command::new(binary);
@@ -653,6 +715,7 @@ enum Check {
     Aside,
     Side,
     Summary,
+    Ping,
 }
 
 /// Runs the checks into `out`, keeping every capture there. False when the
@@ -744,6 +807,11 @@ fn run(binary: &Path, out: &Path, checks: &[Check], live: bool) -> Result<bool> 
         std::fs::create_dir_all(&dest)?;
         approval(&binary, &provider.endpoint, &dest).map_err(fail("approval".into()))?;
     }
+    if checks.contains(&Check::Ping) {
+        let dest = out.join("ping");
+        std::fs::create_dir_all(&dest)?;
+        ping(&binary, &provider.endpoint, &dest).map_err(fail("ping".into()))?;
+    }
     if checks.contains(&Check::CtrlC) {
         let home = out.join("interrupt-home");
         let endpoint = (!live).then_some((provider.endpoint.as_str(), home.as_path()));
@@ -785,6 +853,7 @@ pub fn command(args: &[String]) -> Result<ExitCode> {
             "aside" => checks.push(Check::Aside),
             "side" => checks.push(Check::Side),
             "summary" => checks.push(Check::Summary),
+            "ping" => checks.push(Check::Ping),
             other => bail!("unknown tty check {other:?}; expected ctrl-c, approval or steady"),
         }
     }

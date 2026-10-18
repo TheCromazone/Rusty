@@ -3236,6 +3236,7 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
             "non-interactive session; the call needs approval".into()
         }));
     }
+    crate::ping::notify(crate::ping::Outcome::NeedsApproval, &std::env::current_dir().unwrap_or_default());
     if destructive {
         println!("  {} {}", ui::err("‼ can't be undone:"), why);
         let prompt = format!("  {} ", ui::dim("type yes to run it once · anything else is sent back as feedback ›"));
