@@ -13,6 +13,23 @@ import XCTest
     var released: Bool { owner == nil && window == nil && controls == nil && view == nil && status == nil }
 }
 
+@MainActor private final class PresentedDocumentProbes {
+    weak var owner: PrototypeWindowController?
+    weak var window: NSWindow?
+    weak var root: NSView?
+    weak var scroll: NSScrollView?
+    weak var controls: Controls?
+    weak var view: DiffRowView?
+    weak var status: NSTextField?
+
+    var initialized: Bool {
+        owner != nil && window != nil && root != nil && scroll != nil && controls != nil && view != nil && status != nil
+    }
+    var released: Bool {
+        owner == nil && window == nil && root == nil && scroll == nil && controls == nil && view == nil && status == nil
+    }
+}
+
 /// Exercises the same owner used by main, without a worker, AX-driven close,
 /// application termination, or a second implementation of the view hierarchy.
 @MainActor final class DocumentLifetimeTests: XCTestCase {
@@ -91,7 +108,7 @@ import XCTest
             "observed_cycles": observations.count, "fd_baseline": baseline.map { $0 as Any } ?? NSNull(),
             "fd_tolerance": 2, "observations": observations,
             "rss_or_performance_qualified": false,
-            "scope": "Actual prototype owner/window/controls/view/status release only; no worker, event queue or supervisor exists in this target"
+            "scope": "Offscreen prototype owner/window/controls/view/status release only; no presented draw, external AX client, worker, event queue or supervisor is exercised"
         ]
         let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys, .prettyPrinted])
         if let output = ProcessInfo.processInfo.environment["RUSTY_NATIVE_LIFECYCLE_RECEIPT"] {
@@ -135,5 +152,104 @@ import XCTest
         XCTAssertNil(status, "closed controller retained the status field")
         XCTAssertNil(window, "closed controller retained its window")
         withExtendedLifetime((owner, retainedOwner)) {}
+    }
+
+    /// This opt-in path shows real windows and must run only in a coordinated
+    /// GUI window. Default package tests never bring these windows forward.
+    func testPresentedDrawnDocumentsReleaseAfterProgrammaticWindowClose() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["RUSTY_NATIVE_PRESENTED_LIFECYCLE"] == "1",
+                          "Requires an explicitly coordinated GUI window; presents 23 native windows")
+        let app = NSApplication.shared
+        let previousPolicy = app.activationPolicy()
+        let previousDelegate = app.delegate
+        app.setActivationPolicy(.regular)
+        let application = PrototypeApplicationController()
+        app.delegate = application
+        defer {
+            application.documentWindow?.close()
+            app.delegate = previousDelegate
+            app.setActivationPolicy(previousPolicy)
+        }
+        var baseline: Int?
+        var observations: [[String: Any]] = []
+        for iteration in 0..<23 {
+            let probes = PresentedDocumentProbes()
+            var heldAXRows: [Any] = []
+            var didDraw = false
+            var initialGraphPresent = false
+            var paintedRows = 0
+            var windowNumber = -1
+            autoreleasepool {
+                let owner = application.openFixture(count: 20_000)
+                probes.owner = owner; probes.window = owner.window
+                probes.root = owner.window?.contentView
+                probes.scroll = owner.diffView?.enclosingScrollView
+                probes.controls = owner.controls; probes.view = owner.diffView; probes.status = owner.status
+                initialGraphPresent = probes.initialized
+                XCTAssertNotNil(probes.owner)
+                XCTAssertNotNil(probes.window)
+                XCTAssertNotNil(probes.root)
+                XCTAssertNotNil(probes.scroll)
+                XCTAssertNotNil(probes.controls)
+                XCTAssertNotNil(probes.view)
+                XCTAssertNotNil(probes.status)
+                owner.present()
+                app.activate(ignoringOtherApps: true)
+                didDraw = drain { owner.window?.isVisible == true && (owner.diffView?.drawnRows ?? 0) > 0 }
+                XCTAssertTrue(didDraw, "presented window did not draw within the deadline, cycle \(iteration)")
+                paintedRows = owner.diffView?.drawnRows ?? 0
+                windowNumber = owner.window?.windowNumber ?? -1
+                XCTAssertGreaterThan(windowNumber, 0)
+                owner.diffView?.primeLineCacheForMemoryMeasurement()
+                XCTAssertEqual(owner.diffView?.cachedLineCount, 2000)
+                // These are real view-owned AX objects, but this direct getter
+                // does NOT exercise an external AX client or VoiceOver.
+                heldAXRows = owner.diffView?.accessibilityChildren() ?? []
+                XCTAssertFalse(heldAXRows.isEmpty)
+                owner.window?.performClose(nil)
+                XCTAssertNil(application.documentWindow)
+            }
+            let released = drain { probes.released }
+            XCTAssertTrue(released, "presented document graph retained after cycle \(iteration)")
+            XCTAssertNil(probes.owner)
+            XCTAssertNil(probes.window)
+            XCTAssertNil(probes.root)
+            XCTAssertNil(probes.scroll)
+            XCTAssertNil(probes.controls)
+            XCTAssertNil(probes.view)
+            XCTAssertNil(probes.status)
+            // Keep getter-produced AX elements alive while checking that their
+            // nonowning parent does not keep any part of the graph alive.
+            XCTAssertFalse(heldAXRows.isEmpty)
+            heldAXRows.removeAll()
+            guard initialGraphPresent && didDraw && released else { break }
+            let count = try fdCount()
+            if iteration == 2 { baseline = count }
+            if iteration >= 3 {
+                let expected = try XCTUnwrap(baseline)
+                XCTAssertLessThanOrEqual(abs(count - expected), 2, "fd growth after presented cycle \(iteration)")
+                observations.append(["iteration": iteration - 2, "pid": getpid(), "window_number": windowNumber,
+                                     "all_weak_probes_non_nil_before_close": initialGraphPresent,
+                                     "all_weak_probes_nil_after_close": released,
+                                     "drawn_rows": paintedRows, "open_fds": count,
+                                     "direct_ax_getter_exercised": true, "external_ax_client_exercised": false])
+            }
+        }
+        withExtendedLifetime(application) {}
+        XCTAssertEqual(observations.count, 20)
+        let receipt: [String: Any] = [
+            "kind": "presented_drawn_synthetic_document_owner_lifecycle", "warmup_cycles": 3,
+            "observed_cycles": observations.count, "fd_baseline": baseline.map { $0 as Any } ?? NSNull(),
+            "fd_tolerance": 2, "observations": observations,
+            "external_ax_client_or_voiceover_qualified": false, "rss_or_performance_qualified": false,
+            "scope": "Actual presented window and AppKit draw, followed by programmatic performClose and graph release; direct AX getter only; no worker or supervisor"
+        ]
+        let data = try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys, .prettyPrinted])
+        if let output = ProcessInfo.processInfo.environment["RUSTY_NATIVE_PRESENTED_LIFECYCLE_RECEIPT"] {
+            let url = URL(fileURLWithPath: output)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+        }
+        print(String(decoding: data, as: UTF8.self))
     }
 }

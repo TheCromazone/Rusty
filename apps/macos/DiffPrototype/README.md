@@ -121,7 +121,7 @@ from the application owner. The application can remain alive without retaining
 that closed document. Command-Q still terminates the prototype. This introduces
 no worker wrapper, session supervisor, background execution or stage-1 UI.
 
-The programmatic SwiftPM lifecycle tests exercise the same owner used by the
+The default, offscreen SwiftPM lifecycle tests exercise the same owner used by the
 executable, rather than duplicating its hierarchy. After three warmed cycles,
 they perform twenty more construction/use/close cycles, hold AX children across
 close, drain autorelease pools and the main run loop with a five-second hard
@@ -143,3 +143,28 @@ a quiet-machine memory budget, or global leak freedom. Do not run this alongside
 scrolling performance measurements. Source content is fixed for each prototype
 view: its document setter is private, and document replacement/cache
 invalidation remains outside this synthetic spike.
+
+
+A separate presented/drawn lifecycle test is skipped by default. It brings up
+23 native windows and requires an explicitly coordinated GUI window with no
+other computer-use driver. Enable it only for that controlled run:
+
+```sh
+RUSTY_NATIVE_PRESENTED_LIFECYCLE=1 \
+RUSTY_NATIVE_PRESENTED_LIFECYCLE_RECEIPT=/absolute/path/presented-lifecycle.json \
+  swift test --package-path apps/macos/DiffPrototype --jobs 1 -c release \
+  -debug-info-format none \
+  --filter testPresentedDrawnDocumentsReleaseAfterProgrammaticWindowClose
+```
+
+Each cycle uses the actual `present()` path and waits, with a hard deadline, for
+a visible registered window and a nonzero AppKit draw count before warming the
+2,000-line cache. It checks owner/window/root/scroll/controls/diff/status weak
+references are populated before closing through `performClose`, and all clear
+after autorelease-pool/run-loop draining. Three warm-up cycles precede twenty
+observed cycles and the fd comparison. AX elements returned by the view's
+direct getter stay held across close; **this does not qualify an external AX
+client, XCUI, or VoiceOver**. Those require separate tests on the same source.
+A completed AppKit draw is not proof of compositor presentation, scroll hitches,
+or RSS stability. The opt-in test's output must not be conflated with the
+previous offscreen lifecycle receipts.
