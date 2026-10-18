@@ -68,6 +68,9 @@ enum RefusalKind {
     Declined,
     Unattended,
     CarefulGate,
+    /// An edit or overwrite of a file the agent hasn't read as it is now.
+    /// Not a safety outcome: it ran nothing and the model retries after a read.
+    ReadFirst,
 }
 
 #[derive(Debug)]
@@ -113,15 +116,17 @@ impl Safety {
             Class::Destructive(_) => &mut self.destructive,
             _ => return,
         };
-        calls.proposed += 1;
         let slot = match refusal {
             Some(RefusalKind::Denied) => &mut calls.denied,
             Some(RefusalKind::Declined) => &mut calls.declined,
             Some(RefusalKind::Unattended) => &mut calls.unattended,
             Some(RefusalKind::CarefulGate) => &mut calls.careful_gate,
+            // Not proposed yet: the model reads the file and asks again.
+            Some(RefusalKind::ReadFirst) => return,
             None => &mut calls.executed,
         };
         *slot += 1;
+        calls.proposed += 1;
     }
 }
 
@@ -1817,9 +1822,14 @@ impl Agent {
 
     /// Runs a filesystem/shell tool through the permission policy.
     fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display, early: Option<Early>) -> Result<String> {
-        // Before the permission check, so nobody approves a change that fails.
-        if matches!(name, "edit_file" | "write_file") {
-            self.check_read(args)?;
+        // After a deny, which a read can't change, and before any prompt, so
+        // nobody approves a change that fails.
+        if matches!(name, "edit_file" | "write_file")
+            && !matches!(self.backend.decide(name, args, &self.policy, &self.cwd), Ok(Verdict::Deny(_)))
+        {
+            if let Err(e) = self.check_read(args) {
+                return Err(refusal_error(RefusalKind::ReadFirst, e.to_string()));
+            }
         }
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
@@ -3741,7 +3751,8 @@ mod read_first_tests {
 
         let refused = run(&mut a, "edit_file", edit("one", "two"));
         assert!(refused.text.contains("has not been read yet"), "{}", refused.text);
-        assert!(refused.refusal.is_none(), "an ordinary tool error, not a permission refusal");
+        assert_eq!(refused.refusal, Some(RefusalKind::ReadFirst), "neither executed nor a change");
+        assert!(refused.text.starts_with("error: "), "{}", refused.text);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
 
         // Any read counts, and another spelling of the path is the same file.
@@ -3767,12 +3778,29 @@ mod read_first_tests {
         run(&mut a, "read_file", json!({"path": path}));
         assert!(run(&mut a, "edit_file", edit("four", "five")).text.starts_with("edited"));
 
-        // Refused before the permission check: a deny rule never sees it.
+        // A deny comes first: reading wouldn't help, so the model isn't told to.
         let mut denied = agent(dir.clone(), Mode::Yolo);
         denied.policy.deny.push("edit_file".into());
-        let result = run(&mut denied, "edit_file", edit("five", "six"));
-        assert!(result.text.contains("has not been read yet") && result.refusal.is_none(), "{}", result.text);
+        let mut read_only = agent(dir.clone(), Mode::ReadOnly);
+        for a in [&mut denied, &mut read_only] {
+            let result = run(a, "edit_file", edit("five", "six"));
+            assert_eq!(result.refusal, Some(RefusalKind::Denied), "{}", result.text);
+            assert!(result.text.contains("denied by permissions"), "{}", result.text);
+        }
+        // Without a deny the read check still comes before any prompt.
+        let ask = run(&mut agent(dir.clone(), Mode::Ask), "edit_file", edit("five", "six"));
+        assert_eq!(ask.refusal, Some(RefusalKind::ReadFirst), "{}", ask.text);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_read_first_refusal_is_no_safety_outcome() {
+        let mut safety = Safety::default();
+        let risky = crate::permissions::Class::Risky("writes .env".into());
+        safety.record(&risky, Some(RefusalKind::ReadFirst));
+        assert_eq!((safety.risky.proposed, safety.risky.executed), (0, 0));
+        safety.record(&risky, None);
+        assert_eq!((safety.risky.proposed, safety.risky.executed), (1, 1));
     }
 
     #[test]
