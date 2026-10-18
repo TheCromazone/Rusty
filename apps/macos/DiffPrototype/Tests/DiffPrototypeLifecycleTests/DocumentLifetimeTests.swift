@@ -177,6 +177,11 @@ import XCTest
             var heldAXRows: [Any] = []
             var didDraw = false
             var initialGraphPresent = false
+            var graphPresentBeforeClose = false
+            var firstResponderMatches = false
+            var windowIsKey = false
+            weak var heldAXElement: NSAccessibilityElement?
+            var heldAXParentCleared = false
             var paintedRows = 0
             var windowNumber = -1
             autoreleasepool {
@@ -197,6 +202,9 @@ import XCTest
                 app.activate(ignoringOtherApps: true)
                 didDraw = drain { owner.window?.isVisible == true && (owner.diffView?.drawnRows ?? 0) > 0 }
                 XCTAssertTrue(didDraw, "presented window did not draw within the deadline, cycle \(iteration)")
+                firstResponderMatches = owner.diffView != nil && owner.window?.firstResponder === owner.diffView
+                XCTAssertTrue(firstResponderMatches, "drawn diff view must be the first responder, cycle \(iteration)")
+                windowIsKey = owner.window?.isKeyWindow ?? false
                 paintedRows = owner.diffView?.drawnRows ?? 0
                 windowNumber = owner.window?.windowNumber ?? -1
                 XCTAssertGreaterThan(windowNumber, 0)
@@ -206,6 +214,17 @@ import XCTest
                 // does NOT exercise an external AX client or VoiceOver.
                 heldAXRows = owner.diffView?.accessibilityChildren() ?? []
                 XCTAssertFalse(heldAXRows.isEmpty)
+                heldAXElement = heldAXRows.first as? NSAccessibilityElement
+                XCTAssertNotNil(heldAXElement, "the held AX rows must include a real accessibility element")
+                graphPresentBeforeClose = probes.initialized
+                XCTAssertTrue(graphPresentBeforeClose, "all seven weak probes must remain live immediately before close")
+                XCTAssertNotNil(probes.owner)
+                XCTAssertNotNil(probes.window)
+                XCTAssertNotNil(probes.root)
+                XCTAssertNotNil(probes.scroll)
+                XCTAssertNotNil(probes.controls)
+                XCTAssertNotNil(probes.view)
+                XCTAssertNotNil(probes.status)
                 owner.window?.performClose(nil)
                 XCTAssertNil(application.documentWindow)
             }
@@ -221,16 +240,31 @@ import XCTest
             // Keep getter-produced AX elements alive while checking that their
             // nonowning parent does not keep any part of the graph alive.
             XCTAssertFalse(heldAXRows.isEmpty)
+            autoreleasepool {
+                XCTAssertNotNil(heldAXElement, "held AX element must survive until its holding array is cleared")
+                heldAXParentCleared = heldAXElement != nil && heldAXElement?.accessibilityParent() == nil
+                XCTAssertTrue(heldAXParentCleared, "held AX element must have a nil parent after graph release")
+                XCTAssertNil(heldAXElement?.accessibilityParent())
+            }
             heldAXRows.removeAll()
-            guard initialGraphPresent && didDraw && released else { break }
+            let heldAXElementReleased = drain { heldAXElement == nil }
+            XCTAssertTrue(heldAXElementReleased, "AX element retained after clearing its holding array, cycle \(iteration)")
+            XCTAssertNil(heldAXElement)
+            guard initialGraphPresent && graphPresentBeforeClose && didDraw && firstResponderMatches && released
+                    && heldAXParentCleared && heldAXElementReleased else { break }
             let count = try fdCount()
             if iteration == 2 { baseline = count }
             if iteration >= 3 {
                 let expected = try XCTUnwrap(baseline)
                 XCTAssertLessThanOrEqual(abs(count - expected), 2, "fd growth after presented cycle \(iteration)")
                 observations.append(["iteration": iteration - 2, "pid": getpid(), "window_number": windowNumber,
-                                     "all_weak_probes_non_nil_before_close": initialGraphPresent,
+                                     "all_weak_probes_non_nil_before_present": initialGraphPresent,
+                                     "all_weak_probes_non_nil_before_close": graphPresentBeforeClose,
                                      "all_weak_probes_nil_after_close": released,
+                                     "diff_view_is_first_responder_after_draw": firstResponderMatches,
+                                     "window_is_key_after_draw": windowIsKey,
+                                     "held_ax_element_parent_nil_after_graph_release": heldAXParentCleared,
+                                     "held_ax_element_nil_after_holding_array_clear": heldAXElementReleased,
                                      "drawn_rows": paintedRows, "open_fds": count,
                                      "direct_ax_getter_exercised": true, "external_ax_client_exercised": false])
             }
