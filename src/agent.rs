@@ -29,6 +29,8 @@ const MAX_STEPS: usize = 80;
 const TOKEN_LIMIT_NOTE: &str = "  (the reply hit the token limit; say \"continue\" to resume)";
 const WORKER_STEPS: usize = 30;
 const TRAJECTORY_EVERY: Duration = Duration::from_secs(30);
+/// Threads, the agent's own included, for a run of reads in one reply.
+const READ_AHEAD_THREADS: usize = 4;
 
 /// What happened to the consequential calls the model made, by permission
 /// class: proposed, then either executed or blocked and by what. Kept apart
@@ -1235,7 +1237,9 @@ impl Agent {
                 };
                 break;
             }
-            for call in &reply.tool_calls {
+            let mut early: Vec<Option<Result<String>>> = Vec::new();
+            let mut read_to = 0;
+            for (i, call) in reply.tool_calls.iter().enumerate() {
                 let output = if signal::interrupted() {
                     "skipped: the user interrupted".to_string()
                 } else if outcome.is_err() {
@@ -1256,7 +1260,10 @@ impl Agent {
                     {
                         self.escalate(&format!("consequential step ({why})"), &mut d);
                     }
-                    let mut result = self.dispatch(call, &mut d);
+                    if i >= read_to {
+                        read_to = self.read_ahead(&reply.tool_calls, i, &mut early);
+                    }
+                    let mut result = self.dispatch(call, &mut d, early.get_mut(i).and_then(Option::take));
                     self.safety.record(&class, result.refusal);
                     if class != crate::permissions::Class::ReadOnly && result.refusal.is_none() {
                         changed = true;
@@ -1492,7 +1499,63 @@ impl Agent {
         }
     }
 
-    fn dispatch(&mut self, call: &ToolCall, d: &mut Display) -> DispatchResult {
+    /// When the call at `at` starts a run of in-process reads the policy
+    /// allows without asking, runs the whole run side by side now and files
+    /// each result under its call. Everything else about those calls (the
+    /// display, the permission check, redaction, history) still happens one
+    /// call at a time, in order. Returns the index past the run.
+    fn read_ahead(&self, calls: &[ToolCall], at: usize, early: &mut Vec<Option<Result<String>>>) -> usize {
+        // A lone read gains nothing from a thread.
+        let read = |c: &ToolCall| tools::IN_PROCESS_READS.contains(&c.name.as_str());
+        if !calls.get(at + 1).is_some_and(read) {
+            return at + 1;
+        }
+        let run: Vec<(&str, Value)> =
+            calls[at..].iter().map_while(|c| Some((c.name.as_str(), self.reads_ahead(c)?))).collect();
+        if run.len() < 2 {
+            return at + 1;
+        }
+        let jobs: Vec<(&str, &Value)> = run.iter().map(|(name, args)| (*name, args)).collect();
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(READ_AHEAD_THREADS);
+        early.resize_with(calls.len(), || None);
+        for (slot, result) in
+            early[at..].iter_mut().zip(tools::read_ahead(&jobs, threads, &signal::interrupted_from_here()))
+        {
+            *slot = result;
+        }
+        at + run.len()
+    }
+
+    /// A call's arguments when it may run ahead: an in-process read of local
+    /// files that the policy allows outright, of no file too large to hold
+    /// beside others. Side chats stay in order for their file observations.
+    fn reads_ahead(&self, call: &ToolCall) -> Option<Value> {
+        if !tools::IN_PROCESS_READS.contains(&call.name.as_str())
+            || self.backend.name() != "local"
+            || self.shell_only
+            || self.side_meta.is_some()
+        {
+            return None;
+        }
+        let raw = if call.arguments.trim().is_empty() { "{}" } else { &call.arguments };
+        let args: Value = serde_json::from_str(raw).ok()?;
+        if crate::permissions::classify(&call.name, &args, &self.cwd) != crate::permissions::Class::ReadOnly
+            || !matches!(self.backend.decide(&call.name, &args, &self.policy, &self.cwd), Ok(Verdict::Allow))
+        {
+            return None;
+        }
+        if matches!(call.name.as_str(), "read_file" | "outline") {
+            let meta = std::fs::metadata(args["path"].as_str()?).ok()?;
+            if meta.is_file() && meta.len() > tools::READ_AHEAD_MAX_BYTES {
+                return None;
+            }
+        }
+        Some(args)
+    }
+
+    /// `early` is the call's result when it already ran ahead; it is used
+    /// only once the call is authorized like any other.
+    fn dispatch(&mut self, call: &ToolCall, d: &mut Display, early: Option<Result<String>>) -> DispatchResult {
         self.tool_calls_run += 1;
         if self.shell_only && !Self::SHELL_TOOLS.contains(&call.name.as_str()) {
             return DispatchResult::failed(format!("error: unknown tool `{}`; this run offers only bash", call.name));
@@ -1598,7 +1661,7 @@ impl Agent {
                     Err(e) => Err(e),
                 },
             },
-            name => self.run_guarded(name, &args, d),
+            name => self.run_guarded(name, &args, d, early),
         };
         let (text, ok, refusal) = match result {
             Ok(t) => (t, true, None),
@@ -1636,7 +1699,13 @@ impl Agent {
     }
 
     /// Runs a filesystem/shell tool through the permission policy.
-    fn run_guarded(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<String> {
+    fn run_guarded(
+        &mut self,
+        name: &str,
+        args: &Value,
+        d: &mut Display,
+        early: Option<Result<String>>,
+    ) -> Result<String> {
         let approval = match self.authorize(name, args, d)? {
             Authorization::Allowed(approval) => approval,
             Authorization::Refused { kind, message } => return Err(refusal_error(kind, message)),
@@ -1649,7 +1718,10 @@ impl Agent {
         } else {
             None
         };
-        let result = self.backend.execute(name, args, &self.policy, &approval);
+        let result = match early {
+            Some(result) => result,
+            None => self.backend.execute(name, args, &self.policy, &approval),
+        };
         if result.is_ok() {
             if let Some((path, hash)) = observed {
                 if let Some(meta) = &mut self.side_meta {
@@ -3153,6 +3225,81 @@ fn checker_gist(report: &str) -> Option<String> {
         })
         // A bare file name says nothing; the finding is on the next line.
         .find(|l| !l.is_empty() && !l.ends_with(':') && !is_bare_filename(l))
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::*;
+
+    fn agent(cwd: PathBuf, mode: Mode) -> Agent {
+        let endpoint = crate::llm::Endpoint::new(
+            crate::config::Provider::Compatible,
+            "http://127.0.0.1:1/v1".into(),
+            vec!["offline-test-key".into()],
+        );
+        let client = Arc::new(Client::new(vec![endpoint]).unwrap());
+        Agent::new(client, "test-model".into(), cwd, Policy::new(mode))
+    }
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall { id: format!("id-{name}"), name: name.into(), arguments: args.to_string() }
+    }
+
+    #[test]
+    fn only_allowed_in_process_reads_of_modest_files_run_ahead() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-ahead-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.rs");
+        std::fs::write(&small, "fn a() {}\n").unwrap();
+        let large = dir.join("large.rs");
+        std::fs::write(&large, vec![b'x'; tools::READ_AHEAD_MAX_BYTES as usize + 1]).unwrap();
+        let path = |p: &std::path::Path| json!({"path": p.display().to_string()});
+        let a = agent(dir.clone(), Mode::Ask);
+        assert!(a.reads_ahead(&call("read_file", path(&small))).is_some());
+        assert!(a.reads_ahead(&call("outline", path(&dir))).is_some());
+        assert!(a.reads_ahead(&call("glob", json!({"pattern": "*.rs"}))).is_some());
+        assert!(a.reads_ahead(&call("read_file", path(&large))).is_none(), "a large file waits its turn");
+        assert!(a.reads_ahead(&call("outline", path(&large))).is_none());
+        // Credentials ask first, whatever the mode; the prompt keeps its place.
+        for mode in [Mode::Ask, Mode::Yolo] {
+            let a = agent(dir.clone(), mode);
+            assert!(a.reads_ahead(&call("read_file", json!({"path": "~/.aws/credentials"}))).is_none());
+        }
+        let mut denied = agent(dir.clone(), Mode::Ask);
+        denied.policy.deny.push("read_file".into());
+        assert!(denied.reads_ahead(&call("read_file", path(&small))).is_none());
+        for (name, args) in [
+            ("search", json!({"pattern": "a"})),
+            ("bash", json!({"command": "cat small.rs"})),
+            ("write_file", json!({"path": "x", "content": ""})),
+            ("plan", json!({"items": []})),
+        ] {
+            assert!(a.reads_ahead(&call(name, args)).is_none(), "{name} stays in order");
+        }
+        assert!(a.reads_ahead(&ToolCall { id: "x".into(), name: "read_file".into(), arguments: "{".into() }).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_run_of_reads_stops_at_the_first_call_that_must_wait() {
+        let dir = std::env::temp_dir().join(format!("rusty-agent-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let read = call("read_file", json!({"path": file.display().to_string()}));
+        let write = call("write_file", json!({"path": file.display().to_string(), "content": "two\n"}));
+        let calls = [read.clone(), read.clone(), write, read.clone(), read];
+        let a = agent(dir.clone(), Mode::Yolo);
+        let mut early: Vec<Option<Result<String>>> = calls.iter().map(|_| None).collect();
+        assert_eq!(a.read_ahead(&calls, 0, &mut early), 2);
+        assert!(early[0].as_ref().is_some_and(|r| r.as_ref().unwrap().contains("one")));
+        assert!(early[1].is_some() && early[2..].iter().all(Option::is_none), "nothing past the write ran");
+        // A lone read, or the last call, runs in place.
+        assert_eq!(a.read_ahead(&calls, 2, &mut early), 3);
+        assert_eq!(a.read_ahead(&calls[..4], 3, &mut early), 4);
+        assert!(early[2..].iter().all(Option::is_none));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]

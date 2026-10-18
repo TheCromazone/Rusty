@@ -22,8 +22,9 @@
 
 - `cargo xtask bench` measures what a user waits on, offline and from fixed
   inputs: startup, `--sessions` over 500 and 5000 sessions, redaction,
-  recall, a turn on a 300-message history, a 5 MB streamed answer and the
-  binary sizes. It prints one table and writes JSON (`--json PATH`).
+  recall, a turn on a 300-message history, one reply asking for eight reads,
+  six REPL turns, a 5 MB streamed answer and the binary sizes. It prints one
+  table and writes JSON (`--json PATH`).
 - Before and after: build main, keep its binary, then run
   `cargo xtask bench --binary OLD` and `cargo xtask bench` on your branch on
   the same machine. Compare cpu ms, RSS and allocation counts; wall time moves

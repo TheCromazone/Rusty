@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 const USAGE: &str = "usage: cargo xtask bench [--binary PATH] [--json PATH] [--runs N] [--only GROUP,...]\n\
     Builds release rusty (unless --binary) and the perf example, then prints one table.\n\
-    Groups: startup, sessions, redact, recall, turn, stream, size.";
+    Groups: startup, sessions, redact, recall, turn, tools, repl, stream, size.";
 
 pub fn command(args: &[String]) -> Result<ExitCode> {
     let (mut binary, mut out, mut runs) = (None, super::target_dir().join("bench.json"), 11usize);
@@ -129,6 +129,12 @@ impl Bench {
         }
         if self.wants("turn") {
             self.context(&home, &work)?;
+        }
+        if self.wants("tools") {
+            self.tools(&home, &work)?;
+        }
+        if self.wants("repl") {
+            self.repl(&home, &work)?;
         }
         if self.wants("stream") {
             self.stream(&home, &work)?;
@@ -259,6 +265,117 @@ impl Bench {
         Ok(())
     }
 
+    /// One reply asking for eight in-process reads at once over a project
+    /// of about 2,000 files: four 2,500-line files, an outline, a glob and a
+    /// directory listing. The gap between that reply and the next request is
+    /// what the user waits on for the reads.
+    fn tools(&mut self, home: &Path, work: &Path) -> Result<()> {
+        let project = work.join("tools");
+        project_tree(&project)?;
+        let calls = [
+            ("read_file", json!({"path": "big/m0.rs"})),
+            ("read_file", json!({"path": "big/m1.rs"})),
+            ("read_file", json!({"path": "big/m2.rs"})),
+            ("read_file", json!({"path": "big/m3.rs"})),
+            ("outline", json!({"path": "big"})),
+            ("glob", json!({"pattern": "**/*.rs"})),
+            ("list_files", json!({"path": ".", "max_depth": 3})),
+            ("outline", json!({"path": "src/d07"})),
+        ];
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (name, args))| {
+                json!({"index": i, "id": format!("call{i}"), "type": "function",
+                    "function": {"name": name, "arguments": args.to_string()}})
+            })
+            .collect();
+        let reply = json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 4000, "completion_tokens": 50}});
+        let bodies = Arc::new(vec![format!("data: {reply}\n\ndata: [DONE]\n\n"), say("done")]);
+        let (mut gaps, mut samples) = (Vec::new(), Vec::new());
+        for _ in 0..=self.runs {
+            let mock = Mock::start(bodies.clone())?;
+            let s = self.rusty(home, &project, &["read them all"], Some(&mock.url))?;
+            let log = mock.stop();
+            if !s.ok || log.len() != 2 {
+                bail!("the tools run made {} requests (exit ok: {})", log.len(), s.ok);
+            }
+            gaps.push((log[1].received - log[0].answered).as_secs_f64() * 1e3);
+            samples.push(s);
+        }
+        samples.remove(0);
+        gaps.remove(0);
+        let m = medians(&samples);
+        let batch = median(gaps);
+        let data = json!({"calls": 8, "batch_ms": batch});
+        self.row("tools, 8 reads in one reply", &m, format!("{batch:.2} ms for the reads"), data);
+        let _ = std::fs::remove_dir_all(&project);
+        Ok(())
+    }
+
+    /// Six REPL turns on a resumed 300-message session, each a read and an
+    /// answer. Between turns the user waits for the end of the turn (saving
+    /// it among other things) before the next prompt is read.
+    fn repl(&mut self, home: &Path, work: &Path) -> Result<()> {
+        const TURNS: usize = 6;
+        let project = work.join("repl");
+        project_tree(&project)?;
+        let dir = sessions_dir(home, &project);
+        let mut rng = Rng(301);
+        let history: Vec<Value> = (0..300)
+            .map(|m| {
+                let role = if m % 2 == 0 { "user" } else { "assistant" };
+                json!({"role": role, "content": sentence(&mut rng, 90, m)})
+            })
+            .collect();
+        let id = "c0ffee00c0ffee00c0ffee00c0ffee01";
+        let session = json!({"started": 1_700_000_000u64, "model": "bench/model", "history": history});
+        let mut bodies = Vec::new();
+        for t in 0..TURNS {
+            let args = json!({"path": format!("big/m{}.rs", t % 6)}).to_string();
+            let reply = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": format!("call{t}"),
+                "type": "function", "function": {"name": "read_file", "arguments": args}}]},
+                "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 40000, "completion_tokens": 5}});
+            bodies.push(format!("data: {reply}\n\ndata: [DONE]\n\n"));
+            bodies.push(say(&format!("turn {t} done")));
+        }
+        let bodies = Arc::new(bodies);
+        let input: String =
+            (0..TURNS).map(|t| format!("turn {t}: read the next file\n")).collect::<String>() + "/exit\n";
+        let (mut between, mut within, mut samples) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..=self.runs.min(5) {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join(format!("{id}.json")), session.to_string())?;
+            let mock = Mock::start(bodies.clone())?;
+            let mut cmd = self.command(home, &project, &["-c", id], Some(&mock.url));
+            cmd.stdin(Stdio::piped());
+            let s = measure_with_input(cmd, input.as_bytes())?;
+            let log = mock.stop();
+            if !s.ok || log.len() != 2 * TURNS {
+                bail!("the repl run made {} requests (exit ok: {})", log.len(), s.ok);
+            }
+            for (i, w) in log.windows(2).enumerate() {
+                let gap = (w[1].received - w[0].answered).as_secs_f64() * 1e3;
+                if i % 2 == 0 {
+                    within.push(gap)
+                } else {
+                    between.push(gap)
+                }
+            }
+            samples.push(s);
+            std::fs::remove_dir_all(&dir)?;
+        }
+        samples.remove(0);
+        let m = medians(&samples);
+        let (between, within) = (median(between), median(within));
+        let extra = format!("{between:.2} ms between turns, {within:.2} ms within");
+        let data = json!({"turns": TURNS, "between_ms": between, "within_ms": within});
+        self.row("repl, 6 turns on 300 messages", &m, extra, data);
+        let _ = std::fs::remove_dir_all(&project);
+        Ok(())
+    }
+
     /// A 5 MB answer in 50,000 deltas.
     fn stream(&mut self, home: &Path, work: &Path) -> Result<()> {
         let mut samples = Vec::new();
@@ -291,6 +408,10 @@ impl Bench {
 
     /// One rusty process with an offline environment.
     fn rusty(&self, home: &Path, work: &Path, args: &[&str], url: Option<&str>) -> Result<Sample> {
+        Ok(measure(self.command(home, work, args, url))?.0)
+    }
+
+    fn command(&self, home: &Path, work: &Path, args: &[&str], url: Option<&str>) -> Command {
         let mut cmd = Command::new(&self.binary);
         cmd.env_clear()
             .current_dir(work)
@@ -311,7 +432,7 @@ impl Bench {
         if let Some(url) = url {
             cmd.env("RUSTY_BASE_URL", url);
         }
-        Ok(measure(cmd)?.0)
+        cmd
     }
 
     /// One warm-up, then the medians of `runs` samples.
@@ -376,6 +497,62 @@ fn measure(mut cmd: Command) -> Result<(Sample, String)> {
     let cpu_ms = ms(usage.ru_utime) + ms(usage.ru_stime);
     let out = reader.map(|r| r.join().unwrap_or_default()).unwrap_or_default();
     Ok((Sample { wall_ms, cpu_ms, rss, ok }, out))
+}
+
+/// `measure`, with `input` written to the child's stdin and then closed.
+fn measure_with_input(mut cmd: Command, input: &[u8]) -> Result<Sample> {
+    let start = Instant::now();
+    let mut child = cmd.spawn().context("starting a benchmarked command")?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    stdin.write_all(input)?;
+    drop(stdin);
+    let mut status = 0;
+    // SAFETY: as in `measure`.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let pid = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut usage) };
+    let wall_ms = start.elapsed().as_secs_f64() * 1e3;
+    if pid < 0 {
+        bail!("wait4: {}", std::io::Error::last_os_error());
+    }
+    let rss = if cfg!(target_os = "macos") { usage.ru_maxrss as u64 } else { usage.ru_maxrss as u64 * 1024 };
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let ms = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+    Ok(Sample { wall_ms, cpu_ms: ms(usage.ru_utime) + ms(usage.ru_stime), rss, ok })
+}
+
+/// A small project: 40 directories of 50 short source files, and six
+/// 2,500-line files under `big/`. The same bytes on every run.
+fn project_tree(root: &Path) -> Result<()> {
+    let _ = std::fs::remove_dir_all(root);
+    let mut rng = Rng(2000);
+    for d in 0..40 {
+        let dir = root.join(format!("src/d{d:02}"));
+        std::fs::create_dir_all(&dir)?;
+        for f in 0..50 {
+            let mut text = String::new();
+            for l in 0..40 {
+                if l % 8 == 0 {
+                    text.push_str(&format!("pub fn f{f}_{l}(x: usize) -> usize {{\n"));
+                } else {
+                    text.push_str(&format!("    // {}\n", sentence(&mut rng, 10, l)));
+                }
+            }
+            std::fs::write(dir.join(format!("f{f:02}.rs")), text)?;
+        }
+    }
+    std::fs::create_dir_all(root.join("big"))?;
+    for m in 0..6 {
+        let mut text = String::new();
+        for l in 0..2500 {
+            if l % 25 == 0 {
+                text.push_str(&format!("pub fn item{m}_{l}(input: &str) -> Option<String> {{\n"));
+            } else {
+                text.push_str(&format!("    let v{l} = \"{}\";\n", sentence(&mut rng, 6, l)));
+            }
+        }
+        std::fs::write(root.join(format!("big/m{m}.rs")), text)?;
+    }
+    Ok(())
 }
 
 /// The median of each measure; `ok` only if every run succeeded.

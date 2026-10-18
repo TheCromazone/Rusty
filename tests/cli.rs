@@ -1515,6 +1515,59 @@ fn tool_reply(name: &str, args: serde_json::Value) -> serde_json::Value {
         "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
 }
 
+/// Several calls in one reply: reads may run side by side, but every result
+/// comes back under its own call, in order, and a read after a write sees
+/// the write. A read that needs approval keeps its place and its refusal.
+#[test]
+fn reads_in_one_reply_come_back_in_order_and_after_earlier_writes() {
+    let s = Sandbox::new("read-batch");
+    for (name, text) in [("a.txt", "alpha\n"), ("b.txt", "bravo\n"), ("d.txt", "delta\n")] {
+        std::fs::write(s.project.join(name), text).unwrap();
+    }
+    let calls = [
+        ("read_file", serde_json::json!({"path": "a.txt"})),
+        ("read_file", serde_json::json!({"path": "b.txt"})),
+        ("write_file", serde_json::json!({"path": "c.txt", "content": "charlie\n"})),
+        ("read_file", serde_json::json!({"path": "c.txt"})),
+        ("glob", serde_json::json!({"pattern": "*.txt"})),
+        ("read_file", serde_json::json!({"path": "~/.aws/credentials"})),
+        ("read_file", serde_json::json!({"path": "d.txt"})),
+        ("list_files", serde_json::json!({"path": "."})),
+    ];
+    let calls: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (name, args))| {
+            serde_json::json!({"index": i, "id": format!("call{i}"), "type": "function",
+                "function": {"name": name, "arguments": args.to_string()}})
+        })
+        .collect();
+    let batch = serde_json::json!({"choices": [{"delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}});
+    let (_, _, requests) = scripted_run(
+        &s,
+        &["--memory", "off", "--mode", "standard", "--permissions", "auto", "read them"],
+        vec![batch, text_reply("ok")],
+    );
+    assert_eq!(requests.len(), 2);
+    let results: Vec<(String, String)> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(|m| (m["tool_call_id"].as_str().unwrap().to_string(), m["content"].as_str().unwrap().to_string()))
+        .collect();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, (0..8).map(|i| format!("call{i}")).collect::<Vec<_>>());
+    let text = |i: usize| results[i].1.as_str();
+    assert!(text(0).contains("alpha") && text(1).contains("bravo"), "{results:?}");
+    assert!(text(2).starts_with("wrote 1 lines to c.txt"), "{}", text(2));
+    assert!(text(3).contains("charlie"), "the read after the write sees it: {}", text(3));
+    assert!(text(4).contains("c.txt") && text(7).contains("c.txt"), "{results:?}");
+    assert!(text(5).starts_with("error:") && text(5).contains("approval"), "{}", text(5));
+    assert!(text(6).contains("delta"), "{}", text(6));
+}
+
 #[test]
 fn careful_goal_gets_one_checker_review_then_closes() {
     let s = Sandbox::new("careful-goal");
