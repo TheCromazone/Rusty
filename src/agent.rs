@@ -158,11 +158,45 @@ pub enum GoalStatus {
     Blocked(String),
 }
 
+/// Why an explicit goal invocation stopped. Saved text never resumes work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStopReason {
+    Done,
+    Blocked,
+    Paused,
+    Interrupted,
+    TurnLimit,
+    Stalled,
+    Error,
+}
+
+impl GoalStopReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+            Self::Paused => "paused",
+            Self::Interrupted => "interrupted",
+            Self::TurnLimit => "turn_limit",
+            Self::Stalled => "stalled",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Goal {
     pub objective: String,
     pub status: GoalStatus,
+    /// Lifetime turns started, including interrupted or failed attempts.
     pub turns: u32,
+    #[serde(default)]
+    pub run_turns: u32,
+    #[serde(default)]
+    pub run_limit: u32,
+    #[serde(default)]
+    pub stop_reason: Option<GoalStopReason>,
     /// One checker attempt per goal, including after saving and resuming.
     #[serde(default)]
     pub checker_used: bool,
@@ -2264,9 +2298,12 @@ impl Agent {
         }
         // How this run ends, not how an earlier goal in the process did.
         self.goal_end = None;
-        let result = self.drive_goal(objective);
+        let mut result = self.drive_goal(objective);
         if result.is_err() && self.goal.is_some() && self.goal_end.is_none() {
-            self.goal_end = Some("error");
+            if let Err(checkpoint) = self.checkpoint_goal(Some(GoalStopReason::Error)) {
+                result =
+                    result.map_err(|original| original.context(format!("goal stop checkpoint failed: {checkpoint:#}")));
+            }
         }
         self.learn_from_goal(first);
         result
@@ -2280,6 +2317,9 @@ impl Agent {
                     objective: obj.to_string(),
                     status: GoalStatus::Active,
                     turns: 0,
+                    run_turns: 0,
+                    run_limit: 0,
+                    stop_reason: None,
                     checker_used: false,
                     check: self.goal_check.clone(),
                 });
@@ -2303,6 +2343,20 @@ impl Agent {
                 }
             },
         };
+        let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+        if max_turns == 0 {
+            if let Some(objective) = objective {
+                // No run_turn will record this request. Keep the zero-work
+                // goal discoverable and resumable in the session catalog.
+                self.history.push(json!({"role":"user", "content":objective}));
+            }
+        }
+        if let Some(g) = &mut self.goal {
+            g.run_turns = 0;
+            g.run_limit = max_turns;
+            g.stop_reason = None;
+        }
+        self.save_session()?;
         println!("{} {}", ui::accent("◎ goal"), ui::bold(&self.goal.as_ref().unwrap().objective));
         if !self.mode_fixed {
             let (mode, why) = self.pick_mode(&self.goal.as_ref().unwrap().objective.clone());
@@ -2311,46 +2365,62 @@ impl Agent {
         }
         self.checker_owed =
             self.execution_mode == ExecutionMode::Careful && !self.goal.as_ref().is_some_and(|g| g.checker_used);
-        let max_turns: u32 = std::env::var("RUSTY_GOAL_MAX_TURNS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         let mut stalls_in_a_row = 0;
         loop {
-            let finished = self.run_turn(&prompt)?;
+            let Some(g) = &mut self.goal else { return Ok(()) };
+            if g.run_turns >= max_turns {
+                println!(
+                    "{}",
+                    ui::warn(&format!("  goal paused after {max_turns} turns this run. /goal resume to continue"))
+                );
+                self.checkpoint_goal(Some(GoalStopReason::TurnLimit))?;
+                return Ok(());
+            }
+            // Count before execution so interruption or a failed request does
+            // not make an attempted turn free, including after a restart.
+            g.turns = g.turns.saturating_add(1);
+            g.run_turns += 1;
             self.save_session()?;
+            let finished = self.run_turn(&prompt)?;
             stalls_in_a_row = if self.last_turn_stalled { stalls_in_a_row + 1 } else { 0 };
             if stalls_in_a_row == 3 {
                 // An unfinished goal, not an error: the harness contract
                 // gives it exit status 2, and the goal stays open.
                 eprintln!("{}", ui::warn("the goal stalled three turns in a row; task completion is unconfirmed"));
-                self.goal_end = Some("stalled");
+                self.checkpoint_goal(Some(GoalStopReason::Stalled))?;
                 return Ok(());
             }
-            let Some(g) = &mut self.goal else { return Ok(()) };
-            g.turns += 1;
             if !finished || signal::interrupted() {
-                self.goal_end = Some(if signal::interrupted() { "interrupted" } else { "paused" });
+                self.checkpoint_goal(Some(if signal::interrupted() {
+                    GoalStopReason::Interrupted
+                } else {
+                    GoalStopReason::Paused
+                }))?;
                 println!("{}", ui::warn("  goal paused. /goal resume to continue"));
                 return Ok(());
             }
+            let Some(g) = &self.goal else { return Ok(()) };
             match &g.status {
                 GoalStatus::Done(ev) => {
                     println!("{} {}\n", ui::ok("◉ goal done"), ev);
-                    self.goal_end = Some("done");
+                    self.checkpoint_goal(Some(GoalStopReason::Done))?;
                     return Ok(());
                 }
                 GoalStatus::Blocked(why) => {
                     println!("{} {}\n", ui::warn("◌ goal blocked"), why);
-                    self.goal_end = Some("blocked");
+                    self.checkpoint_goal(Some(GoalStopReason::Blocked))?;
                     return Ok(());
                 }
                 GoalStatus::Active => {}
             }
-            if g.turns >= max_turns {
-                println!("{}", ui::warn(&format!("  goal paused after {max_turns} turns. /goal resume to continue")));
-                self.goal_end = Some("turn_limit");
-                return Ok(());
+            let at_limit = g.run_turns >= max_turns;
+            let next_turn = g.turns.saturating_add(1);
+            self.save_session()?;
+            if at_limit {
+                continue;
             }
             let open = self.plan.iter().filter(|p| p.status != "done").count();
-            println!("{}", ui::dim(&format!("  ↻ goal turn {}: not closed yet, continuing", g.turns + 1)));
+            println!("{}", ui::dim(&format!("  ↻ goal turn {next_turn}: not closed yet, continuing")));
             prompt = format!(
                 "{}The goal is not closed yet ({open} plan items open). Keep going: pick the next step, do it, verify \
                  it. If everything is done and verified, call goal_done with evidence. If you are blocked on the \
@@ -2358,6 +2428,14 @@ impl Agent {
                 context::NOTE
             );
         }
+    }
+
+    fn checkpoint_goal(&mut self, reason: Option<GoalStopReason>) -> Result<()> {
+        self.goal_end = reason.map(GoalStopReason::name);
+        if let Some(g) = &mut self.goal {
+            g.stop_reason = reason;
+        }
+        self.save_session()
     }
 
     /// Credits or charges the lessons a goal used by its last fixed check
@@ -3156,6 +3234,19 @@ fn ask_user(why: &str, destructive: bool) -> Answer {
 #[cfg(test)]
 mod stable_prompt_tests {
     use super::*;
+
+    #[test]
+    fn goal_allowance_legacy_sessions_keep_lifetime_counts_without_inventing_a_stop() {
+        let goal: Goal =
+            serde_json::from_value(json!({"objective":"continue work", "status":"Active", "turns":7})).unwrap();
+        assert_eq!(goal.turns, 7);
+        assert_eq!((goal.run_turns, goal.run_limit), (0, 0));
+        assert_eq!(goal.stop_reason, None);
+        assert!(serde_json::from_value::<Goal>(
+            json!({"objective":"work", "status":"Active", "turns":7, "stop_reason":"arbitrary command"})
+        )
+        .is_err());
+    }
 
     fn agent() -> Agent {
         let endpoint = crate::llm::Endpoint::new(

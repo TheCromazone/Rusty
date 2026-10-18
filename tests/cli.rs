@@ -3078,6 +3078,9 @@ fn ctrl_c_cancels_and_reaps_an_owned_command_before_export() {
     let trace: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(s.home.join("interrupted.json")).unwrap()).unwrap();
     assert_eq!(trace["activities"][0]["status"], "Interrupted");
+    assert_eq!(trace["goal"]["turns"], 1, "interrupted partial turns count as attempted");
+    assert_eq!(trace["goal"]["run_turns"], 1);
+    assert_eq!(trace["goal"]["stop_reason"], "interrupted");
     assert_eq!(trace["verification"].as_array().unwrap().len(), 0);
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "shell leader must be reaped");
 }
@@ -5971,4 +5974,119 @@ fn completion_contract_interactive_goal_uses_user_fixed_pinned_check() {
     assert_eq!(trace["verification"][0]["outcome"], "Passed");
     assert!(String::from_utf8_lossy(&out.stdout).contains("verified:"));
     assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[test]
+fn goal_allowance_resets_only_on_explicit_invocation_and_checkpoints_limits() {
+    for limit in [0usize, 1, 2] {
+        let s = Sandbox::new(&format!("goal-allowance-{limit}"));
+        std::fs::write(s.project.join("check.py"), "assert True\n").unwrap();
+        let (url, server) = scripted_endpoint(vec![text_reply("Work remains open."); limit * 2]);
+        let first = s.home.join("first.json");
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", limit.to_string())
+            .env("RUSTY_RETRY_SECS", "1")
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--yolo", "--trajectory"])
+            .arg(&first)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.take().unwrap(),
+            "/goal verify python3 -B check.py\n/goal pin check.py\n/goal inspect this fixture\n/goal resume\n/exit"
+        )
+        .unwrap();
+        let out = wait(child, Duration::from_secs(20));
+        assert!(out.status.success(), "limit {limit}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(server.join().unwrap().len(), limit * 2, "actual requests at limit {limit}");
+        let before: serde_json::Value = serde_json::from_slice(&std::fs::read(first).unwrap()).unwrap();
+        assert_eq!(before["goal"]["turns"], limit * 2);
+        assert_eq!(before["goal"]["run_turns"], limit);
+        assert_eq!(before["goal"]["run_limit"], limit);
+        assert_eq!(before["goal"]["stop_reason"], "turn_limit");
+        assert_eq!(before["goal_end"], "turn_limit");
+        assert_eq!(before["goal_outcome"], "incomplete");
+
+        let (url, server) = scripted_endpoint(vec![text_reply("Still working."); limit]);
+        let second = s.home.join("second.json");
+        let mut child = s
+            .cmd()
+            .env("RUSTY_BASE_URL", url)
+            .env("RUSTY_GOAL_MAX_TURNS", limit.to_string())
+            .env("RUSTY_RETRY_SECS", "1")
+            .args(["--mode", "standard", "--agents", "off", "--memory", "off", "--yolo", "--continue", "--trajectory"])
+            .arg(&second)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "/goal status\n/goal resume\n/exit").unwrap();
+        let out = wait(child, Duration::from_secs(20));
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(server.join().unwrap().len(), limit, "restart never replays a goal before explicit resume");
+        let shown = String::from_utf8_lossy(&out.stdout);
+        assert!(shown.contains("last stop: turn limit") && shown.contains("lifetime turns"), "{shown}");
+        let after: serde_json::Value = serde_json::from_slice(&std::fs::read(second).unwrap()).unwrap();
+        assert_eq!(after["goal"]["turns"], limit * 3);
+        assert_eq!(after["goal"]["run_turns"], limit);
+        assert_eq!(after["goal"]["run_limit"], limit);
+        assert_eq!(after["goal"]["stop_reason"], "turn_limit");
+        assert_eq!(after["goal"]["check"], before["goal"]["check"], "resume retains pinned acceptance");
+        assert!(after["verification"].as_array().unwrap().is_empty());
+        let path = std::fs::read_dir(sessions_dir(&s))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json") && p.file_stem().unwrap().len() == 32)
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["goal"], after["goal"], "checkpoint includes final counters and stop transition");
+    }
+}
+
+#[test]
+fn goal_allowance_does_not_reset_a_finite_resource_budget() {
+    let s = Sandbox::new("goal-allowance-budget");
+    let ledger = s.home.join("ledger.json");
+    let (url, server) = scripted_endpoint(vec![text_reply("Keep working."); 3]);
+    let path = s.home.join("trace.json");
+    let mut child = s
+        .cmd()
+        .env("RUSTY_BASE_URL", url)
+        .env("RUSTY_GOAL_MAX_TURNS", "2")
+        .env("RUSTY_BUDGET_LEDGER", &ledger)
+        .env("RUSTY_RETRY_SECS", "1")
+        .args([
+            "--mode",
+            "standard",
+            "--agents",
+            "off",
+            "--memory",
+            "off",
+            "--yolo",
+            "--max-requests",
+            "3",
+            "--trajectory",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "/goal inspect this fixture\n/goal resume\n/exit").unwrap();
+    let out = wait(child, Duration::from_secs(20));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(server.join().unwrap().len(), 3, "resume cannot buy another resource allowance");
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(trace["goal"]["turns"], 4, "the denied partial turn is still attempted");
+    assert_eq!(trace["goal"]["run_turns"], 2);
+    assert_eq!(trace["goal"]["stop_reason"], "error");
+    let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(ledger).unwrap()).unwrap();
+    assert_eq!(ledger["requests"], 3);
+    assert!(ledger["denied_requests"].as_u64().unwrap() >= 1);
 }

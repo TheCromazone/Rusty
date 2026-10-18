@@ -1258,3 +1258,27 @@ Before comparing model quality, run the existing hidden-graded tasks with
 verification and careful review independently toggled, identical starting
 files/model/total budgets, and repeated trials. Report external pass rate,
 false completion, latency and total lead-plus-worker usage separately.
+
+
+### Goal invocation allowance (contract 4)
+
+`RUSTY_GOAL_MAX_TURNS` (default 25) bounds each explicit new goal or
+`/goal resume` invocation. Zero creates a saved, discoverable goal and pauses
+before any turn or model request. Resume does not run automatically on load.
+Each invocation starts a fresh turn allowance; the existing model resource
+budget and optional persisted ledger are not reset.
+
+`goal.turns` counts lifetime turn attempts and never resets on resume. An
+attempt is counted and checkpointed before `run_turn`, including a later
+interruption, failure, or resource denial. It does not imply a successful
+model request. `goal.run_turns` and `goal.run_limit` describe the latest
+invocation. The saved `goal.stop_reason` is one of `done`, `blocked`,
+`paused`, `interrupted`, `turn_limit`, `stalled`, or `error`. Older sessions
+without these fields retain their lifetime count and have no known saved
+stop reason. `/goal status` exposes these values. A saved reason is diagnostic
+context, not permission to resume work, replay commands or restore processes.
+
+Counters are checkpointed before execution and after the stop transition.
+A crash between checkpoints can leave a started attempt without a stop reason;
+its effects need inspection. Pinned criteria, checker usage, verification
+freshness and permission decisions retain their existing contracts.

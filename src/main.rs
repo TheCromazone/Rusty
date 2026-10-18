@@ -542,7 +542,7 @@ fn joined<T>(probe: std::thread::JoinHandle<T>) -> T {
 
 /// Bumped when a harness-facing flag, exit code or `--stats` key changes
 /// meaning (docs/VERIFICATION.md, "Harness contract").
-const CONTRACT: u32 = 3;
+const CONTRACT: u32 = 4;
 
 /// What this build accepts, so a harness can refuse an unsupported setting
 /// before any model call. Each list is filtered through the parser that
@@ -1134,7 +1134,15 @@ fn command(agent: &mut Agent, client: &Arc<Client>, cwd: &Path, settings: &mut S
                     println!(
                         "  goal {}\n  {}",
                         ui::bold(&g.objective),
-                        ui::dim(&format!("{status} · {} turns", g.turns))
+                        ui::dim(&format!(
+                            "{status} · {}/{} turns this run · {} lifetime turns{}",
+                            g.run_turns,
+                            g.run_limit,
+                            g.turns,
+                            g.stop_reason
+                                .map(|reason| format!(" · last stop: {}", reason.name().replace('_', " ")))
+                                .unwrap_or_default()
+                        ))
                     );
                 }
                 None => println!("{}", ui::dim("  no goal. /goal <objective> to start one")),
