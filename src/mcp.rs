@@ -9,8 +9,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Error, Result};
@@ -69,6 +70,8 @@ struct Server {
     child: Child,
     stdin: ChildStdin,
     lines: Receiver<Result<String, String>>,
+    reader_stop: Arc<AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
     next_id: u64,
     tools: Vec<Tool>,
     /// Features the server offers that rusty doesn't use.
@@ -278,30 +281,55 @@ impl Server {
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         // A reader thread, so a silent server can never block past a deadline.
         let (tx, lines) = mpsc::sync_channel(QUEUED_FRAMES);
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            loop {
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let mut server = Self {
+            name: name.to_string(),
+            child,
+            stdin,
+            lines,
+            reader_stop: reader_stop.clone(),
+            reader: None,
+            next_id: 1,
+            tools: Vec::new(),
+            ignored: Vec::new(),
+        };
+        for fd in [server.stdin.as_raw_fd(), stdout.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("setting MCP pipes nonblocking");
+            }
+        }
+        server.reader = Some(std::thread::spawn(move || {
+            let mut reader = BufReader::new(Reader { stdout, stop: reader_stop.clone() });
+            'frames: loop {
                 let line = read_frame(&mut reader);
+                if reader_stop.load(Ordering::Acquire) {
+                    break;
+                }
                 let done = !matches!(&line, Ok(Some(_)));
-                let message = match line {
+                let mut message = match line {
                     Ok(Some(line)) => Ok(line),
                     Ok(None) => break,
                     Err(e) => Err(e.to_string()),
                 };
-                // Backpressure bounds retained output; dropping the receiver
-                // unblocks the reader even when the queue is full.
-                if tx.send(message).is_err() || done {
+                loop {
+                    if reader_stop.load(Ordering::Acquire) {
+                        break 'frames;
+                    }
+                    match tx.try_send(message) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Disconnected(_)) => break 'frames,
+                        Err(mpsc::TrySendError::Full(value)) => {
+                            message = value;
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                if done {
                     break;
                 }
             }
-        });
-        let server =
-            Self { name: name.to_string(), child, stdin, lines, next_id: 1, tools: Vec::new(), ignored: Vec::new() };
-        let fd = server.stdin.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(std::io::Error::last_os_error()).context("setting MCP input nonblocking");
-        }
+        }));
         Ok(server)
     }
 
@@ -362,11 +390,7 @@ impl Server {
     }
 
     fn send(&mut self, message: &Value, deadline: Instant) -> Result<()> {
-        let mut bytes = serde_json::to_vec(message)?;
-        if bytes.len() >= MAX_FRAME {
-            bail!("MCP request exceeds 4 MiB");
-        }
-        bytes.push(b'\n');
+        let bytes = encode_frame(message)?;
         let mut rest = bytes.as_slice();
         while !rest.is_empty() {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -424,6 +448,53 @@ impl Server {
     }
 }
 
+/// Polling permits shutdown even if an escaped descendant retains stdout.
+struct Reader {
+    stdout: std::process::ChildStdout,
+    stop: Arc<AtomicBool>,
+}
+impl Read for Reader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "MCP reader stopped"));
+            }
+            match self.stdout.read(bytes) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fd = libc::pollfd { fd: self.stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    let status = unsafe { libc::poll(&mut fd, 1, 50) };
+                    if status < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// Cap serialization while writing, including JSON escape expansion.
+fn encode_frame(message: &Value) -> Result<Vec<u8>> {
+    struct Frame(Vec<u8>);
+    impl Write for Frame {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_FRAME - 1).saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("MCP request exceeds 4 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut frame = Frame(Vec::new());
+    serde_json::to_writer(&mut frame, message)?;
+    frame.0.push(b'\n');
+    Ok(frame.0)
+}
+
 /// Limit before allocating or parsing, including output without a newline.
 fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
     let mut bytes = Vec::new();
@@ -439,6 +510,7 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        self.reader_stop.store(true, Ordering::Release);
         // A launcher may exit before its server. Reap the child and stop its
         // owned process group so descendants cannot retain stdout/readers.
         unsafe {
@@ -446,6 +518,9 @@ impl Drop for Server {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -753,7 +828,17 @@ mod tests {
                 class: verb_class(t),
             })
             .collect();
-        Server { name: name.into(), child, stdin, lines: mpsc::channel().1, next_id: 1, tools, ignored: Vec::new() }
+        Server {
+            name: name.into(),
+            child,
+            stdin,
+            lines: mpsc::channel().1,
+            reader_stop: Arc::new(AtomicBool::new(false)),
+            reader: None,
+            next_id: 1,
+            tools,
+            ignored: Vec::new(),
+        }
     }
 
     fn names(servers: &[Server]) -> Vec<String> {
@@ -973,5 +1058,51 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("timed out"));
         drop(server);
         assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+    }
+    #[test]
+    fn outbound_json_is_capped_during_escape_expansion() {
+        assert!(encode_frame(&json!({"data":"\u{0001}".repeat(MAX_FRAME / 4)}))
+            .unwrap_err()
+            .to_string()
+            .contains("4 MiB"));
+        let frame = encode_frame(&json!({"ok":true})).unwrap();
+        assert!(frame.ends_with(b"\n"));
+        assert_eq!(serde_json::from_slice::<Value>(&frame).unwrap(), json!({"ok":true}));
+    }
+
+    #[test]
+    fn drop_joins_reader_when_an_escaped_descendant_holds_stdout_open() {
+        struct Escaped(u32);
+        impl Drop for Escaped {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0 as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let path = std::env::temp_dir().join(format!("rusty-mcp-escaped-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let script = "import os,sys,time\nif os.fork()==0:\n os.setsid()\n with open(sys.argv[1], 'w') as f: f.write(str(os.getpid()))\n time.sleep(60)\n os._exit(0)\nos._exit(0)";
+        let cfg = ServerConfig {
+            args: vec!["-c".into(), script.into(), path.display().to_string()],
+            ..ServerConfig::default()
+        };
+        let server = Server::spawn("escaped", "python3", &cfg, Path::new(".")).unwrap();
+        let end = Instant::now() + Duration::from_secs(30);
+        let escaped = loop {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break Escaped(pid);
+                }
+            }
+            assert!(Instant::now() < end, "escaped fixture did not publish PID");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let stopped = server.reader_stop.clone();
+        drop(server);
+        assert_eq!(Arc::strong_count(&stopped), 1, "reader thread retained its cancellation state");
+        assert_eq!(unsafe { libc::kill(escaped.0 as i32, 0) }, 0, "fixture must still hold stdout");
+        drop(escaped);
+        let _ = std::fs::remove_file(path);
     }
 }
