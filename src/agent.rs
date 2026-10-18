@@ -183,7 +183,7 @@ enum Authorization {
 
 fn refusal_from_answer() -> RefusalKind {
     use std::io::IsTerminal;
-    if std::io::stdin().is_terminal() {
+    if crate::session_worker::active() || std::io::stdin().is_terminal() {
         RefusalKind::Declined
     } else {
         RefusalKind::Unattended
@@ -1053,6 +1053,9 @@ impl Agent {
     pub fn run_turn(&mut self, user: &str) -> Result<bool> {
         self.turn_stop = TurnStop::StepLimit;
         self.history.push(json!({"role": "user", "content": user}));
+        if crate::session_worker::active() {
+            self.save_session()?;
+        }
         let query = match &self.goal {
             Some(g) => format!("{user} {}", g.objective),
             None => user.to_string(),
@@ -1533,6 +1536,7 @@ impl Agent {
         if let Some(p) = &self.progress {
             p.fetch_add(1, Ordering::Relaxed);
         }
+        let _tool_scope = crate::session_worker::ToolScope::enter();
         d.tool(&call.name, &args);
         let result = match call.name.as_str() {
             "bash_start" | "bash_wait" | "bash_cancel" => self.run_activity(&call.name, &args, d),
@@ -1633,6 +1637,9 @@ impl Agent {
             Authorization::Allowed(approval) => approval,
             Authorization::Refused { kind, message } => return Err(refusal_error(kind, message)),
         };
+        if crate::session_worker::active() && signal::interrupted() {
+            bail!("stopped before tool execution");
+        }
         if name == "bash" {
             return self.run_bash(args, &approval, d);
         }
@@ -1687,6 +1694,26 @@ impl Agent {
         Ok(serde_json::to_string(&record)?)
     }
 
+    fn ask_approval(&self, name: &str, args: &Value, why: &str, destructive: bool) -> Answer {
+        if crate::session_worker::active() {
+            let requester = self.board.as_ref().map(|(_, _, _, label)| label.as_str()).unwrap_or(self.request_role);
+            return match crate::session_worker::approve(
+                name,
+                args,
+                &self.cwd,
+                why,
+                destructive,
+                &self.policy,
+                (&self.backend.identity(&self.cwd), requester),
+            ) {
+                Ok(true) => Answer::Yes,
+                Ok(false) => Answer::No(None),
+                Err(reason) => Answer::Unavailable(reason),
+            };
+        }
+        ask_user(why, destructive)
+    }
+
     fn authorize(&mut self, name: &str, args: &Value, d: &mut Display) -> Result<Authorization> {
         let mut approval = self.backend.decide(name, args, &self.policy, &self.cwd)?;
         match approval.clone() {
@@ -1709,8 +1736,13 @@ impl Agent {
                     println!("{} {}", ui::info("▸"), tools::summary(name, args));
                 }
                 print!("{}", tools::preview(name, args));
-                match ask_user(&why, true) {
+                match self.ask_approval(name, args, &why, true) {
                     Answer::Yes | Answer::Always => {}
+                    Answer::Unavailable(reason) => {
+                        self.refused(name, args, "unavailable", reason);
+                        return Ok(Authorization::Refused { kind: RefusalKind::Denied,
+                            message: format!("{reason}; the user did not decline this call. Inspect state and request fresh authorization before retrying.") });
+                    }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", &why);
                         return Ok(Authorization::Refused {
@@ -1735,7 +1767,7 @@ impl Agent {
                     println!("{} {}", ui::info("▸"), tools::summary(name, args));
                 }
                 print!("{}", tools::preview(name, args));
-                match ask_user(&why, false) {
+                match self.ask_approval(name, args, &why, false) {
                     Answer::Yes => {}
                     Answer::Always => {
                         let rule = Policy::suggest_rule(name, args);
@@ -1743,6 +1775,11 @@ impl Agent {
                         self.policy.allow.push(rule);
                         self.policy.save();
                         approval = Verdict::Allow;
+                    }
+                    Answer::Unavailable(reason) => {
+                        self.refused(name, args, "unavailable", reason);
+                        return Ok(Authorization::Refused { kind: RefusalKind::Denied,
+                            message: format!("{reason}; the user did not decline this call. Inspect state and request fresh authorization before retrying.") });
                     }
                     Answer::No(None) => {
                         self.refused(name, args, "declined", "");
@@ -1761,10 +1798,18 @@ impl Agent {
                 }
             }
         }
+        if crate::session_worker::active() && signal::interrupted() {
+            bail!("stopped before tool authorization completed");
+        }
+        if crate::session_worker::active() {
+            let requester = self.board.as_ref().map(|(_, _, _, label)| label.as_str()).unwrap_or(self.request_role);
+            crate::session_worker::tool_started(name, args, requester)?;
+        }
         Ok(Authorization::Allowed(approval))
     }
 
     fn check_goal(&mut self, check: &CheckSpec, d: &mut Display) -> Result<CheckRecord> {
+        let _tool_scope = crate::session_worker::ToolScope::enter();
         check.validate()?;
         if self.backend.name() != "local" || std::env::current_dir()?.canonicalize()? != self.cwd.canonicalize()? {
             bail!("fixed verification needs the current local workspace; no fallback or replay");
@@ -2931,6 +2976,7 @@ enum Answer {
     Yes,
     Always,
     No(Option<String>),
+    Unavailable(&'static str),
 }
 
 /// Destructive calls normally need a person every time. A disposable sandbox
@@ -2939,7 +2985,8 @@ enum Answer {
 /// interactive session or the other permission modes.
 fn unattended_destructive(mode: crate::permissions::Mode) -> bool {
     use std::io::IsTerminal;
-    mode == crate::permissions::Mode::Yolo
+    !crate::session_worker::active()
+        && mode == crate::permissions::Mode::Yolo
         && std::env::var("RUSTY_ALLOW_DESTRUCTIVE").is_ok_and(|v| v.trim() == "1")
         && !std::io::stdin().is_terminal()
 }

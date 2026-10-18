@@ -14,11 +14,14 @@ mod execution;
 mod footer;
 mod inbox;
 mod infra;
+mod inspect;
 mod llm;
 mod markdown;
 mod mcp;
 mod permissions;
+mod protocol;
 mod session;
+mod session_worker;
 mod side;
 mod signal;
 mod skills;
@@ -55,6 +58,15 @@ struct Cli {
     /// Private endpoint for the Daytona tool bridge; no model or memory required
     #[arg(long, hide = true)]
     tool_rpc: bool,
+    /// Private native-app session engine (no terminal UI).
+    #[arg(long, hide = true, conflicts_with = "inspect_worker")]
+    session_worker: bool,
+    /// Provider-free native-app repository inspection.
+    #[arg(long, hide = true)]
+    inspect_worker: bool,
+    /// Carry private worker frames over stdin/stdout (for SSH).
+    #[arg(long, hide = true)]
+    protocol_stdio: bool,
     /// Run this prompt once and exit. Omit for interactive mode.
     prompt: Vec<String>,
 
@@ -192,7 +204,77 @@ fn main() {
     }
 }
 
+struct WorkerStartupTrace {
+    enabled: bool,
+    started: Instant,
+    previous: Instant,
+}
+impl WorkerStartupTrace {
+    fn new(worker: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: worker && std::env::var("RUSTY_WORKER_TRACE").as_deref() == Ok("1"),
+            started: now,
+            previous: now,
+        }
+    }
+    fn phase(&mut self, name: &str) {
+        if self.enabled {
+            let now = Instant::now();
+            eprintln!(
+                "worker startup {name}: phase_ms={:.3} total_ms={:.3}",
+                now.duration_since(self.previous).as_secs_f64() * 1000.0,
+                now.duration_since(self.started).as_secs_f64() * 1000.0
+            );
+            self.previous = now;
+        }
+    }
+}
+
 fn run() -> Result<i32> {
+    let private_mode = std::env::args()
+        .take_while(|arg| arg != "--")
+        .any(|arg| matches!(arg.split('=').next().unwrap_or(""), "--session-worker" | "--inspect-worker"));
+    let mut worker_transport = None;
+    let mut trace = WorkerStartupTrace::new(private_mode);
+    let result = run_inner(private_mode, &mut worker_transport, &mut trace);
+    if let Err(error) = &result {
+        if let Some(transport) = &mut worker_transport {
+            let message = format!("{error:#}");
+            let code =
+                if message.contains("session is already open for writing") { "lease_busy" } else { "startup_failed" };
+            // The app receives a typed failure before the ordinary stderr diagnostic.
+            if let Err(report) = transport.startup_failed(code, &message) {
+                eprintln!("worker startup failure could not be reported: {report:#}");
+            }
+        }
+        trace.phase("failed");
+    }
+    result
+}
+
+fn run_inner(
+    private_mode: bool,
+    worker_transport: &mut Option<session_worker::Transport>,
+    trace: &mut WorkerStartupTrace,
+) -> Result<i32> {
+    if private_mode {
+        let cli = Cli::parse();
+        *worker_transport = Some(session_worker::Transport::open(cli.protocol_stdio)?);
+        trace.phase("transport_hello");
+        if let Some(dir) = &cli.dir {
+            std::env::set_current_dir(dir)?;
+        }
+        if cli.inspect_worker {
+            let root = std::env::current_dir()?.canonicalize()?;
+            trace.phase("inspect_root");
+            return session_worker::inspect(worker_transport.take().expect("opened transport"), &root);
+        }
+        // This process is never an unattended harness. Scrub before dotenv and
+        // again afterwards; worker authorization also rejects the bypass.
+        session_worker::activate();
+        std::env::remove_var("RUSTY_ALLOW_DESTRUCTIVE");
+    }
     // The sandbox's tool endpoint must never load model keys from dotenv.
     if std::env::args().take_while(|arg| arg != "--").any(|arg| arg == "--tool-rpc") {
         let cli = Cli::parse();
@@ -203,8 +285,11 @@ fn run() -> Result<i32> {
         return backend::serve_rpc();
     }
     config::load_env();
+    if session_worker::active() {
+        std::env::remove_var("RUSTY_ALLOW_DESTRUCTIVE");
+    }
     let mut cli = Cli::parse();
-    if let Some(d) = &cli.dir {
+    if let Some(d) = cli.dir.as_ref().filter(|_| worker_transport.is_none()) {
         std::env::set_current_dir(d).map_err(|e| anyhow!("cannot enter {}: {e}", d.display()))?;
     }
     let cwd = std::env::current_dir()?.canonicalize()?;
@@ -219,8 +304,11 @@ fn run() -> Result<i32> {
         return Ok(if ok { 0 } else { 1 });
     }
 
+    trace.phase("environment_and_directory");
     let mut settings = Settings::load();
+    trace.phase("settings");
     let backend = backend::Backend::connect(cli.tools.as_deref().unwrap_or(&settings.tools))?;
+    trace.phase("backend");
     if let Some(query) = &cli.sessions {
         // Unquoted words all belong to the search: `rusty --sessions fix parser`.
         let query = std::iter::once(query).chain(&cli.prompt).map(String::as_str).collect::<Vec<_>>().join(" ");
@@ -281,6 +369,7 @@ fn run() -> Result<i32> {
         client = client.with_budget(limits, ledger.as_deref())?;
     }
     let client = Arc::new(client);
+    trace.phase("client_configuration");
     if cli.list_models {
         for m in client.list_models()? {
             println!("{m}");
@@ -306,9 +395,9 @@ fn run() -> Result<i32> {
     use rusty::advisor::Level;
     let memory_level = Level::parse(&cli.memory);
     let advisor_probe = memory_level
-        .filter(|level| level.advises())
+        .filter(|level| level.advises() && !session_worker::active())
         .map(|level| std::thread::spawn(move || rusty::advisor::Hooks::connect(&global, &identity, level)));
-    let window_probe = cli.context_tokens.is_none().then(|| {
+    let window_probe = (cli.context_tokens.is_none() && !session_worker::active()).then(|| {
         let (client, model) = (client.clone(), model.clone());
         std::thread::spawn(move || client.context_window(&model))
     });
@@ -322,16 +411,20 @@ fn run() -> Result<i32> {
         agent.infra.target = joined(target);
     }
     agent.set_backend(backend)?;
+    trace.phase("agent_and_backend");
     if agent.backend.name() == "local" {
         agent.snapshot = snapshot_probe.map(joined).unwrap_or_default();
         agent.start_blobs = blobs_probe.and_then(joined);
+        trace.phase("workspace_snapshot");
         agent.mcp = mcp::Mcp::load(&cwd)?;
+        trace.phase("mcp");
         if !agent.mcp.is_empty() {
             println!("{} {}", ui::dim("◇ mcp"), ui::dim(&agent.mcp.summary()));
         }
     }
     agent.memory_level =
         memory_level.ok_or_else(|| anyhow!("unknown memory level `{}` ({})", cli.memory, Level::NAMES))?;
+    // Session workers connect the advisor lazily when the first run starts.
     if let Some(advisor) = advisor_probe {
         match joined(advisor) {
             Ok(h) => agent.advisor = Some(h),
@@ -341,8 +434,15 @@ fn run() -> Result<i32> {
             }
         }
     }
+    trace.phase("memory_configuration");
     agent.meter = match cli.context_tokens {
         Some(n) => context::Meter::new(n as usize, "flag"),
+        // An app can pin a context size; otherwise use the local table/default.
+        // A slow /models endpoint must never delay a worker's ready handshake.
+        None if session_worker::active() => match settings.context_windows.get(&agent.model) {
+            Some(&n) => context::Meter::new(n, "table"),
+            None => context::Meter::default(),
+        },
         None => match window_probe.and_then(joined) {
             Some(n) => context::Meter::new(n, "endpoint"),
             None => match settings.context_windows.get(&agent.model) {
@@ -360,6 +460,7 @@ fn run() -> Result<i32> {
             },
         },
     };
+    trace.phase("context_configuration");
     // Unchosen, compaction follows the window (aggressive below 48k), and so
     // does the history cap, whatever the mode (128k above a 200k window).
     let chosen_compaction = cli.compaction.clone().or_else(|| settings.compaction.clone());
@@ -406,7 +507,11 @@ fn run() -> Result<i32> {
     // Checked once the mode is known, since the reply reserve depends on it.
     if let Some(m) = agent.compaction_model.clone() {
         client.endpoint_for(&m)?;
-        agent.compaction_window = client.context_window(&m).or_else(|| settings.context_windows.get(&m).copied());
+        agent.compaction_window = if session_worker::active() {
+            settings.context_windows.get(&m).copied()
+        } else {
+            client.context_window(&m).or_else(|| settings.context_windows.get(&m).copied())
+        };
         let need = agent.largest_summary_request();
         match agent.compaction_window {
             Some(w) if w < need => {
@@ -427,39 +532,57 @@ fn run() -> Result<i32> {
         }
     }
 
+    trace.phase("execution_configuration");
     let sessions = pdir.join("sessions");
     if let Some(key) = cli.resume.clone() {
-        // Try IDs before treating an optional -c value as prompt text. This
-        // keeps legacy timestamp-hyphen IDs resumable while retaining `-c prompt`.
-        let found = if key == "latest" { Vec::new() } else { session::find(&sessions, &key)? };
-        let (entry, key) = if key == "latest" {
-            (session::latest(&sessions)?, key)
-        } else if let [entry] = found.as_slice() {
-            (Some(entry.clone()), key)
-        } else if found.len() > 1 {
-            let ids: Vec<&str> = found.iter().map(|e| e.id.as_str()).collect();
-            return Err(anyhow!("`{key}` could be {}; give more of the id", ids.join(", ")));
+        // The app already owns the exact ID returned by session.ready. An idle
+        // transcript deliberately stays out of CLI search, but must still be
+        // recoverable after a crash before the first turn was recorded.
+        let exact_worker = session_worker::active()
+            && key.len() == 32
+            && key.bytes().all(|b| b.is_ascii_hexdigit())
+            && session::path(&sessions, &key).is_file();
+        if exact_worker {
+            agent.load_session(&session::path(&sessions, &key))?;
         } else {
-            let hex = key.bytes().all(|byte| byte.is_ascii_hexdigit());
-            let legacy = key.len() >= 8
-                && key.as_bytes()[0].is_ascii_digit()
-                && key.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
-            if hex || legacy {
-                return Err(anyhow!("no session {key} here; `rusty --sessions` lists them"));
+            // Try IDs before treating an optional -c value as prompt text. This
+            // keeps legacy timestamp-hyphen IDs resumable while retaining `-c prompt`.
+            let found = if key == "latest" { Vec::new() } else { session::find(&sessions, &key)? };
+            let (entry, key) = if key == "latest" {
+                (session::latest(&sessions)?, key)
+            } else if let [entry] = found.as_slice() {
+                (Some(entry.clone()), key)
+            } else if found.len() > 1 {
+                let ids: Vec<&str> = found.iter().map(|e| e.id.as_str()).collect();
+                return Err(anyhow!("`{key}` could be {}; give more of the id", ids.join(", ")));
+            } else {
+                let hex = key.bytes().all(|byte| byte.is_ascii_hexdigit());
+                let legacy = key.len() >= 8
+                    && key.as_bytes()[0].is_ascii_digit()
+                    && key.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
+                if hex || legacy {
+                    return Err(anyhow!("no session {key} here; `rusty --sessions` lists them"));
+                }
+                cli.prompt.insert(0, key);
+                (session::latest(&sessions)?, "latest".to_string())
+            };
+            match entry {
+                Some(entry) => resume_session(&mut agent, &sessions, &entry)?,
+                None if key == "latest" => println!("{}", ui::dim("no previous session here; starting fresh")),
+                None => return Err(anyhow!("no session {key} here; `rusty --sessions` lists them")),
             }
-            cli.prompt.insert(0, key);
-            (session::latest(&sessions)?, "latest".to_string())
-        };
-        match entry {
-            Some(entry) => resume_session(&mut agent, &sessions, &entry)?,
-            None if key == "latest" => println!("{}", ui::dim("no previous session here; starting fresh")),
-            None => return Err(anyhow!("no session {key} here; `rusty --sessions` lists them")),
         }
     }
     if agent.session_path.is_none() {
         agent.new_session(&sessions)?;
     }
     agent.trajectory_path = cli.trajectory.clone();
+
+    trace.phase("session_lease_and_history");
+    if let Some(transport) = worker_transport.take() {
+        trace.phase("ready_to_serve");
+        return session_worker::serve(transport, &mut agent);
+    }
 
     // Headless modes.
     let started = Instant::now();

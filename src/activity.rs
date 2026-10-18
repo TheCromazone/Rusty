@@ -140,12 +140,16 @@ impl Activities {
         let worker_cancel = cancel.clone();
         let command = command.to_string();
         let (tx, rx) = mpsc::channel();
+        crate::session_worker::bind_activity(&id)?;
+        let activity_id = id.clone();
         let thread = std::thread::Builder::new()
             .name("owned-shell".into())
             .spawn(move || {
                 let result = tools::run_cancellable(&command, Duration::from_secs(timeout), &worker_cancel);
+                crate::session_worker::activity_finished(&activity_id);
                 let _ = tx.send(result);
             })
+            .inspect_err(|_| crate::session_worker::activity_finished(&id))
             .context("start shell owner")?;
         self.entries.insert(id, Entry { record: record.clone(), started, cancel, rx, thread: Some(thread) });
         Ok(record)

@@ -19,6 +19,10 @@ thread_local! { static ACTIVE_FOOTER: RefCell<Weak<RefCell<crate::footer::Footer
 /// Runtime side results use the terminal owner's footer rather than painting
 /// a second progress panel over the active turn.
 pub fn notice(text: &str) {
+    if crate::session_worker::active() {
+        crate::session_worker::display("notice", serde_json::json!({"text":text}));
+        return;
+    }
     ACTIVE_FOOTER.with(|f| {
         if let Some(footer) = f.borrow().upgrade() {
             footer.borrow_mut().clear(&mut std::io::stdout());
@@ -83,6 +87,7 @@ pub struct TurnStats {
 
 pub struct Display {
     quiet: bool,
+    emit_events: bool,
     verb: &'static str,
     started: Instant,
     last_draw: Instant,
@@ -118,7 +123,8 @@ impl Display {
             ACTIVE_FOOTER.with(|f| *f.borrow_mut() = Rc::downgrade(&footer));
         }
         Self {
-            quiet,
+            quiet: quiet || crate::session_worker::active(),
+            emit_events: !quiet && crate::session_worker::active(),
             verb: ui::VERBS[ui::rand(ui::VERBS.len())],
             started: now,
             last_draw: now - Duration::from_secs(1),
@@ -139,6 +145,9 @@ impl Display {
 
     /// Advances only the geometric rail; completed output stays in scrollback.
     pub fn tick(&mut self) {
+        if self.emit_events {
+            crate::session_worker::flush_display();
+        }
         if self.quiet || !ui::tty() || self.in_reasoning {
             return;
         }
@@ -194,6 +203,9 @@ impl Display {
     }
 
     pub fn set_status(&mut self, s: String) {
+        if self.emit_events && !s.is_empty() {
+            crate::session_worker::display("run.status", serde_json::json!({"text":s}));
+        }
         self.status = s;
     }
 
@@ -211,6 +223,9 @@ impl Display {
     }
 
     pub fn line(&mut self, s: &str) {
+        if self.emit_events {
+            crate::session_worker::display("notice", serde_json::json!({"text":s}));
+        }
         if self.quiet {
             return;
         }
@@ -220,6 +235,9 @@ impl Display {
     }
 
     pub fn reasoning(&mut self, s: &str) {
+        if self.emit_events {
+            crate::session_worker::display("reasoning.delta", serde_json::json!({"text":s}));
+        }
         if self.quiet {
             return;
         }
@@ -237,6 +255,9 @@ impl Display {
     }
 
     pub fn content(&mut self, s: &str) {
+        if self.emit_events {
+            crate::session_worker::display("message.delta", serde_json::json!({"text":s}));
+        }
         self.content.push_str(s);
         self.stats.visible_chars += s.len();
         if self.quiet {
@@ -272,6 +293,9 @@ impl Display {
     }
 
     pub fn end_stream(&mut self) {
+        if self.emit_events && !self.content.is_empty() {
+            crate::session_worker::display("message.completed", serde_json::json!({}));
+        }
         if !self.quiet && !self.line_buf.is_empty() {
             let rendered = crate::markdown::line(&self.line_buf, &mut self.in_code);
             self.append(&rendered);
@@ -288,6 +312,11 @@ impl Display {
 
     /// Called before a tool runs.
     pub fn tool(&mut self, name: &str, args: &Value) {
+        if self.emit_events {
+            let mut safe = args.clone();
+            rusty::privacy::scrub(&mut safe);
+            crate::session_worker::display("tool.proposed", serde_json::json!({"name":name,"arguments":safe}));
+        }
         let label = label(name, args);
         match name {
             "read_file" => {
@@ -322,6 +351,14 @@ impl Display {
 
     /// Called after a tool returns.
     pub fn tool_result(&mut self, name: &str, args: &Value, text: &str, ok: bool) {
+        if self.emit_events {
+            let mut safe = args.clone();
+            rusty::privacy::scrub(&mut safe);
+            crate::session_worker::display(
+                "tool.completed",
+                serde_json::json!({"name":name,"arguments":safe,"text":crate::ui::truncate(text, 16000),"ok":ok}),
+            );
+        }
         let tokens = text.len() / 4;
         *self.stats.tool_tokens.entry(name.to_string()).or_default() += tokens as u64;
         if tokens > self.stats.biggest.1 {
@@ -434,6 +471,12 @@ impl Display {
 
     /// The one-line summary printed when a turn ends.
     pub fn recap(&mut self, prompt: u64, completion: u64, context_pct: usize, interrupted: bool) {
+        if self.emit_events {
+            crate::session_worker::display(
+                "run.usage",
+                serde_json::json!({"prompt_tokens":prompt,"completion_tokens":completion,"context_pct":context_pct,"interrupted":interrupted}),
+            );
+        }
         if self.quiet {
             return;
         }
