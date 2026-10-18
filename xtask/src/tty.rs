@@ -163,7 +163,7 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     }
     let log = File::create(dest.join("input.ansi"))?;
     let mut s = Session::spawn(cmd, cols, Box::new(log), Duration::from_secs(20))?;
-    s.wait_for(&[Lit("?2004h")], "input prompt missing")?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "input prompt missing")?;
     s.drain(0.2)?;
     let wrapped = format!("USER_PROMPT_START {}pong", "wrapped input ".repeat(16));
     s.send(&wrapped)?;
@@ -174,7 +174,7 @@ fn input_capture(binary: &Path, endpoint: &str, cols: u16, dest: &Path, plain: b
     std::fs::write(dest.join("input-live.ansi"), &s.text)?;
     s.send("\r")?;
     s.wait_for(&[Lit("pong"), Space], "submitted input did not run")?;
-    s.wait_for(&[Lit("?2004h")], "next prompt missing")?;
+    s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "next prompt missing")?;
     s.drain(0.2)?;
     inspect_input(&s.text, cols, plain, indexed)?;
     s.send("/quit\r")?;
@@ -193,7 +193,10 @@ fn menu_resize_capture(binary: &Path, endpoint: &str, dest: &Path) -> Result<()>
     let log = File::create(dest.join("menu-resize.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(20))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "input prompt missing after resize")?;
+        s.wait_for(
+            &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+            "input prompt missing after resize",
+        )?;
         s.drain(0.3)
     };
     ready(&mut s)?;
@@ -253,7 +256,10 @@ fn shell_capture(binary: &Path, dest: &Path) -> Result<()> {
     let log = File::create(dest.join("direct-shell.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(10))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "input did not return after direct shell")?;
+        s.wait_for(
+            &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")],
+            "input did not return after direct shell",
+        )?;
         s.drain(0.15)
     };
     ready(&mut s)?;
@@ -403,7 +409,7 @@ pub fn approval(binary: &Path, endpoint: &str, dest: &Path) -> Result<()> {
     let log = File::create(dest.join("terminal.ansi"))?;
     let mut s = Session::spawn(cmd, 80, Box::new(log), Duration::from_secs(15))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "no prompt")?;
+        s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "no prompt")?;
         s.drain(0.4)
     };
     ready(&mut s)?;
@@ -447,7 +453,7 @@ pub fn ctrl_c(binary: &Path, cwd: &Path, endpoint: Option<(&str, &Path)>, log: B
     }
     let mut s = Session::spawn(cmd, 80, log, Duration::from_secs(90))?;
     let ready = |s: &mut Session| -> Result<()> {
-        s.wait_for(&[Lit("?2004h")], "no prompt")?;
+        s.wait_for(&[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")], "no prompt")?;
         s.drain(0.4)
     };
     ready(&mut s)?;
@@ -492,7 +498,7 @@ fn side_ctrl_c(binary: &Path, cwd: &Path, endpoint: &str, home: &Path) -> Result
         offline(&mut cmd, endpoint, &home.join(name));
         cmd
     };
-    let prompt = &[Lit("?2004h")];
+    let prompt = &[Lit("────────────────────"), Line, Space, Line, Lit("?2004h")];
 
     let mut idle = Session::spawn(command("side-idle-home"), 80, Box::new(std::io::sink()), Duration::from_secs(4))?;
     idle.wait_for(prompt, "idle-side check had no prompt")?;
