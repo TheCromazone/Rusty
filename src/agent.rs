@@ -2466,6 +2466,13 @@ impl Agent {
     /// Works on a goal across as many turns as it takes, up to a limit, then
     /// lets memory learn from how its fixed acceptance check ended.
     pub fn run_goal(&mut self, objective: Option<&str>) -> Result<()> {
+        // Resuming a closed goal would re-verify accepted work and count a
+        // second acceptance. Say it is done; `/goal reopen` works on it again.
+        if objective.is_none() && self.goal.as_ref().is_some_and(|g| matches!(g.status, GoalStatus::Done(_))) {
+            println!("{}", self.goal_status().unwrap_or_default());
+            println!("{}", ui::dim("  already done; /goal reopen continues"));
+            return Ok(());
+        }
         // A new goal clears the records; a resumed one keeps its earlier ones.
         let first = if objective.is_some() { 0 } else { self.verification_records.len() };
         if let Some(h) = &mut self.advisor {
@@ -3087,6 +3094,38 @@ impl Agent {
             context::memory_note(memories.len(), saved, known, kept)
         )));
         Ok(())
+    }
+
+    /// `/goal status`: the objective, then its state, this run's turns, the
+    /// lifetime turns and why it last stopped.
+    pub fn goal_status(&self) -> Option<String> {
+        let g = self.goal.as_ref()?;
+        let status = match &g.status {
+            GoalStatus::Active => "active".to_string(),
+            GoalStatus::Done(e) => format!("{}: {e}", self.goal_outcome().unwrap_or("completed_unverified")),
+            GoalStatus::Blocked(e) => format!("blocked: {e}"),
+        };
+        Some(format!(
+            "  goal {}\n  {}",
+            ui::bold(&g.objective),
+            ui::dim(&format!(
+                "{status} · {}/{} turns this run · {} lifetime turns{}",
+                g.run_turns,
+                g.run_limit,
+                g.turns,
+                g.stop_reason
+                    .map(|reason| format!(" · last stop: {}", reason.name().replace('_', " ")))
+                    .unwrap_or_default()
+            ))
+        ))
+    }
+
+    /// Makes a finished goal active again, for `/goal reopen`. Other goals
+    /// are left as they are, so reopening them is the same as resuming.
+    pub fn reopen_goal(&mut self) {
+        if let Some(g) = self.goal.as_mut().filter(|g| matches!(g.status, GoalStatus::Done(_))) {
+            g.status = GoalStatus::Active;
+        }
     }
 
     /// Runtime classification; restored claims cannot recreate executed evidence.
