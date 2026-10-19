@@ -50,7 +50,12 @@ pub const COMMANDS: &[Command] = &[
         "<objective>",
         "keep going until it's done and verified",
         "work",
-        &[("status", "the current goal"), ("resume", "pick the goal back up"), ("clear", "drop the goal")],
+        &[
+            ("status", "the current goal"),
+            ("resume", "pick the goal back up"),
+            ("reopen", "work on a finished goal again"),
+            ("clear", "drop the goal"),
+        ],
     ),
     cmd("/loop", "<[5m] [x10] prompt>", "repeat on an interval, or let rusty pick the pace", "work"),
     with(
